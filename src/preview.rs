@@ -9,11 +9,13 @@ use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter}
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Preview {
     pub lines: Vec<Line<'static>>,
     pub reason: Option<String>,
     pub width: usize,
+    /// One-based old/new source rows, independent of syntax enrichment.
+    pub locations: Vec<(Option<usize>, Option<usize>)>,
 }
 
 type MappedColors<'a> = (
@@ -26,6 +28,10 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
     anyhow::ensure!(
         side.path.ends_with(b".rs"),
         "syntax highlighting currently supports Rust (.rs); other languages retain basic output"
+    );
+    anyhow::ensure!(
+        side.content.len() <= 1024 * 1024,
+        "source exceeds highlighting limit"
     );
     let names = [
         "comment", "string", "keyword", "function", "type", "constant", "number", "operator",
@@ -51,7 +57,10 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
     )?;
     configuration.configure(&names);
     let mut highlighter = Highlighter::new();
-    let events = highlighter.highlight(&configuration, side.content.as_bytes(), None, |_| None)?;
+    let events =
+        highlighter.highlight(&configuration, side.content.as_bytes(), None, None, |_| {
+            None
+        })?;
     let mut stack = Vec::new();
     let mut bytes = vec![None; side.content.len()];
     for event in events {
@@ -67,6 +76,12 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
 }
 
 fn changed_ranges(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    if old.len().saturating_add(new.len()) > 8192 {
+        return (
+            std::iter::once(0..old.len()).collect(),
+            std::iter::once(0..new.len()).collect(),
+        );
+    }
     let mut old_ranges = Vec::new();
     let mut new_ranges = Vec::new();
     let mut old_offset = 0;
@@ -103,6 +118,13 @@ impl Preview {
     }
 
     pub fn item(cwd: &Path, item: &Item) -> Self {
+        if item.patch.len() > 256 * 1024 {
+            let mut preview = Self::original(&item.patch);
+            preview.add_reason(
+                "Large patch: bounded basic rendering; source navigation remains separate",
+            );
+            return preview;
+        }
         let sources = source::load(cwd, item);
         let (mapped, reason) = match &sources {
             Ok(sources) => match (syntax(&sources.old), syntax(&sources.new)) {
@@ -134,7 +156,10 @@ impl Preview {
         reason: Option<String>,
         escape_backslashes: bool,
     ) -> Self {
-        let raw: Vec<_> = patch.split_terminator('\n').collect();
+        let mut rows = patch.split_terminator('\n');
+        let raw: Vec<_> = rows.by_ref().take(20000).collect();
+        let omitted_rows = rows.next().is_some();
+        let mut omitted_columns = false;
         let mut remaining = (0, 0);
         let source_lines: Vec<_> = raw
             .iter()
@@ -191,6 +216,7 @@ impl Preview {
         let mut old_line = 0;
         let mut new_line = 0;
         let mut lines = Vec::new();
+        let mut locations = Vec::new();
         for (index, text) in raw.iter().enumerate() {
             if let Some((old, _, new, _)) = source::hunk(text) {
                 old_line = old.saturating_sub(1);
@@ -219,9 +245,26 @@ impl Preview {
             } else {
                 None
             };
+            locations.push(if source_line {
+                (
+                    if prefix != Some(b'+') {
+                        Some(old_line + 1)
+                    } else {
+                        None
+                    },
+                    if prefix != Some(b'-') {
+                        Some(new_line + 1)
+                    } else {
+                        None
+                    },
+                )
+            } else {
+                (None, None)
+            });
             let mut spans = Vec::new();
+            omitted_columns |= text.graphemes(true).nth(4096).is_some();
             let mut column: usize = 0;
-            for (byte, grapheme) in text.grapheme_indices(true) {
+            for (byte, grapheme) in text.grapheme_indices(true).take(4096) {
                 let mut style = base;
                 if source_line && byte > 0 {
                     if let Some((colors, offset)) = map
@@ -265,11 +308,79 @@ impl Preview {
             }
         }
         let width = lines.iter().map(Line::width).max().unwrap_or(0);
-        Self {
+        let mut preview = Self {
             lines,
             reason,
             width,
+            locations,
+        };
+        if omitted_rows {
+            preview.add_reason("Display omitted rows after 20000");
         }
+        if omitted_columns {
+            preview.add_reason("Display omitted columns after 4096 graphemes per row");
+        }
+        preview
+    }
+
+    fn add_reason(&mut self, note: &str) {
+        if let Some(reason) = &mut self.reason {
+            reason.push_str("; ");
+            reason.push_str(note);
+        } else {
+            self.reason = Some(note.into());
+        }
+    }
+
+    /// Refuse excluded coordinates before constructing a view. The retained
+    /// prefix must never be presented as if it were an omitted target.
+    pub fn target(
+        source: &source::CapturedSource,
+        line: usize,
+        col: usize,
+        len: usize,
+    ) -> anyhow::Result<(Self, usize)> {
+        anyhow::ensure!(
+            line > 0 && line <= 20000,
+            "Target unavailable: source row {line} exceeds the 20000-row display limit"
+        );
+        let text = std::str::from_utf8(&source.bytes)?;
+        let row = text
+            .split_terminator('\n')
+            .nth(line - 1)
+            .ok_or_else(|| anyhow::anyhow!("Target source row unavailable"))?;
+        let target_end = col.saturating_add(len);
+        let through_target: String = row.chars().take(target_end).collect();
+        // Source views apply visible_bytes before compose truncates graphemes.
+        // Validate against that same escaped representation, including doubled
+        // backslashes and escaped control characters.
+        let escaped = crate::git::visible_bytes(through_target.as_bytes());
+        anyhow::ensure!(
+            through_target.chars().count() == target_end
+                && escaped.graphemes(true).take(4097).count() <= 4096,
+            "Target unavailable: scalar column {} exceeds the retained 4096-grapheme row window",
+            col + 1
+        );
+        let prefix: String = row.chars().take(col).collect();
+        let rendered = Self::original(prefix.as_bytes());
+        Ok((Self::source(source), rendered.width))
+    }
+
+    pub fn source(source: &source::CapturedSource) -> Self {
+        let mut preview = Self::original(&source.bytes);
+        preview.locations = (1..=preview.lines.len())
+            .map(|line| match source.side {
+                source::ComparedSide::Old => (Some(line), None),
+                source::ComparedSide::New => (None, Some(line)),
+            })
+            .collect();
+        preview.add_reason(&format!(
+            "Captured {} {} · {}",
+            source.side.label(),
+            crate::git::visible_bytes(&source.path),
+            &source.identity[..12]
+        ));
+        preview
     }
 
     pub fn visible(
@@ -297,6 +408,9 @@ impl Preview {
                             spans.push(Span::styled(" ".repeat(visible), span.style));
                         }
                         column = end;
+                        if column >= left.saturating_add(width) {
+                            break;
+                        }
                     }
                 }
                 Line::from(spans)

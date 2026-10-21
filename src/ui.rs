@@ -13,7 +13,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
-use std::io;
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let areas = Layout::default()
@@ -110,63 +117,120 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             area,
         );
     }
-    let explanation = app.capture.unavailable.as_deref().or_else(|| {
+    let explanation = [
         app.preview
             .as_ref()
-            .and_then(|preview| preview.reason.as_deref())
+            .and_then(|preview| preview.reason.as_deref()),
+        app.capture.unavailable.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" | ");
+    let prompt = app.navigation.as_ref().filter(|n| n.editing).map(|n| {
+        format!(
+            "Search/outline: {}_ (Enter searches both sides; Escape returns)",
+            n.query
+        )
     });
-    let status = [explanation.unwrap_or(""), app.status.trim()]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" | ");
+    let status = [
+        explanation.as_str(),
+        prompt.as_deref().unwrap_or(app.status.trim()),
+    ]
+    .into_iter()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(" | ");
     frame.render_widget(
         Paragraph::new(status).wrap(ratatui::widgets::Wrap { trim: false }),
         areas[1],
     );
     frame.render_widget(
         Paragraph::new(
-            "l/Enter open · h back · jk/↑↓ move · ←→ scroll · Space mark · q quit · Tab focus",
+            "Enter/l open · h close · s search · d defs · r refs · b back · [old ]new · Space mark · q quit",
         ),
         areas[2],
     );
 }
 
-struct Restore;
+type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+struct Restore {
+    hook: PanicHook,
+    signals: Vec<signal_hook::SigId>,
+}
 impl Drop for Restore {
     fn drop(&mut self) {
+        for signal in self.signals.drain(..) {
+            signal_hook::low_level::unregister(signal);
+        }
+        if !std::thread::panicking() {
+            let hook = self.hook.clone();
+            std::panic::set_hook(Box::new(move |info| hook(info)));
+        }
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
     }
 }
 
 pub fn run(app: &mut App) -> Result<()> {
+    let old_hook: PanicHook = std::panic::take_hook().into();
+    let mut restore = Restore {
+        hook: old_hook.clone(),
+        signals: Vec::new(),
+    };
     enable_raw_mode()?;
-    let _restore = Restore;
     execute!(io::stdout(), EnterAlternateScreen)?;
-    let old_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        if std::thread::current().id() == ui_thread {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        }
         old_hook(info);
     }));
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    loop {
-        terminal.draw(|frame| draw(frame, app))?;
-        match event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if key.code == event::KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    break;
-                }
-                if app.key(key.code) {
-                    break;
-                }
-            }
-            _ => {}
-        }
+    let interrupted = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        restore
+            .signals
+            .push(signal_hook::flag::register(signal, interrupted.clone())?);
     }
-    terminal.show_cursor()?;
-    Ok(())
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        loop {
+            app.poll_analysis();
+            terminal.draw(|frame| draw(frame, app))?;
+            #[cfg(test)]
+            match std::env::var("REVIEW_TERMINAL_SCENARIO").as_deref() {
+                Ok("panic") => panic!("injected UI panic"),
+                Ok("error") => anyhow::bail!("injected terminal I/O failure"),
+                _ => {}
+            }
+            if interrupted.load(Ordering::Relaxed) {
+                break;
+            }
+            if !event::poll(Duration::from_millis(50))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if key.code == event::KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+                    if app.key(key.code) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        terminal.show_cursor()?;
+        Ok(())
+    }));
+    drop(restore);
+    match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
 }

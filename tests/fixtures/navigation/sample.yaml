@@ -1,0 +1,12 @@
+service:
+  port: 80
+  port: 81
+  list:
+    # not an array element
+    - name: first
+    - name: second
+quoted:
+  "line\nkey": value
+origin: &shared
+  port: 82
+copy: *shared

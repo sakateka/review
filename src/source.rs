@@ -193,17 +193,81 @@ pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
     if patch.lines().any(|line| line.starts_with("\\ No newline")) {
         bail!("source mapping for missing final newlines is unavailable");
     }
-    let reconstructed = reconstruct(cwd, item)?;
+    if !matches!(
+        item.old_source,
+        SourceIdentity::Blob(_) | SourceIdentity::Empty
+    ) || !matches!(
+        item.new_source,
+        SourceIdentity::CapturedPatch | SourceIdentity::Empty
+    ) {
+        bail!("source enrichment requires mapped ordinary patch sources");
+    }
+    let (old_bytes, new_bytes) = if let Some((old, new)) = &item.captured_sources {
+        (old.clone(), new.clone())
+    } else {
+        let reconstructed = reconstruct(cwd, item)?;
+        (reconstructed.old, reconstructed.new)
+    };
     Ok(Sources {
         old: Side {
             path: item.old_path.clone(),
-            content: String::from_utf8(reconstructed.old)
-                .context("compared source is not UTF-8")?,
+            content: String::from_utf8(old_bytes).context("compared source is not UTF-8")?,
         },
         new: Side {
             path: item.new_path.clone(),
-            content: String::from_utf8(reconstructed.new)
-                .context("compared source is not UTF-8")?,
+            content: String::from_utf8(new_bytes).context("compared source is not UTF-8")?,
         },
     })
+}
+
+/// Native identity and immutable content stay outside the UTF-8 tag registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ComparedSide {
+    Old,
+    New,
+}
+impl ComparedSide {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct CapturedSource {
+    pub side: ComparedSide,
+    pub path: Vec<u8>,
+    pub bytes: std::sync::Arc<[u8]>,
+    pub identity: String,
+}
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    pub sources: Vec<CapturedSource>,
+    pub gaps: Vec<String>,
+}
+impl Catalog {
+    pub fn insert(&mut self, side: ComparedSide, path: Vec<u8>, bytes: Vec<u8>) {
+        let identity = crate::state::digest([bytes.as_slice()]);
+        let source = CapturedSource {
+            side,
+            path,
+            bytes: bytes.into(),
+            identity,
+        };
+        if let Some(existing) = self
+            .sources
+            .iter_mut()
+            .find(|s| s.side == side && s.path == source.path)
+        {
+            *existing = source;
+        } else {
+            self.sources.push(source);
+        }
+    }
+    pub fn find(&self, side: ComparedSide, path: &[u8]) -> Option<usize> {
+        self.sources
+            .iter()
+            .position(|s| s.side == side && s.path == path)
+    }
 }

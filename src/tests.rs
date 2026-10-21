@@ -2561,3 +2561,752 @@ fn captured_permissions_match_git_owner_execute_for_worktree_and_no_index() {
     assert_eq!(captured.items[0].new_mode, "100644");
     assert!(captured.items[0].canonical_identity.is_some());
 }
+
+fn navigation_query(
+    catalog: &source::Catalog,
+    operation: navigation::Operation,
+    name: &str,
+) -> navigation::Results {
+    navigation::Analysis::build(catalog).query(
+        catalog,
+        navigation::Request {
+            generation: 1,
+            position: None,
+            operation,
+            query: name.into(),
+            side: None,
+        },
+    )
+}
+#[test]
+fn navigation_fixture_operations_cover_every_declared_language_and_shell_dialect() {
+    for name in [
+        "sample.rs",
+        "sample.c",
+        "sample.h",
+        "sample.cpp",
+        "sample.go",
+        "sample.zig",
+        "sample.py",
+        "sample.sh",
+        "sample.bash",
+    ] {
+        let bytes = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/navigation")
+                .join(name),
+        )
+        .unwrap();
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::Old,
+            name.as_bytes().to_vec(),
+            bytes.clone(),
+        );
+        catalog.insert(
+            source::ComparedSide::New,
+            name.as_bytes().to_vec(),
+            bytes.clone(),
+        );
+        for operation in [
+            navigation::Operation::Search,
+            navigation::Operation::Definitions,
+            navigation::Operation::References,
+        ] {
+            let result = navigation_query(&catalog, operation, "target");
+            assert!(
+                result.candidates.len() >= 2,
+                "{name} {operation:?}: {result:?}"
+            );
+            assert!(result.coverage.contains("Partial"));
+            for candidate in result.candidates {
+                let text = std::str::from_utf8(&catalog.sources[candidate.source].bytes).unwrap();
+                let actual: String = text
+                    .lines()
+                    .nth(candidate.tag.line as usize - 1)
+                    .unwrap()
+                    .chars()
+                    .skip(candidate.tag.col as usize)
+                    .take(candidate.tag.len as usize)
+                    .collect();
+                assert_eq!(actual, "target", "{name} {operation:?}");
+            }
+        }
+    }
+}
+#[test]
+fn navigation_formats_keep_nested_arrays_duplicate_positions_and_yaml_aliases() {
+    for name in ["sample.yaml", "sample.json"] {
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::New,
+            name.as_bytes().to_vec(),
+            std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/navigation")
+                    .join(name),
+            )
+            .unwrap(),
+        );
+        let ports = navigation_query(&catalog, navigation::Operation::Definitions, "port");
+        assert!(ports.candidates.len() >= 2);
+        let positions: std::collections::BTreeSet<_> = ports
+            .candidates
+            .iter()
+            .map(|c| (c.tag.line, c.tag.col))
+            .collect();
+        assert_eq!(positions.len(), ports.candidates.len());
+        assert!(
+            ports.candidates[0]
+                .tag
+                .context
+                .as_deref()
+                .unwrap()
+                .contains("[\"service\"][\"port\"]")
+        );
+        let names = navigation_query(&catalog, navigation::Operation::Definitions, "name");
+        assert_eq!(names.candidates.len(), 2);
+        assert!(
+            names.candidates[0]
+                .tag
+                .context
+                .as_deref()
+                .unwrap()
+                .contains("[0]")
+        );
+        assert!(
+            names.candidates[1]
+                .tag
+                .context
+                .as_deref()
+                .unwrap()
+                .contains("[1]")
+        );
+        if name.ends_with("yaml") {
+            assert_eq!(
+                navigation_query(&catalog, navigation::Operation::Definitions, "shared")
+                    .candidates
+                    .len(),
+                1
+            );
+            assert_eq!(
+                navigation_query(&catalog, navigation::Operation::References, "shared")
+                    .candidates
+                    .len(),
+                1
+            );
+            assert_eq!(
+                navigation_query(&catalog, navigation::Operation::Definitions, "line\nkey")
+                    .candidates
+                    .len(),
+                1
+            );
+        } else {
+            assert!(
+                navigation_query(&catalog, navigation::Operation::References, "port")
+                    .candidates
+                    .is_empty()
+            );
+        }
+    }
+}
+#[test]
+fn navigation_reports_unsupported_recovered_invalid_and_resource_limited_sources() {
+    let mut catalog = source::Catalog::default();
+    for (name, bytes) in [
+        ("other.sh", b"#!/bin/zsh -f\ntarget() {}".to_vec()),
+        (
+            "env.sh",
+            b"#!/usr/bin/env -S fish -x\nfunction target; end".to_vec(),
+        ),
+        ("file.rs", vec![0xff]),
+        ("huge.rs", vec![b'a'; navigation::MAX_FILE_BYTES + 1]),
+        ("broken.json", b"{\"port\": 1, broken".to_vec()),
+    ] {
+        catalog.insert(source::ComparedSide::New, name.as_bytes().to_vec(), bytes);
+    }
+    let result = navigation_query(&catalog, navigation::Operation::Search, "");
+    for reason in [
+        "unsupported language/shell dialect",
+        "invalid UTF-8",
+        "resource limit",
+        "recovered syntax errors",
+    ] {
+        assert!(
+            result.coverage.contains(reason),
+            "{reason}: {}",
+            result.coverage
+        );
+    }
+}
+#[test]
+fn captured_navigation_searches_unchanged_both_sides_and_survives_later_mutation() {
+    let directory = fixture();
+    change(directory.path());
+    let captured = capture(directory.path(), &["HEAD", "--", "one.rs"]);
+    std::fs::write(directory.path().join("two.rs"), "fn moved() {}\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "moved"]);
+    let results = navigation_query(&captured.catalog, navigation::Operation::Definitions, "two");
+    assert_eq!(results.candidates.len(), 2, "{results:?}");
+    assert_ne!(
+        captured.catalog.sources[results.candidates[0].source].side,
+        captured.catalog.sources[results.candidates[1].source].side
+    );
+    assert!(
+        results
+            .candidates
+            .iter()
+            .all(|c| captured.catalog.sources[c.source].path == b"two.rs")
+    );
+    assert!(
+        navigation_query(
+            &captured.catalog,
+            navigation::Operation::Definitions,
+            "moved"
+        )
+        .candidates
+        .is_empty()
+    );
+}
+#[test]
+fn no_index_navigation_includes_unchanged_directory_targets() {
+    let directory = tempfile::tempdir().unwrap();
+    for side in ["left", "right"] {
+        std::fs::create_dir(directory.path().join(side)).unwrap();
+        std::fs::write(
+            directory.path().join(side).join("target.rs"),
+            "fn target() {}\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(directory.path().join("left/change.rs"), "fn old() {}\n").unwrap();
+    std::fs::write(directory.path().join("right/change.rs"), "fn new() {}\n").unwrap();
+    let captured = capture(directory.path(), &["--no-index", "left", "right"]);
+    let results = navigation_query(
+        &captured.catalog,
+        navigation::Operation::Definitions,
+        "target",
+    );
+    assert_eq!(results.candidates.len(), 2, "{results:?}");
+    assert_eq!(
+        captured.catalog.sources[results.candidates[0].source].path,
+        b"left/target.rs"
+    );
+    assert_eq!(
+        captured.catalog.sources[results.candidates[1].source].path,
+        b"right/target.rs"
+    );
+}
+fn await_navigation(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app
+        .navigation
+        .as_ref()
+        .is_some_and(|nav| nav.coverage.is_empty())
+    {
+        app.poll_analysis();
+        assert!(std::time::Instant::now() < deadline, "worker timed out");
+        std::thread::yield_now();
+    }
+}
+#[test]
+fn navigation_controls_open_candidates_go_back_choose_old_side_and_never_mark() {
+    let directory = fixture();
+    change(directory.path());
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('s'));
+    for character in "two".chars() {
+        app.key(KeyCode::Char(character));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 2);
+    app.key(KeyCode::Enter);
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("old two.rs")
+    );
+    app.key(KeyCode::Char(']'));
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("new two.rs")
+    );
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
+    app.key(KeyCode::Char('b'));
+    app.key(KeyCode::Char('b'));
+    assert!(app.navigation.is_some());
+    app.key(KeyCode::Char('b'));
+    assert!(app.preview.is_some());
+    assert!(app.marks.iter().all(|mark| !mark));
+    assert!(!state_dir.path().read_dir().unwrap().any(|_| true));
+}
+#[test]
+fn navigation_selection_changes_cannot_publish_obsolete_worker_results() {
+    let directory = fixture();
+    change(directory.path());
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('h'));
+    app.key(KeyCode::Char('j'));
+    for _ in 0..1000 {
+        app.poll_analysis();
+        std::thread::yield_now();
+    }
+    assert!(app.preview.is_none());
+    assert!(app.navigation.is_none());
+    assert_eq!(app.selected, 1);
+    assert!(app.marks.iter().all(|mark| !mark));
+    for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 6), (120, 40)] {
+        screen(&mut app, width, height);
+    }
+}
+
+#[test]
+fn terminal_lifecycle_worker() {
+    let Ok(scenario) = std::env::var("REVIEW_TERMINAL_SCENARIO") else {
+        return;
+    };
+    let cwd = std::env::current_dir().unwrap();
+    let capture = capture(&cwd, &["HEAD"]);
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(
+        capture,
+        state::Store::at(state_dir.path(), &cwd, &["HEAD".into()]),
+    );
+    let result = ui::run(&mut app);
+    if scenario == "error" {
+        assert!(result.unwrap_err().to_string().contains("injected"));
+    } else {
+        result.unwrap();
+    }
+}
+#[test]
+fn navigation_deleted_renamed_native_paths_and_missing_newlines_keep_captured_targets() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = fixture();
+    let name = OsString::from_vec(b"odd-\xff.rs".to_vec());
+    std::fs::write(directory.path().join(&name), "fn unique() {}").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "native"]);
+    std::fs::remove_file(directory.path().join(&name)).unwrap();
+    std::fs::rename(
+        directory.path().join("two.rs"),
+        directory.path().join("renamed.rs"),
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "-A"]);
+    let captured = capture(directory.path(), &["--cached"]);
+    let result = navigation_query(
+        &captured.catalog,
+        navigation::Operation::Definitions,
+        "unique",
+    );
+    assert_eq!(result.candidates.len(), 1);
+    let target = &captured.catalog.sources[result.candidates[0].source];
+    assert_eq!(target.path, b"odd-\xff.rs");
+    assert_eq!(target.side, source::ComparedSide::Old);
+    assert_eq!(target.bytes.as_ref(), b"fn unique() {}");
+    let twos = navigation_query(&captured.catalog, navigation::Operation::Definitions, "two");
+    assert_eq!(twos.candidates.len(), 2);
+    assert!(
+        twos.candidates
+            .iter()
+            .any(|c| captured.catalog.sources[c.source].path == b"two.rs")
+    );
+    assert!(
+        twos.candidates
+            .iter()
+            .any(|c| captured.catalog.sources[c.source].path == b"renamed.rs")
+    );
+}
+#[test]
+fn navigation_range_and_merge_base_catalogs_include_unchanged_sources() {
+    let directory = fixture();
+    change(directory.path());
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "second"]);
+    for args in [
+        vec!["HEAD~..HEAD"],
+        vec!["HEAD~...HEAD"],
+        vec!["--merge-base", "HEAD~", "HEAD"],
+    ] {
+        let captured = capture(directory.path(), &args);
+        let result = navigation_query(&captured.catalog, navigation::Operation::Definitions, "two");
+        assert_eq!(result.candidates.len(), 2, "{args:?}: {result:?}");
+    }
+}
+
+#[test]
+fn navigation_search_accepts_native_path_substrings_without_collapsing_candidates() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::Old,
+        b"nested/definition.rs".to_vec(),
+        b"fn target() {}\n".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"nested/definition.rs".to_vec(),
+        b"fn target() {}\n".to_vec(),
+    );
+    let result = navigation_query(&catalog, navigation::Operation::Search, "nested/def");
+    assert_eq!(result.candidates.len(), 2);
+    assert_eq!(
+        catalog.sources[result.candidates[0].source].side,
+        source::ComparedSide::Old
+    );
+    assert_eq!(
+        catalog.sources[result.candidates[1].source].side,
+        source::ComparedSide::New
+    );
+}
+
+#[test]
+fn navigation_catalog_acquisition_limits_unchanged_blobs_before_retention() {
+    let directory = fixture();
+    for index in 0..9 {
+        std::fs::write(
+            directory.path().join(format!("a{index}.rs")),
+            vec![b' '; 1024 * 1024],
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        directory.path().join("a-large.rs"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    for index in 0..1030 {
+        std::fs::write(
+            directory.path().join(format!("b{index:04}.rs")),
+            "fn tiny() {}\n",
+        )
+        .unwrap();
+    }
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "catalog limits"]);
+    change(directory.path());
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "small change"]);
+    let captured = assert_native(directory.path(), &["HEAD~", "HEAD", "--", "one.rs"]);
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_some());
+    assert!(
+        captured
+            .catalog
+            .sources
+            .iter()
+            .all(|s| s.bytes.len() <= 1024 * 1024)
+    );
+    assert!(
+        !captured
+            .catalog
+            .sources
+            .iter()
+            .any(|s| s.path == b"a-large.rs")
+    );
+    assert!(
+        captured
+            .catalog
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("byte limit"))
+    );
+    assert!(
+        captured
+            .catalog
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("count limit"))
+    );
+    assert!(
+        captured
+            .catalog
+            .sources
+            .iter()
+            .map(|s| s.bytes.len())
+            .sum::<usize>()
+            <= 16 * 1024 * 1024 + 1024
+    );
+}
+
+#[test]
+fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
+    let many_rows = "x\n".repeat(20001);
+    let original = preview::Preview::original(many_rows.as_bytes());
+    assert!(original.reason.unwrap().contains("omitted rows"));
+    let directory = fixture();
+    change(directory.path());
+    let mut opaque = capture(directory.path(), &["HEAD"]);
+    opaque.unavailable = Some("Original output: file actions unavailable".into());
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut opaque_app = App::new(
+        opaque,
+        state::Store::at(state_dir.path(), directory.path(), &[]),
+    );
+    opaque_app.preview = Some(preview::Preview::original(many_rows.as_bytes()));
+    assert!(screen_text(&screen(&mut opaque_app, 120, 20)).contains("Display omitted rows"));
+    let mut captured = capture(directory.path(), &["HEAD"]);
+    captured.items[0].patch = format!("{}\n", "界".repeat(4100)).into_bytes();
+    let basic = preview::Preview::item(directory.path(), &captured.items[0]);
+    assert!(basic.reason.unwrap().contains("omitted columns"));
+    let original_wide = preview::Preview::original("界".repeat(4100).as_bytes());
+    assert!(original_wide.reason.unwrap().contains("omitted columns"));
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("// {}\nfn wide() {{}}\n", "界".repeat(4100)),
+    )
+    .unwrap();
+    let enriched_capture = capture(directory.path(), &["HEAD"]);
+    let enriched = preview::Preview::item(directory.path(), &enriched_capture.items[0]);
+    let reason = enriched.reason.unwrap();
+    assert!(reason.contains("omitted columns"));
+    assert!(!reason.contains("unavailable"));
+    captured.items[0].patch = "x\n".repeat(140000).into_bytes();
+    let large_basic = preview::Preview::item(directory.path(), &captured.items[0]);
+    let reason = large_basic.reason.unwrap();
+    assert!(reason.contains("omitted rows") && reason.contains("Large patch"));
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"late.rs".to_vec(),
+        format!("{}fn late() {{}}\n", "\n".repeat(20000)).into_bytes(),
+    );
+    assert!(
+        preview::Preview::target(&catalog.sources[0], 20001, 3, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("20000-row")
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"wide.rs".to_vec(),
+        format!("{}fn late() {{}}\n", " ".repeat(4100)).into_bytes(),
+    );
+    assert!(
+        preview::Preview::target(&catalog.sources[1], 1, 4103, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("4096-grapheme")
+    );
+}
+
+#[test]
+fn navigation_new_search_editing_rejects_inflight_results() {
+    let directory = fixture();
+    change(directory.path());
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('t'));
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('z'));
+    // Let the old worker answer while the new query is still being edited.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+    while std::time::Instant::now() < until {
+        app.poll_analysis();
+        std::thread::yield_now();
+    }
+    let nav = app.navigation.as_ref().unwrap();
+    assert!(nav.editing);
+    assert_eq!(nav.query, "z");
+    assert!(nav.candidates.is_empty());
+    assert!(nav.coverage.is_empty());
+}
+
+#[test]
+fn navigation_horizontal_movement_uses_scroll_point_after_target_opening() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn first() {} fn second() {}\n",
+    )
+    .unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('s'));
+    for ch in "first".chars() {
+        app.key(KeyCode::Char(ch));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    app.key(KeyCode::Enter);
+    app.viewport = (1, 1);
+    for _ in 0..3 {
+        app.key(KeyCode::Right);
+    }
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().query, "second");
+    app.key(KeyCode::Enter);
+    for _ in 0..5 {
+        app.key(KeyCode::Left);
+    }
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().query, "first");
+}
+
+#[test]
+fn navigation_side_switch_discards_previous_target_coordinates() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("{}fn late() {{}}\n", "\n".repeat(30)),
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "old location"]);
+    std::fs::write(directory.path().join("one.rs"), "fn early() {}\n").unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('s'));
+    for ch in "late".chars() {
+        app.key(KeyCode::Char(ch));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    app.key(KeyCode::Enter);
+    assert_eq!(app.top, 30);
+    app.viewport = (1, 1);
+    app.key(KeyCode::Char(']'));
+    assert_eq!(app.top, 0);
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().query, "early");
+}
+
+#[test]
+fn review_fix_target_retention_counts_escaped_backslashes() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"slashes.rs".to_vec(),
+        format!("{}fn target() {{}}\n", "\\".repeat(2500)).into_bytes(),
+    );
+    let source = &catalog.sources[0];
+    let preview = preview::Preview::source(source);
+    assert!(!preview.lines[0].to_string().contains("target"));
+    let error = preview::Preview::target(source, 1, 2503, 6).unwrap_err();
+    assert!(error.to_string().contains("4096-grapheme"));
+    catalog.insert(
+        source::ComparedSide::New,
+        b"retained.rs".to_vec(),
+        format!("{}fn target() {{}}\n", "\\".repeat(2000)).into_bytes(),
+    );
+    let (preview, left) = preview::Preview::target(&catalog.sources[1], 1, 2003, 6).unwrap();
+    assert_eq!(left, 4003);
+    assert!(
+        preview.visible(0, left, 1, 20)[0]
+            .to_string()
+            .starts_with("target")
+    );
+}
+
+#[test]
+fn review_fix_multiline_candidate_fields_keep_one_row_and_selection_visible() {
+    let directory = fixture();
+    let path = "multi\nname.json";
+    std::fs::write(
+        directory.path().join(path),
+        r#"{"key\nline":0,"second":1,"third":2,"fourth":3}"#,
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "multiline candidates"]);
+    change(directory.path());
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let nav = app.navigation.as_ref().unwrap();
+    assert!(
+        nav.candidates
+            .iter()
+            .any(|c| c.tag.name.as_ref() == "key\nline")
+    );
+    assert!(
+        app.capture
+            .catalog
+            .sources
+            .iter()
+            .any(|s| s.path == path.as_bytes())
+    );
+    assert_eq!(
+        app.preview.as_ref().unwrap().lines.len(),
+        nav.candidates.len() + 2
+    );
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("multi\\\\nname.json"))
+    );
+    screen(&mut app, 120, 12);
+    let count = app.navigation.as_ref().unwrap().candidates.len();
+    for _ in 1..count {
+        app.key(KeyCode::Down);
+    }
+    let nav = app.navigation.as_ref().unwrap();
+    assert_eq!(nav.selected, count - 1);
+    let selected_row = nav.selected + 2;
+    assert!(selected_row >= app.top && selected_row < app.top + app.viewport.0);
+    assert!(screen_text(&screen(&mut app, 120, 12)).contains("> new"));
+}
+
+#[test]
+fn review_fix_structural_depth_limit_is_explicit() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"deep.json".to_vec(),
+        format!("{}{{\"key\":0}}{}", "[".repeat(140), "]".repeat(140)).into_bytes(),
+    );
+    let results = navigation_query(&catalog, navigation::Operation::Search, "");
+    assert!(
+        results
+            .coverage
+            .contains("structural depth limit (128), truncated")
+    );
+    assert!(results.candidates.is_empty());
+}
+
+#[test]
+fn review_fix_structural_tag_limit_is_explicit_at_exact_cap() {
+    let mut catalog = source::Catalog::default();
+    let json = format!("{{\n{}\"end\":0\n}}", "\"k\":0,\n".repeat(100000));
+    assert!(json.len() < navigation::MAX_FILE_BYTES);
+    catalog.insert(
+        source::ComparedSide::New,
+        b"tags.json".to_vec(),
+        json.into_bytes(),
+    );
+    let results = navigation_query(&catalog, navigation::Operation::Search, "end");
+    assert!(
+        results
+            .coverage
+            .contains("structural tag limit (100000), truncated")
+    );
+    assert!(results.candidates.is_empty());
+}

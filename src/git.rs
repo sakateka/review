@@ -31,6 +31,7 @@ pub struct Item {
     /// Digest of both complete captured sides and semantic item metadata.
     /// Missing when the representation cannot prove complete side bytes.
     pub canonical_identity: Option<String>,
+    pub captured_sources: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Item {
@@ -108,6 +109,7 @@ pub struct Capture {
     pub diagnostic: String,
     pub cwd: PathBuf,
     pub args: Vec<OsString>,
+    pub catalog: crate::source::Catalog,
 }
 
 pub(crate) fn command(cwd: &Path) -> Command {
@@ -774,10 +776,10 @@ pub(crate) fn capture_with_hook(
     } else {
         None
     };
+    let after = before
+        .as_ref()
+        .and_then(|_| input_snapshot(cwd, &analysis).ok());
     if let Some(items) = &mut items {
-        let after = before
-            .as_ref()
-            .and_then(|_| input_snapshot(cwd, &analysis).ok());
         for item in items {
             let stable = before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
                 if analysis.index_only {
@@ -793,7 +795,7 @@ pub(crate) fn capture_with_hook(
                     });
                 paths_stable && a.get(b"\0GIT_INDEX".as_slice()) == b.get(b"\0GIT_INDEX".as_slice())
             });
-            item.canonical_identity = canonical_identity(
+            let proven = canonical_sources(
                 cwd,
                 item,
                 &analysis,
@@ -801,6 +803,10 @@ pub(crate) fn capture_with_hook(
                 after.as_ref(),
                 refs_before.as_deref().filter(|_| refs_stable),
             );
+            if let Some((identity, old, new)) = proven {
+                item.canonical_identity = Some(identity);
+                item.captured_sources = Some((old, new));
+            }
             item.legacy_fingerprints =
                 legacy_fingerprints(cwd, item, &analysis).unwrap_or_default();
         }
@@ -831,7 +837,84 @@ pub(crate) fn capture_with_hook(
             diagnostic.push_str(&format!("{unproven} item(s) lack complete captured-content proof; their marks cannot be restored"));
         }
     }
+    let mut catalog = crate::source::Catalog::default();
+    if refs_stable || analysis.no_index || (refs_before.is_none() && analysis.operands.is_empty()) {
+        let stable = before
+            .as_ref()
+            .zip(after.as_ref())
+            .filter(|(a, b)| a == b)
+            .map(|(a, _)| a);
+        let trees = refs_before.as_deref().unwrap_or_default();
+        let mut acquisition_gaps = Vec::new();
+        let sides = if analysis.no_index {
+            stable.and_then(|snapshot| no_index_catalog(snapshot, &analysis, &mut acquisition_gaps))
+        } else if analysis.index_only {
+            trees
+                .first()
+                .and_then(|tree| tree_catalog(cwd, tree, &mut acquisition_gaps))
+                .zip(stable.and_then(|s| index_catalog(cwd, s, &mut acquisition_gaps)))
+        } else if trees.len() == 2 {
+            tree_catalog(cwd, &trees[0], &mut acquisition_gaps).zip(tree_catalog(
+                cwd,
+                &trees[1],
+                &mut acquisition_gaps,
+            ))
+        } else {
+            let old = if let Some(tree) = trees.first() {
+                tree_catalog(cwd, tree, &mut acquisition_gaps)
+            } else {
+                stable.and_then(|s| index_catalog(cwd, s, &mut acquisition_gaps))
+            };
+            old.zip(stable.map(|s| worktree_catalog(s, &mut acquisition_gaps)))
+        };
+        catalog.gaps.extend(acquisition_gaps);
+        if let Some((mut old, mut new)) = sides {
+            if analysis.reverse && trees.len() != 2 {
+                std::mem::swap(&mut old, &mut new);
+            }
+            for (side, files) in [
+                (crate::source::ComparedSide::Old, old),
+                (crate::source::ComparedSide::New, new),
+            ] {
+                for (path, bytes) in files {
+                    catalog.insert(side, path, bytes);
+                }
+            }
+            catalog.gaps.push("Search includes captured tracked ordinary files; untracked files, submodules and symlinks are excluded".into());
+        } else {
+            catalog.gaps.push("Full comparison catalog unavailable for these operands/provenance; searching proven changed sources only".into());
+        }
+    } else {
+        catalog
+            .gaps
+            .push("Comparison inputs moved; searching proven changed sources only".into());
+    }
+    if let Some(items) = &items {
+        for item in items {
+            if let Some((old, new)) = &item.captured_sources {
+                if matches!(item.old_mode.as_str(), "100644" | "100755") {
+                    catalog.insert(
+                        crate::source::ComparedSide::Old,
+                        item.old_path.clone(),
+                        old.clone(),
+                    );
+                }
+                if matches!(item.new_mode.as_str(), "100644" | "100755") {
+                    catalog.insert(
+                        crate::source::ComparedSide::New,
+                        item.new_path.clone(),
+                        new.clone(),
+                    );
+                }
+            } else {
+                catalog
+                    .gaps
+                    .push(format!("{}: compared source unavailable", item.name()));
+            }
+        }
+    }
     Ok(Capture {
+        catalog,
         items: items.unwrap_or_default(),
         original: result.stdout,
         stderr: result.stderr,
@@ -843,14 +926,14 @@ pub(crate) fn capture_with_hook(
     })
 }
 
-fn canonical_identity(
+fn canonical_sources(
     cwd: &Path,
     item: &Item,
     analysis: &Analysis,
     stable: bool,
     snapshot: Option<&std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
     revisions: Option<&[Vec<u8>]>,
-) -> Option<String> {
+) -> Option<(String, Vec<u8>, Vec<u8>)> {
     let sources = crate::source::reconstruct(cwd, item).ok();
     let (old, new) = if let Some(sources) = sources {
         (sources.old, sources.new)
@@ -951,7 +1034,7 @@ fn canonical_identity(
         }
     }
     let kind = [item.status.as_bytes().first().copied()?];
-    Some(crate::state::digest([
+    let identity = crate::state::digest([
         b"review-item-v2".as_slice(),
         item.old_path.as_slice(),
         item.new_path.as_slice(),
@@ -960,22 +1043,68 @@ fn canonical_identity(
         kind.as_slice(),
         old.as_slice(),
         new.as_slice(),
-    ]))
+    ]);
+    Some((identity, old, new))
 }
 
 // Pin the actual tree operands before/after the native comparison. Tree IDs
 // are provenance handles only; canonical identities never include them.
 fn revision_snapshot(cwd: &Path, analysis: &Analysis) -> Option<Vec<Vec<u8>>> {
     use std::os::unix::ffi::OsStringExt;
-    if analysis.no_index || analysis.merge_base {
+    if analysis.no_index {
         return None;
     }
-    let operands = if analysis.index_only && analysis.operands.is_empty() {
+    let mut operands = if analysis.index_only && analysis.operands.is_empty() {
         vec![OsString::from("HEAD")]
     } else {
         analysis.operands.clone()
     };
-    if operands.len() != if analysis.index_only { 1 } else { 2 } {
+    let mut symmetric = analysis.merge_base;
+    if operands.len() == 1 && !analysis.index_only {
+        let bytes = operands[0].as_encoded_bytes();
+        let split = bytes
+            .windows(3)
+            .position(|part| part == b"...")
+            .map(|i| (i, 3))
+            .or_else(|| {
+                bytes
+                    .windows(2)
+                    .position(|part| part == b"..")
+                    .map(|i| (i, 2))
+            });
+        if let Some((index, length)) = split {
+            symmetric |= length == 3;
+            let left = if index == 0 {
+                b"HEAD".to_vec()
+            } else {
+                bytes[..index].to_vec()
+            };
+            let right = if index + length == bytes.len() {
+                b"HEAD".to_vec()
+            } else {
+                bytes[index + length..].to_vec()
+            };
+            operands = vec![OsString::from_vec(left), OsString::from_vec(right)];
+        }
+    }
+    if symmetric {
+        if operands.len() != 2 {
+            return None;
+        }
+        let output = command(cwd)
+            .arg("merge-base")
+            .args(&operands)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        operands[0] = OsString::from_vec(output.stdout.strip_suffix(b"\n")?.to_vec());
+    }
+    if operands.is_empty() && !analysis.index_only {
+        return Some(Vec::new());
+    }
+    if operands.len() > 2 {
         return None;
     }
     let mut trees: Vec<Vec<u8>> = operands
@@ -1480,6 +1609,7 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
             patch: patch.to_vec(),
             legacy_fingerprints: Vec::new(),
             canonical_identity: None,
+            captured_sources: None,
         });
     }
     let mut identities = std::collections::BTreeSet::new();
@@ -1597,4 +1727,200 @@ fn unquote(encoded: &[u8]) -> Option<Vec<u8>> {
         });
     }
     Some(result)
+}
+
+// Catalog construction reads only captured index entries or pinned tree objects.
+type CatalogFiles = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+// These limits apply before reading any broad-catalog object content. Existing
+// comparison output and canonical item proofs deliberately retain their policy.
+const CATALOG_FILES_PER_SIDE: usize = 1024;
+const CATALOG_BYTES_PER_SIDE: usize = 8 * 1024 * 1024;
+const CATALOG_LIST_BYTES: usize = 2 * 1024 * 1024;
+fn listed_catalog(
+    cwd: &Path,
+    entries: &[u8],
+    index: bool,
+    gaps: &mut Vec<String>,
+) -> Option<CatalogFiles> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    let mut child = command(cwd)
+        .args(["cat-file", "--batch-command"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let result = (|| {
+        let input = child.stdin.as_mut()?;
+        let mut output = BufReader::new(child.stdout.take()?);
+        let mut files = CatalogFiles::new();
+        let mut total = 0usize;
+        let mut omitted = 0usize;
+        for (position, entry) in entries
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .enumerate()
+        {
+            if position >= CATALOG_FILES_PER_SIDE {
+                gaps.push(
+                    "Catalog acquisition count limit: remaining entries omitted (1024 per side)"
+                        .into(),
+                );
+                break;
+            }
+            let tab = entry.iter().position(|b| *b == b'\t')?;
+            let fields: Vec<_> = entry[..tab].split(|b| *b == b' ').collect();
+            if fields.len() != 3 {
+                return None;
+            }
+            if !matches!(fields[0], b"100644" | b"100755") || (index && fields[2] != b"0") {
+                continue;
+            }
+            let oid = std::str::from_utf8(fields[if index { 1 } else { 2 }]).ok()?;
+            if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            writeln!(input, "info {oid}").ok()?;
+            input.flush().ok()?;
+            let mut header = String::new();
+            output.by_ref().take(256).read_line(&mut header).ok()?;
+            let parts: Vec<_> = header.split_whitespace().collect();
+            if parts.len() != 3 || parts[1] != "blob" {
+                return None;
+            }
+            let size: usize = parts[2].parse().ok()?;
+            if size > crate::navigation::MAX_FILE_BYTES
+                || total.saturating_add(size) > CATALOG_BYTES_PER_SIDE
+            {
+                omitted += 1;
+                continue;
+            }
+            writeln!(input, "contents {oid}").ok()?;
+            input.flush().ok()?;
+            let mut content_header = String::new();
+            output
+                .by_ref()
+                .take(256)
+                .read_line(&mut content_header)
+                .ok()?;
+            if content_header != header {
+                return None;
+            }
+            let mut bytes = vec![0; size];
+            output.read_exact(&mut bytes).ok()?;
+            let mut newline = [0];
+            output.read_exact(&mut newline).ok()?;
+            if newline != *b"\n" {
+                return None;
+            }
+            total += size;
+            files.insert(entry[tab + 1..].to_vec(), bytes);
+        }
+        if omitted > 0 {
+            gaps.push(format!("Catalog acquisition omitted {omitted} source(s): 1 MiB per file / 8 MiB per side byte limit"));
+        }
+        Some(files)
+    })();
+    // Also reap on malformed headers or early limits; no per-object processes.
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+fn tree_catalog(cwd: &Path, tree: &[u8], gaps: &mut Vec<String>) -> Option<CatalogFiles> {
+    use std::{io::Read, os::unix::ffi::OsStrExt, process::Stdio};
+    let mut child = command(cwd)
+        .args(["ls-tree", "-rz", "--full-tree"])
+        .arg(std::ffi::OsStr::from_bytes(tree))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut entries = Vec::new();
+    let read = child
+        .stdout
+        .take()?
+        .take(CATALOG_LIST_BYTES as u64 + 1)
+        .read_to_end(&mut entries);
+    if read.is_err() || entries.len() > CATALOG_LIST_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        gaps.push("Catalog acquisition tree listing exceeds 2 MiB; this side omitted".into());
+        return Some(CatalogFiles::new());
+    }
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    listed_catalog(cwd, &entries, false, gaps)
+}
+fn index_catalog(
+    cwd: &Path,
+    snapshot: &CatalogFiles,
+    gaps: &mut Vec<String>,
+) -> Option<CatalogFiles> {
+    listed_catalog(
+        cwd,
+        snapshot.get(b"\0INDEX_ENTRIES".as_slice())?,
+        true,
+        gaps,
+    )
+}
+fn worktree_catalog(snapshot: &CatalogFiles, gaps: &mut Vec<String>) -> CatalogFiles {
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut omitted = false;
+    let files = snapshot
+        .iter()
+        .filter(|(path, _)| {
+            !path.starts_with(b"\0")
+                && snapshot
+                    .get(&[b"\0MODE".as_slice(), path].concat())
+                    .is_some_and(|mode| matches!(mode.as_slice(), b"100644" | b"100755"))
+        })
+        .take(CATALOG_FILES_PER_SIDE + 1)
+        .filter(|(_, bytes)| {
+            count += 1;
+            if count > CATALOG_FILES_PER_SIDE
+                || bytes.len() > crate::navigation::MAX_FILE_BYTES
+                || total.saturating_add(bytes.len()) > CATALOG_BYTES_PER_SIDE
+            {
+                omitted = true;
+                return false;
+            }
+            total += bytes.len();
+            true
+        })
+        .map(|(p, b)| (p.clone(), b.clone()))
+        .collect();
+    if omitted {
+        gaps.push("Catalog acquisition omitted snapshot sources: 1024 files / 1 MiB per file / 8 MiB per side limit".into());
+    }
+    files
+}
+
+fn no_index_catalog(
+    snapshot: &CatalogFiles,
+    analysis: &Analysis,
+    gaps: &mut Vec<String>,
+) -> Option<(CatalogFiles, CatalogFiles)> {
+    let operands: Vec<_> = analysis.operands.iter().rev().take(2).collect();
+    if operands.len() != 2 {
+        return None;
+    }
+    let files = worktree_catalog(snapshot, gaps);
+    let select = |operand: &OsString| {
+        let prefix = operand.as_encoded_bytes();
+        files
+            .clone()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.as_slice() == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|tail| tail.starts_with(b"/"))
+            })
+            .map(|(path, bytes)| (path.strip_prefix(b"/").unwrap_or(&path).to_vec(), bytes))
+            .collect()
+    };
+    Some((select(operands[1]), select(operands[0])))
 }
