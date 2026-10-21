@@ -75,7 +75,7 @@ impl App {
     pub fn key(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(item) = self.capture.items.get(self.selected) {
                     let mut preview = Preview::item(&self.capture.cwd, item);
                     if !self.capture.stderr.is_empty() {
@@ -92,6 +92,12 @@ impl App {
                 } else if self.capture.unavailable.is_some() {
                     self.status = "File actions are unavailable in original-output mode".into();
                 }
+            }
+            KeyCode::Char('h') if self.capture.unavailable.is_none() => {
+                self.preview = None;
+                self.focus = Focus::Files;
+                self.top = 0;
+                self.left = 0;
             }
             KeyCode::Tab if self.preview.is_some() && self.capture.unavailable.is_none() => {
                 self.focus = if self.focus == Focus::Files {

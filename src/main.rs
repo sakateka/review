@@ -8,7 +8,7 @@ mod ui;
 use anyhow::{Result, bail};
 use std::{ffi::OsString, io::IsTerminal};
 
-const HELP: &str = "review [--help | --version] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\n\nControls: arrows/j/k select or scroll; Enter opens and focuses a diff;\nTab switches focus; left/right scroll horizontally; Space toggles an explicit\nreview mark; q/Escape exits. Navigation closes the preview.\n\nMarks are saved immediately under $XDG_STATE_HOME/review, or\n$HOME/.local/state/review. Unsupported output stays readable with file actions\ndisabled. Requires system Git and an interactive terminal; no delta required.\n";
+const HELP: &str = "review [--help | --version] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\n\nControls: up/down or j/k select or scroll; Enter or l opens and focuses a diff;\nh closes the diff and returns to the file list; Tab switches focus;\nleft/right scroll horizontally; Space toggles an explicit review mark;\nq/Escape exits. Changing the selected file closes the preview.\n\nMarks are saved immediately under $XDG_STATE_HOME/review, or\n$HOME/.local/state/review. Unsupported output stays readable with file actions\ndisabled. Requires system Git and an interactive terminal; no delta required.\n";
 
 #[derive(Debug, PartialEq)]
 enum Cli {

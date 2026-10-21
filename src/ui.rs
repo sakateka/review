@@ -126,7 +126,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(
         Paragraph::new(
-            "Enter open · Tab focus · ↑↓/jk navigate/scroll · ←→ scroll · Space mark · q/Esc quit",
+            "l/Enter open · h back · jk/↑↓ move · ←→ scroll · Space mark · q quit · Tab focus",
         ),
         areas[2],
     );
