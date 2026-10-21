@@ -760,6 +760,276 @@ fn explicit_implicit_no_index_files_and_directories_work_outside_repositories() 
 }
 
 #[test]
+fn no_index_marks_follow_captured_file_bytes_and_invalidate_on_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let left = directory.path().join("left");
+    let right = directory.path().join("right");
+    std::fs::write(&left, b"old side\n").unwrap();
+    std::fs::write(&right, b"new side\n").unwrap();
+    let args = vec!["--no-index".into(), "left".into(), "right".into()];
+    let captured = git::capture(directory.path(), &args).unwrap();
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_some());
+    let store = state::Store::at(state_dir.path(), directory.path(), &args);
+    let mut app = App::new(captured, store);
+    app.key(KeyCode::Char(' '));
+    assert_eq!(app.marks, [true]);
+    assert_eq!(
+        App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state_dir.path(), directory.path(), &args)
+        )
+        .marks,
+        [true]
+    );
+    let absolute_args = vec![
+        "--no-index".into(),
+        left.as_os_str().to_owned(),
+        right.as_os_str().to_owned(),
+    ];
+    let absolute = git::capture(directory.path(), &absolute_args).unwrap();
+    assert!(absolute.items[0].canonical_identity.is_some());
+    std::fs::write(&right, b"changed side\n").unwrap();
+    assert_eq!(
+        App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state_dir.path(), directory.path(), &args)
+        )
+        .marks,
+        [false]
+    );
+}
+
+#[test]
+fn identical_mode_only_patch_with_changed_sides_clears_mark() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    git_run(directory.path(), &["switch", "-c", "left"]);
+    git_run(directory.path(), &["update-ref", "refs/heads/left", "HEAD"]);
+    git_run(directory.path(), &["switch", "-c", "right"]);
+    std::fs::set_permissions(
+        directory.path().join("one.rs"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    git_run(directory.path(), &["commit", "-qm", "executable side"]);
+    git_run(
+        directory.path(),
+        &["update-ref", "refs/heads/right", "HEAD"],
+    );
+    let args = vec!["left".into(), "right".into()];
+    let first = git::capture(directory.path(), &args).unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert!(first.items[0].patch.windows(9).any(|w| w == b"old mode "));
+    let first_patch = first.items[0].patch.clone();
+    let store = state::Store::at(state_dir.path(), directory.path(), &args);
+    let mut app = App::new(first, store);
+    app.key(KeyCode::Char(' '));
+    assert!(app.marks[0]);
+
+    git_run(directory.path(), &["switch", "left"]);
+    std::fs::write(directory.path().join("one.rs"), b"same new bytes\n").unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    git_run(directory.path(), &["commit", "-qm", "left content"]);
+    git_run(directory.path(), &["update-ref", "refs/heads/left", "HEAD"]);
+    git_run(directory.path(), &["switch", "right"]);
+    std::fs::write(directory.path().join("one.rs"), b"same new bytes\n").unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    git_run(directory.path(), &["commit", "-qm", "right content"]);
+    git_run(
+        directory.path(),
+        &["update-ref", "refs/heads/right", "HEAD"],
+    );
+    let second = git::capture(directory.path(), &args).unwrap();
+    assert_eq!(second.items[0].patch, first_patch);
+    assert_eq!(
+        App::new(
+            second,
+            state::Store::at(state_dir.path(), directory.path(), &args)
+        )
+        .marks,
+        [false]
+    );
+}
+
+#[test]
+fn ignored_content_changes_cannot_use_metadata_only_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = fixture();
+    std::fs::set_permissions(
+        directory.path().join("one.rs"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn one() {\n\tlet    answer = 1;\n}\n",
+    )
+    .unwrap();
+    let args = ["-w".into(), "HEAD".into()];
+    let first = git::capture(directory.path(), &args).unwrap();
+    assert_eq!(first.items.len(), 1);
+    let first_patch = first.items[0].patch.clone();
+    let first_identity = first.items[0].canonical_identity.clone().unwrap();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn one() {\n\tlet      answer = 1;\n}\n",
+    )
+    .unwrap();
+    let second = git::capture(directory.path(), &args).unwrap();
+    let strip_index = |patch: &[u8]| {
+        patch
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter(|line| !line.starts_with(b"index "))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        strip_index(&second.items[0].patch),
+        strip_index(&first_patch)
+    );
+    assert!(second.items[0].canonical_identity.is_some());
+    assert_ne!(
+        second.items[0].canonical_identity.as_ref(),
+        Some(&first_identity)
+    );
+}
+
+#[test]
+fn unrelated_commit_movement_preserves_unchanged_item_mark() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    git_run(directory.path(), &["tag", "review-base"]);
+    std::fs::write(directory.path().join("one.rs"), b"committed change\n").unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    git_run(directory.path(), &["commit", "-qm", "reviewed change"]);
+    let args = vec!["review-base".into(), "HEAD".into()];
+    let mut app = App::new(
+        git::capture(directory.path(), &args).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    assert_eq!(app.capture.items.len(), 1);
+    app.key(KeyCode::Char(' '));
+    assert!(app.marks[0]);
+
+    std::fs::write(directory.path().join("unrelated.txt"), b"unrelated\n").unwrap();
+    git_run(directory.path(), &["add", "unrelated.txt"]);
+    git_run(directory.path(), &["commit", "-qm", "unrelated movement"]);
+    let restarted = App::new(
+        git::capture(directory.path(), &args).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    assert_eq!(restarted.capture.items.len(), 2);
+    let reviewed = restarted
+        .capture
+        .items
+        .iter()
+        .position(|item| item.new_path == b"one.rs")
+        .unwrap();
+    assert!(restarted.marks[reviewed]);
+}
+
+#[test]
+fn staged_content_change_clears_only_its_mark() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    change(directory.path());
+    git_run(directory.path(), &["add", "."]);
+    let args = vec!["--cached".into()];
+    let mut app = App::new(
+        git::capture(directory.path(), &args).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Char(' '));
+    assert_eq!(app.marks, [true, true]);
+    std::fs::write(directory.path().join("one.rs"), b"different staged bytes\n").unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    assert_eq!(
+        App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state_dir.path(), directory.path(), &args)
+        )
+        .marks,
+        [false, true]
+    );
+}
+
+#[test]
+fn mutations_at_capture_boundary_disable_proof_but_post_capture_marks_stay_bound() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    change(directory.path());
+    let args = vec![OsString::from("HEAD")];
+    let changed_path = directory.path().join("one.rs");
+    let unstable = git::capture_with_hook(directory.path(), &args, || {
+        std::fs::write(&changed_path, b"raced after Git compared the file\n").unwrap();
+    })
+    .unwrap();
+    let item = unstable
+        .items
+        .iter()
+        .find(|item| item.new_path == b"one.rs")
+        .unwrap();
+    assert!(item.canonical_identity.is_none());
+    let mut app = App::new(
+        unstable,
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    app.key(KeyCode::Char(' '));
+    assert!(!app.marks[app.selected]);
+    assert!(app.status.contains("could not be proven"));
+
+    std::fs::write(&changed_path, b"captured before later mutation\n").unwrap();
+    let captured = git::capture(directory.path(), &args).unwrap();
+    assert!(captured.items[0].canonical_identity.is_some());
+    let mut app = App::new(
+        captured,
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    std::fs::write(&changed_path, b"changed after capture\n").unwrap();
+    app.key(KeyCode::Char(' '));
+    assert!(app.marks[0]);
+    assert_eq!(
+        App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state_dir.path(), directory.path(), &args)
+        )
+        .marks,
+        [false, false]
+    );
+}
+
+#[test]
+fn legacy_session_path_is_read_and_unproven_marks_stay_pending() {
+    let directory = fixture();
+    let base = tempfile::tempdir().unwrap();
+    change(directory.path());
+    let args = vec![OsString::from("HEAD")];
+    let store = state::Store::at(base.path(), directory.path(), &args);
+    let captured = git::capture(directory.path(), &args).unwrap();
+    let legacy_marks: std::collections::BTreeMap<_, _> = captured
+        .items
+        .iter()
+        .map(|item| (state::digest([&item.new_path]), "unverifiable-legacy-mark"))
+        .collect();
+    std::fs::create_dir_all(store.legacy_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &store.legacy_path,
+        serde_json::to_vec(&serde_json::json!({"version": 1, "marks": legacy_marks})).unwrap(),
+    )
+    .unwrap();
+    let loaded = store.load_report(&captured.items).unwrap();
+    assert_eq!(loaded.marks, [false, false]);
+    assert!(loaded.pending_legacy);
+}
+
+#[test]
 fn refs_ranges_merge_base_blob_and_reverse_comparisons_match_git() {
     let directory = fixture();
     change(directory.path());
@@ -1856,4 +2126,438 @@ fn custom_a_b_shaped_prefixes_never_create_fictitious_item_identities() {
     git_run(directory.path(), &["config", "diff.srcPrefix", "a/"]);
     git_run(directory.path(), &["config", "diff.dstPrefix", "b/"]);
     assert_eq!(assert_native(directory.path(), &["HEAD"]).items.len(), 2);
+}
+
+#[test]
+fn staged_metadata_marks_use_base_tree_and_index_for_modes_and_exact_renames() {
+    use std::os::unix::fs::PermissionsExt;
+    for reverse in [false, true] {
+        let directory = fixture();
+        let state_dir = tempfile::tempdir().unwrap();
+        let args: Vec<OsString> = if reverse {
+            vec!["--cached".into(), "-R".into(), "HEAD".into()]
+        } else {
+            vec!["--cached".into()]
+        };
+        for name in ["one.rs", "two.rs"] {
+            std::fs::set_permissions(
+                directory.path().join(name),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git_run(directory.path(), &["add", "."]);
+        let before = snapshot(directory.path());
+        let first = git::capture(directory.path(), &args).unwrap();
+        assert_eq!(snapshot(directory.path()), before);
+        if reverse {
+            // Native reverse headers use b/ then a/: keep faithful fallback.
+            assert!(first.unavailable.is_some());
+            continue;
+        }
+        assert!(
+            first
+                .items
+                .iter()
+                .all(|item| item.canonical_identity.is_some())
+        );
+        let patches: Vec<_> = first.items.iter().map(|item| item.patch.clone()).collect();
+        let mut app = App::new(
+            first,
+            state::Store::at(state_dir.path(), directory.path(), &args),
+        );
+        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Down);
+        app.key(KeyCode::Char(' '));
+        assert_eq!(app.marks, [true, true]);
+        assert_eq!(
+            state::Store::at(state_dir.path(), directory.path(), &args)
+                .load(&git::capture(directory.path(), &args).unwrap().items)
+                .unwrap(),
+            [true, true]
+        );
+        // Move the base and index to new bytes while preserving both patches.
+        for name in ["one.rs", "two.rs"] {
+            std::fs::set_permissions(
+                directory.path().join(name),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            directory.path().join("one.rs"),
+            b"different complete base bytes\n",
+        )
+        .unwrap();
+        git_run(directory.path(), &["add", "."]);
+        git_run(directory.path(), &["commit", "-qm", "new base contents"]);
+        for name in ["one.rs", "two.rs"] {
+            std::fs::set_permissions(
+                directory.path().join(name),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        git_run(directory.path(), &["add", "."]);
+        let changed = git::capture(directory.path(), &args).unwrap();
+        assert_eq!(
+            changed
+                .items
+                .iter()
+                .map(|item| item.patch.clone())
+                .collect::<Vec<_>>(),
+            patches
+        );
+        assert_eq!(
+            state::Store::at(state_dir.path(), directory.path(), &args)
+                .load(&changed.items)
+                .unwrap(),
+            [false, true]
+        );
+    }
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    git_run(directory.path(), &["mv", "one.rs", "renamed.rs"]);
+    let args = vec!["--cached".into(), "HEAD".into()];
+    let mut app = App::new(
+        git::capture(directory.path(), &args).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    assert!(app.capture.items[0].status.starts_with('R'));
+    assert!(app.capture.items[0].canonical_identity.is_some());
+    app.key(KeyCode::Char(' '));
+    let store = state::Store::at(state_dir.path(), directory.path(), &args);
+    assert_eq!(
+        store
+            .load(&git::capture(directory.path(), &args).unwrap().items)
+            .unwrap(),
+        [true]
+    );
+    std::fs::write(
+        directory.path().join("renamed.rs"),
+        b"changed rename destination\n",
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "renamed.rs"]);
+    assert!(
+        store
+            .load(&git::capture(directory.path(), &args).unwrap().items)
+            .unwrap()
+            .iter()
+            .all(|mark| !mark)
+    );
+}
+
+#[test]
+fn subdirectory_worktree_capture_uses_native_root_relative_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let sub = directory.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let name = OsString::from_vec(b" leading-\xff trailing ".to_vec());
+    let file = sub.join(&name);
+    std::fs::write(&file, b"old\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "nested native file"]);
+    std::fs::write(&file, b"captured\n").unwrap();
+    let args = vec!["HEAD".into()];
+    let mut app = App::new(
+        git::capture(&sub, &args).unwrap(),
+        state::Store::at(state_dir.path(), &sub, &args),
+    );
+    assert_eq!(app.capture.items.len(), 1);
+    assert!(app.capture.items[0].canonical_identity.is_some());
+    app.key(KeyCode::Char(' '));
+    assert_eq!(app.marks, [true]);
+    let store = state::Store::at(state_dir.path(), &sub, &args);
+    assert_eq!(
+        store
+            .load(&git::capture(&sub, &args).unwrap().items)
+            .unwrap(),
+        [true]
+    );
+    std::fs::write(&file, b"changed\n").unwrap();
+    assert_eq!(
+        store
+            .load(&git::capture(&sub, &args).unwrap().items)
+            .unwrap(),
+        [false]
+    );
+}
+
+#[test]
+fn pending_legacy_survives_v2_saves_and_migrated_unmarks_never_resurrect() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    change(directory.path());
+    let args = vec!["HEAD".into()];
+    let captured = git::capture(directory.path(), &args).unwrap();
+    let store = state::Store::at(state_dir.path(), directory.path(), &args);
+    let mut legacy = std::collections::BTreeMap::new();
+    for item in &captured.items {
+        legacy.insert(
+            state::digest([&item.new_path]),
+            item.legacy_fingerprints[0].clone(),
+        );
+    }
+    legacy.insert(
+        "absent-unverifiable-item".to_owned(),
+        "abbreviated-patch-only".to_owned(),
+    );
+    let bytes = serde_json::to_vec(&serde_json::json!({"version": 1, "marks": legacy})).unwrap();
+    std::fs::create_dir_all(store.legacy_path.parent().unwrap()).unwrap();
+    std::fs::write(&store.legacy_path, &bytes).unwrap();
+    git_run(directory.path(), &["restore", "two.rs"]);
+    let mut app = App::new(git::capture(directory.path(), &args).unwrap(), store);
+    assert_eq!(app.marks, [true]);
+    assert!(app.status.contains("pending"));
+    app.key(KeyCode::Char(' ')); // Persist explicit unmark of migrated one.rs.
+    assert_eq!(app.marks, [false]);
+    assert!(app.store.path.exists());
+    let loaded = app
+        .store
+        .load_report(&git::capture(directory.path(), &args).unwrap().items)
+        .unwrap();
+    assert_eq!(loaded.marks, [false]);
+    assert!(loaded.pending_legacy);
+    change(directory.path()); // Previously absent two.rs can now prove its legacy identity.
+    let loaded = app
+        .store
+        .load_report(&git::capture(directory.path(), &args).unwrap().items)
+        .unwrap();
+    assert_eq!(loaded.marks, [false, true]);
+    assert!(loaded.pending_legacy);
+    assert_eq!(std::fs::read(&app.store.legacy_path).unwrap(), bytes);
+    app.store
+        .save(
+            &git::capture(directory.path(), &args).unwrap().items,
+            &[false, false],
+        )
+        .unwrap();
+    assert_eq!(
+        app.store
+            .load(&git::capture(directory.path(), &args).unwrap().items)
+            .unwrap(),
+        [false, false]
+    );
+    // A corrupt legacy file is still a protected input after v2 exists.
+    let v2_bytes = std::fs::read(&app.store.path).unwrap();
+    std::fs::write(&app.store.legacy_path, b"unknown corrupt input").unwrap();
+    assert!(app.store.load_report(&captured.items).is_err());
+    assert!(app.store.save(&captured.items, &[true, true]).is_err());
+    assert_eq!(std::fs::read(&app.store.path).unwrap(), v2_bytes);
+    assert_eq!(
+        std::fs::read(&app.store.legacy_path).unwrap(),
+        b"unknown corrupt input"
+    );
+}
+
+#[test]
+fn capture_boundary_index_and_metadata_ref_movement_leave_proof_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = fixture();
+    std::fs::set_permissions(
+        directory.path().join("one.rs"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "one.rs"]);
+    let captured = git::capture_with_hook(directory.path(), &["--cached".into()], || {
+        git_run(directory.path(), &["update-index", "--chmod=-x", "one.rs"]);
+    })
+    .unwrap();
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_none());
+    git_run(directory.path(), &["tag", "before"]);
+    git_run(directory.path(), &["add", "one.rs"]);
+    git_run(directory.path(), &["commit", "-qm", "executable"]);
+    let captured =
+        git::capture_with_hook(directory.path(), &["before".into(), "HEAD".into()], || {
+            git_run(
+                directory.path(),
+                &["update-ref", "refs/tags/before", "HEAD"],
+            );
+        })
+        .unwrap();
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_none());
+    assert!(
+        captured
+            .diagnostic
+            .contains("complete captured-content proof")
+    );
+}
+
+#[test]
+fn implicit_no_index_and_symlink_operands_have_captured_identities() {
+    use std::os::unix::fs::symlink;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("left"), b"left\n").unwrap();
+    std::fs::write(directory.path().join("right"), b"right\n").unwrap();
+    for args in [
+        &["left", "right"][..],
+        &["--no-index", "--", "left", "right"],
+    ] {
+        let captured = capture(directory.path(), args);
+        assert!(captured.items[0].canonical_identity.is_some());
+    }
+    std::fs::create_dir(directory.path().join("target")).unwrap();
+    symlink("missing-target", directory.path().join("link-left")).unwrap();
+    symlink("other-target", directory.path().join("link-right")).unwrap();
+    let captured = capture(directory.path(), &["--no-index", "link-left", "link-right"]);
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].old_mode, "120000");
+    assert!(captured.items[0].canonical_identity.is_some());
+}
+
+#[test]
+fn relative_git_context_worker() {
+    let Some(cwd) = std::env::var_os("REVIEW_RELATIVE_CONTEXT_FIXTURE") else {
+        return;
+    };
+    let cwd = Path::new(&cwd);
+    let captured = capture(cwd, &["--cached", "HEAD"]);
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].new_path, b"sub/file");
+    assert!(captured.items[0].canonical_identity.is_some());
+    let captured = capture(cwd, &[]);
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].new_path, b"sub/file");
+    assert!(captured.items[0].canonical_identity.is_some());
+}
+
+#[test]
+fn subdirectory_relative_alternate_index_and_git_paths_keep_original_context() {
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+    let directory = fixture();
+    let sub = directory.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("file"), b"base\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "nested"]);
+    let native_index = OsString::from_vec(b" index-\xff ".to_vec());
+    std::fs::copy(
+        directory.path().join(".git/index"),
+        directory.path().join(&native_index),
+    )
+    .unwrap();
+    std::fs::set_permissions(sub.join("file"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let status = Command::new("git")
+        .current_dir(&sub)
+        .env("GIT_INDEX_FILE", &native_index)
+        .env("GIT_DIR", "../.git")
+        .env("GIT_WORK_TREE", "..")
+        .args(["add", "file"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    std::fs::write(sub.join("file"), b"working tree change\n").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::relative_git_context_worker",
+            "--nocapture",
+        ])
+        .env("REVIEW_RELATIVE_CONTEXT_FIXTURE", &sub)
+        .env("GIT_INDEX_FILE", &native_index)
+        .env("GIT_DIR", "../.git")
+        .env("GIT_WORK_TREE", "..")
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn no_index_mode_only_and_empty_files_prove_complete_sides() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("left"), b"same bytes\n").unwrap();
+    std::fs::write(directory.path().join("right"), b"same bytes\n").unwrap();
+    std::fs::set_permissions(
+        directory.path().join("right"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let captured = capture(directory.path(), &["--no-index", "left", "right"]);
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_some());
+    std::fs::create_dir(directory.path().join("old")).unwrap();
+    std::fs::create_dir(directory.path().join("new")).unwrap();
+    std::fs::write(directory.path().join("new/empty"), []).unwrap();
+    let captured = capture(directory.path(), &["--no-index", "old", "new"]);
+    assert_eq!(captured.items.len(), 1);
+    assert!(captured.items[0].canonical_identity.is_some());
+}
+
+#[test]
+fn worktree_exact_rename_mark_restarts_and_invalidates_changed_destination() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    git_run(directory.path(), &["mv", "one.rs", "renamed.rs"]);
+    let args = vec!["HEAD".into()];
+    let captured = git::capture(directory.path(), &args).unwrap();
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].status, "R100");
+    assert!(captured.items[0].old_oid.is_empty());
+    assert!(captured.items[0].new_oid.is_empty());
+    let mut app = App::new(
+        captured,
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    app.key(KeyCode::Char(' '));
+    assert_eq!(app.marks, [true]);
+    let store = state::Store::at(state_dir.path(), directory.path(), &args);
+    assert_eq!(
+        store
+            .load(&git::capture(directory.path(), &args).unwrap().items)
+            .unwrap(),
+        [true]
+    );
+    std::fs::write(
+        directory.path().join("renamed.rs"),
+        b"changed rename destination\n",
+    )
+    .unwrap();
+    let changed = git::capture(directory.path(), &args).unwrap();
+    assert!(!changed.items.is_empty());
+    assert!(store.load(&changed.items).unwrap().iter().all(|mark| !mark));
+}
+
+#[test]
+fn captured_permissions_match_git_owner_execute_for_worktree_and_no_index() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = fixture();
+    std::fs::write(directory.path().join("one.rs"), b"changed content\n").unwrap();
+    std::fs::set_permissions(
+        directory.path().join("one.rs"),
+        std::fs::Permissions::from_mode(0o654),
+    )
+    .unwrap();
+    let captured = capture(directory.path(), &["HEAD"]);
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].new_mode, "100644");
+    assert!(captured.items[0].canonical_identity.is_some());
+
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("left"), b"old content\n").unwrap();
+    std::fs::write(directory.path().join("right"), b"new content\n").unwrap();
+    for name in ["left", "right"] {
+        std::fs::set_permissions(
+            directory.path().join(name),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
+    }
+    let captured = capture(directory.path(), &["--no-index", "left", "right"]);
+    assert_eq!(captured.items.len(), 1);
+    assert_eq!(captured.items[0].old_mode, "100644");
+    assert_eq!(captured.items[0].new_mode, "100644");
+    assert!(captured.items[0].canonical_identity.is_some());
 }

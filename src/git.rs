@@ -27,8 +27,10 @@ pub struct Item {
     pub old_source: SourceIdentity,
     pub new_source: SourceIdentity,
     pub patch: Vec<u8>,
-    pub metadata: Vec<u8>,
     pub legacy_fingerprints: Vec<String>,
+    /// Digest of both complete captured sides and semantic item metadata.
+    /// Missing when the representation cannot prove complete side bytes.
+    pub canonical_identity: Option<String>,
 }
 
 impl Item {
@@ -138,6 +140,8 @@ struct Analysis {
     immutable: bool,
     opaque: bool,
     custom_prefixes: bool,
+    content_omissions: bool,
+    reverse: bool,
 }
 
 // Git's value-taking options own the following token even if it resembles a
@@ -238,7 +242,10 @@ fn analyze(cwd: &Path, args: &[OsString]) -> Result<Analysis> {
         }
     }
 
-    let mut analysis = Analysis::default();
+    let mut analysis = Analysis {
+        no_index,
+        ..Analysis::default()
+    };
     let mut src_default = true;
     let mut dst_default = true;
     let prefixes = command(cwd)
@@ -341,6 +348,17 @@ fn analyze(cwd: &Path, args: &[OsString]) -> Result<Analysis> {
         if option == b"--no-ignore-submodules" {
             analysis.ignore_submodules = Some(b"none".to_vec());
         }
+        if option == b"-R"
+            || option == b"--reverse"
+            || (option.starts_with(b"-")
+                && !option.starts_with(b"--")
+                && option[1..]
+                    .iter()
+                    .all(|byte| b"psuWwbaRDcmrtzv".contains(byte))
+                && option.contains(&b'R'))
+        {
+            analysis.reverse = true;
+        }
         if option == b"--merge-base" {
             analysis.merge_base = true;
         }
@@ -350,11 +368,30 @@ fn analyze(cwd: &Path, args: &[OsString]) -> Result<Analysis> {
         if matches!(option, b"--patch" | b"-p" | b"--no-quiet") {
             analysis.opaque = false;
         }
+        if matches!(
+            option,
+            b"-w"
+                | b"-b"
+                | b"--ignore-space-at-eol"
+                | b"--ignore-cr-at-eol"
+                | b"--ignore-blank-lines"
+                | b"--word-diff"
+                | b"--color-words"
+        ) || b"--ignore-all-space".starts_with(option) && option.len() > 2
+            || b"--ignore-space-change".starts_with(option) && option.len() > 2
+            || b"--ignore-matching-lines".starts_with(option) && option.len() > 2
+            || b"--word-diff-regex".starts_with(option) && option.len() > 2
+        {
+            analysis.content_omissions = true;
+        }
         if takes_value(option, no_index) && option == bytes {
             index += 1;
         } else if !bytes.starts_with(b"-") {
             analysis.operands.push(arg.clone());
         }
+    }
+    if analysis.no_index {
+        analysis.operands.append(&mut analysis.paths);
     }
     analysis.custom_prefixes = !src_default || !dst_default;
     if analysis.ext == Some(true) || analysis.textconv == Some(true) {
@@ -703,8 +740,22 @@ fn submodule_worktree_ignored(root: &Path, path: &[u8], analysis: &Analysis) -> 
 }
 
 pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
+    capture_with_hook(cwd, args, || {})
+}
+
+pub(crate) fn capture_with_hook(
+    cwd: &Path,
+    args: &[OsString],
+    after_comparison: impl FnOnce(),
+) -> Result<Capture> {
     let analysis = analyze(cwd, args)?;
     policy(cwd, &analysis)?;
+    let before = if analysis.no_index || !analysis.immutable || analysis.index_only {
+        input_snapshot(cwd, &analysis).ok()
+    } else {
+        None
+    };
+    let refs_before = revision_snapshot(cwd, &analysis);
     // Exactly one comparison. Its bytes, diagnostics and actual status survive
     // even when there is no provable mapping, or Git reports findings/errors.
     let result = command(cwd)
@@ -712,6 +763,9 @@ pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
         .args(args)
         .output()
         .context("cannot execute system Git")?;
+    after_comparison();
+    let refs_after = revision_snapshot(cwd, &analysis);
+    let refs_stable = refs_before.is_some() && refs_before == refs_after;
     let mut items = if !analysis.opaque
         && !analysis.custom_prefixes
         && result.status.code().is_some_and(|code| code <= 1)
@@ -721,13 +775,38 @@ pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
         None
     };
     if let Some(items) = &mut items {
+        let after = before
+            .as_ref()
+            .and_then(|_| input_snapshot(cwd, &analysis).ok());
         for item in items {
+            let stable = before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| {
+                if analysis.index_only {
+                    return a == b;
+                }
+                let keys = [&item.new_path, &item.old_path];
+                let paths_stable = keys
+                    .into_iter()
+                    .take(if analysis.no_index { 2 } else { 1 })
+                    .all(|path| {
+                        let mode = [b"\0MODE".as_slice(), path.as_slice()].concat();
+                        a.get(path) == b.get(path) && a.get(&mode) == b.get(&mode)
+                    });
+                paths_stable && a.get(b"\0GIT_INDEX".as_slice()) == b.get(b"\0GIT_INDEX".as_slice())
+            });
+            item.canonical_identity = canonical_identity(
+                cwd,
+                item,
+                &analysis,
+                stable,
+                after.as_ref(),
+                refs_before.as_deref().filter(|_| refs_stable),
+            );
             item.legacy_fingerprints =
                 legacy_fingerprints(cwd, item, &analysis).unwrap_or_default();
         }
     }
     let unavailable = items.is_none().then(|| "File structure is unavailable for this output. Marks and source enrichment are disabled.".into());
-    let diagnostic = if result.status.success() {
+    let mut diagnostic = if result.status.success() {
         visible_bytes(&result.stderr)
     } else {
         format!(
@@ -740,6 +819,18 @@ pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
             visible_bytes(&result.stderr)
         )
     };
+    if let Some(items) = &items {
+        let unproven = items
+            .iter()
+            .filter(|item| item.canonical_identity.is_none())
+            .count();
+        if unproven > 0 {
+            if !diagnostic.is_empty() {
+                diagnostic.push_str("; ");
+            }
+            diagnostic.push_str(&format!("{unproven} item(s) lack complete captured-content proof; their marks cannot be restored"));
+        }
+    }
     Ok(Capture {
         items: items.unwrap_or_default(),
         original: result.stdout,
@@ -750,6 +841,423 @@ pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
         cwd: cwd.into(),
         args: args.to_vec(),
     })
+}
+
+fn canonical_identity(
+    cwd: &Path,
+    item: &Item,
+    analysis: &Analysis,
+    stable: bool,
+    snapshot: Option<&std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
+    revisions: Option<&[Vec<u8>]>,
+) -> Option<String> {
+    let sources = crate::source::reconstruct(cwd, item).ok();
+    let (old, new) = if let Some(sources) = sources {
+        (sources.old, sources.new)
+    } else if stable && analysis.index_only {
+        index_sides(cwd, snapshot?, revisions?, item, analysis.reverse)?
+    } else if stable && !analysis.no_index && !analysis.immutable {
+        let files = snapshot?;
+        let new = files.get(&item.new_path)?.clone();
+        let metadata_only = !analysis.no_index
+            && !analysis.content_omissions
+            && item.old_oid.is_empty()
+            && item.new_oid.is_empty()
+            && (item.patch.windows(9).any(|part| part == b"old mode ")
+                || matches!(item.status.as_str(), "R100" | "C100"));
+        let old = if metadata_only {
+            new.clone()
+        } else if analysis.no_index {
+            files.get(&item.old_path)?.clone()
+        } else if !item.old_oid.is_empty() && item.old_oid.bytes().all(|byte| byte == b'0') {
+            Vec::new()
+        } else if item.old_oid.is_empty() {
+            return None;
+        } else {
+            object_side(cwd, &item.old_oid)?
+        };
+        if !metadata_only
+            && (!hash_matches(cwd, &old, &item.old_oid) || !hash_matches(cwd, &new, &item.new_oid))
+        {
+            return None;
+        }
+        (old, new)
+    } else if stable && analysis.no_index {
+        let files = snapshot?;
+        let old = if item.old_mode == "000000" {
+            Vec::new()
+        } else {
+            files.get(&item.old_path)?.clone()
+        };
+        let new = if item.new_mode == "000000" {
+            Vec::new()
+        } else {
+            files.get(&item.new_path)?.clone()
+        };
+        if let Ok(reconstructed) =
+            crate::source::reconstruct_from_old(cwd, item, old.clone(), false)
+        {
+            if reconstructed.new != new {
+                return None;
+            }
+        } else if !(item.old_oid.is_empty()
+            && item.new_oid.is_empty()
+            && !analysis.content_omissions
+            && old == new)
+            && (!hash_matches(cwd, &old, &item.old_oid) || !hash_matches(cwd, &new, &item.new_oid))
+        {
+            return None;
+        }
+        (old, new)
+    } else if analysis.immutable && !analysis.no_index {
+        if !item.old_oid.is_empty() && !item.new_oid.is_empty() {
+            (
+                object_side(cwd, &item.old_oid)?,
+                object_side(cwd, &item.new_oid)?,
+            )
+        } else {
+            reference_sides(cwd, revisions?, item)?
+        }
+    } else {
+        return None;
+    };
+    if !stable && (analysis.no_index || !analysis.immutable || analysis.index_only) {
+        return None;
+    }
+    if analysis.no_index || !analysis.immutable {
+        let files = snapshot?;
+        let actual_new = if item.new_mode == "000000" {
+            &[]
+        } else {
+            files
+                .get(&item.new_path)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        };
+        let mode_key = [b"\0MODE".as_slice(), item.new_path.as_slice()].concat();
+        let old_mode_key = [b"\0MODE".as_slice(), item.old_path.as_slice()].concat();
+        if actual_new != new.as_slice()
+            || (analysis.no_index
+                && item.old_mode != "000000"
+                && files
+                    .get(&old_mode_key)
+                    .is_some_and(|mode| mode != item.old_mode.as_bytes()))
+            || (item.new_mode != "000000"
+                && files
+                    .get(&mode_key)
+                    .is_some_and(|mode| mode != item.new_mode.as_bytes()))
+        {
+            return None;
+        }
+    }
+    let kind = [item.status.as_bytes().first().copied()?];
+    Some(crate::state::digest([
+        b"review-item-v2".as_slice(),
+        item.old_path.as_slice(),
+        item.new_path.as_slice(),
+        item.old_mode.as_bytes(),
+        item.new_mode.as_bytes(),
+        kind.as_slice(),
+        old.as_slice(),
+        new.as_slice(),
+    ]))
+}
+
+// Pin the actual tree operands before/after the native comparison. Tree IDs
+// are provenance handles only; canonical identities never include them.
+fn revision_snapshot(cwd: &Path, analysis: &Analysis) -> Option<Vec<Vec<u8>>> {
+    use std::os::unix::ffi::OsStringExt;
+    if analysis.no_index || analysis.merge_base {
+        return None;
+    }
+    let operands = if analysis.index_only && analysis.operands.is_empty() {
+        vec![OsString::from("HEAD")]
+    } else {
+        analysis.operands.clone()
+    };
+    if operands.len() != if analysis.index_only { 1 } else { 2 } {
+        return None;
+    }
+    let mut trees: Vec<Vec<u8>> = operands
+        .iter()
+        .map(|operand| {
+            let mut expression = operand.as_encoded_bytes().to_vec();
+            expression.extend_from_slice(b"^{tree}");
+            let output = command(cwd)
+                .args(["rev-parse", "--verify", "--end-of-options"])
+                .arg(OsString::from_vec(expression))
+                .output()
+                .ok()?;
+            output.status.success().then(|| {
+                output
+                    .stdout
+                    .strip_suffix(b"\n")
+                    .unwrap_or(&output.stdout)
+                    .to_vec()
+            })
+        })
+        .collect::<Option<_>>()?;
+    if analysis.reverse && !analysis.index_only {
+        trees.reverse();
+    }
+    Some(trees)
+}
+
+fn entry_side(cwd: &Path, entries: &[u8], path: &[u8], mode: &str, index: bool) -> Option<Vec<u8>> {
+    if mode == "000000" {
+        return Some(Vec::new());
+    }
+    let entry = entries.split(|byte| *byte == 0).find(|entry| {
+        entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .is_some_and(|tab| &entry[tab + 1..] == path)
+    })?;
+    let tab = entry.iter().position(|byte| *byte == b'\t')?;
+    let fields: Vec<_> = entry[..tab].split(|byte| *byte == b' ').collect();
+    if fields.len() != 3
+        || fields[0] != mode.as_bytes()
+        || (index && fields[2] != b"0")
+        || (!index && fields[1] != b"blob")
+    {
+        return None;
+    }
+    object_side(
+        cwd,
+        std::str::from_utf8(fields[if index { 1 } else { 2 }]).ok()?,
+    )
+}
+
+fn tree_side(cwd: &Path, tree: &[u8], path: &[u8], mode: &str) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let output = command(cwd)
+        .args(["ls-tree", "-rz", "--full-tree"])
+        .arg(std::ffi::OsStr::from_bytes(tree))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    entry_side(cwd, &output.stdout, path, mode, false)
+}
+
+fn index_sides(
+    cwd: &Path,
+    snapshot: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    trees: &[Vec<u8>],
+    item: &Item,
+    reverse: bool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let tree = trees.first()?;
+    let entries = snapshot.get(b"\0INDEX_ENTRIES".as_slice())?;
+    if reverse {
+        Some((
+            entry_side(cwd, entries, &item.old_path, &item.old_mode, true)?,
+            tree_side(cwd, tree, &item.new_path, &item.new_mode)?,
+        ))
+    } else {
+        Some((
+            tree_side(cwd, tree, &item.old_path, &item.old_mode)?,
+            entry_side(cwd, entries, &item.new_path, &item.new_mode, true)?,
+        ))
+    }
+}
+
+fn reference_sides(cwd: &Path, revisions: &[Vec<u8>], item: &Item) -> Option<(Vec<u8>, Vec<u8>)> {
+    if revisions.len() != 2 {
+        return None;
+    }
+    Some((
+        tree_side(cwd, &revisions[0], &item.old_path, &item.old_mode)?,
+        tree_side(cwd, &revisions[1], &item.new_path, &item.new_mode)?,
+    ))
+}
+
+fn hash_matches(cwd: &Path, bytes: &[u8], expected: &str) -> bool {
+    if expected.is_empty() || expected.bytes().all(|byte| byte == b'0') {
+        return bytes.is_empty();
+    }
+    use std::io::Write;
+    use std::process::Stdio;
+    let Ok(mut child) = command(cwd)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    else {
+        return false;
+    };
+    if child
+        .stdin
+        .take()
+        .is_none_or(|mut stdin| stdin.write_all(bytes).is_err())
+    {
+        return false;
+    }
+    child.wait_with_output().ok().is_some_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .starts_with(expected)
+    })
+}
+
+// Snapshot tracked working-tree bytes without following symlinks, along with
+// the index and explicit no-index operands. Comparing both snapshots around
+// the one native diff ties reconstructed sides to stable input bytes.
+fn input_snapshot(
+    cwd: &Path,
+    analysis: &Analysis,
+) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut paths = Vec::<Vec<u8>>::new();
+    let mut root = cwd.to_path_buf();
+    if analysis.no_index {
+        paths.extend(
+            analysis
+                .operands
+                .iter()
+                .rev()
+                .take(2)
+                .map(|path| path.as_encoded_bytes().to_vec()),
+        );
+    } else {
+        let output = command(cwd)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()?;
+        if !output.status.success() {
+            bail!("cannot locate repository root");
+        }
+        root = PathBuf::from(OsString::from_vec(
+            output
+                .stdout
+                .strip_suffix(b"\n")
+                .unwrap_or(&output.stdout)
+                .to_vec(),
+        ));
+        let listed = command(cwd)
+            .args(["ls-files", "--full-name", "-z", "--", ":/"])
+            .output()?;
+        if !listed.status.success() {
+            bail!("cannot enumerate tracked files for capture consistency");
+        }
+        paths.extend(
+            listed
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(<[u8]>::to_vec),
+        );
+    }
+    let mut snapshot = std::collections::BTreeMap::new();
+    for raw in paths
+        .into_iter()
+        .filter(|path| !analysis.index_only && !path.starts_with(b"\0"))
+    {
+        let path = root.join(std::ffi::OsString::from_vec(raw.clone()));
+        if analysis.no_index
+            && std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            snapshot_tree(&path, &raw, &mut snapshot)?;
+        } else {
+            snapshot_path(&path, &raw, &mut snapshot)?;
+        }
+    }
+    if !analysis.no_index {
+        // Git owns relative environment-path interpretation (which can change
+        // when GIT_DIR/GIT_WORK_TREE are explicit), so ask for its absolute path.
+        let index = command(cwd)
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+            .output()?;
+        if !index.status.success() {
+            bail!("cannot locate the active Git index for capture consistency");
+        }
+        let index_path = PathBuf::from(OsString::from_vec(
+            index
+                .stdout
+                .strip_suffix(b"\n")
+                .unwrap_or(&index.stdout)
+                .to_vec(),
+        ));
+        snapshot.insert(b"\0GIT_INDEX".to_vec(), std::fs::read(index_path)?);
+        let entries = command(cwd)
+            .args(["ls-files", "--full-name", "--stage", "-z", "--", ":/"])
+            .output()?;
+        if !entries.status.success() {
+            bail!("cannot capture index entries");
+        }
+        snapshot.insert(b"\0INDEX_ENTRIES".to_vec(), entries.stdout);
+    }
+    Ok(snapshot)
+}
+
+fn snapshot_tree(
+    directory: &Path,
+    key: &[u8],
+    snapshot: &mut std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let mut child_key = key.to_vec();
+        if !child_key.is_empty() {
+            child_key.push(b'/');
+        }
+        child_key.extend_from_slice(entry.file_name().as_bytes());
+        let path = entry.path();
+        if path.is_dir() && !std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            snapshot_tree(&path, &child_key, snapshot)?;
+        } else {
+            snapshot_path(&path, &child_key, snapshot)?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_path(
+    path: &Path,
+    key: &[u8],
+    snapshot: &mut std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (value, mode) = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => (
+            std::fs::read_link(path)?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            b"120000".to_vec(),
+        ),
+        Ok(metadata) if metadata.is_file() => (
+            std::fs::read(path)?,
+            if metadata.mode() & 0o100 != 0 {
+                b"100755".to_vec()
+            } else {
+                b"100644".to_vec()
+            },
+        ),
+        _ => (Vec::new(), b"000000".to_vec()),
+    };
+    let mut keys = vec![key.to_vec()];
+    if let Some(relative) = key.strip_prefix(b"/") {
+        keys.push(relative.to_vec());
+    }
+    for key in keys {
+        snapshot.insert(key.clone(), value.clone());
+        snapshot.insert(
+            [b"\0MODE".as_slice(), key.as_slice()].concat(),
+            mode.clone(),
+        );
+    }
+    Ok(())
+}
+
+fn object_side(cwd: &Path, oid: &str) -> Option<Vec<u8>> {
+    if oid.is_empty() || oid.bytes().all(|byte| byte == b'0') {
+        return Some(Vec::new());
+    }
+    let output = command(cwd).args(["cat-file", "blob", oid]).output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 fn legacy_fingerprints(cwd: &Path, item: &Item, analysis: &Analysis) -> Option<Vec<String>> {
@@ -959,7 +1467,6 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
         };
         // Keep the legacy record representation for ordinary items. Extended
         // identities include both paths/modes/status in the persisted digest.
-        let metadata = format!(":{old_mode} {new_mode} {old_oid} {new_oid} {status}").into_bytes();
         items.push(Item {
             old_path: std::mem::take(&mut old_path),
             new_path: std::mem::take(&mut new_path),
@@ -971,8 +1478,8 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
             old_source,
             new_source,
             patch: patch.to_vec(),
-            metadata,
             legacy_fingerprints: Vec::new(),
+            canonical_identity: None,
         });
     }
     let mut identities = std::collections::BTreeSet::new();

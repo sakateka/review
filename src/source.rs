@@ -63,6 +63,15 @@ pub(crate) fn reconstruct(cwd: &Path, item: &Item) -> Result<Reconstructed> {
         SourceIdentity::Empty => Vec::new(),
         _ => bail!("this representation has no proven ordinary old source"),
     };
+    reconstruct_from_old(cwd, item, old, true)
+}
+
+pub(crate) fn reconstruct_from_old(
+    cwd: &Path,
+    item: &Item,
+    old: Vec<u8>,
+    verify_oid: bool,
+) -> Result<Reconstructed> {
     if !matches!(
         item.new_source,
         SourceIdentity::CapturedPatch | SourceIdentity::Empty
@@ -161,7 +170,7 @@ pub(crate) fn reconstruct(cwd: &Path, item: &Item) -> Result<Reconstructed> {
         if !result.is_empty() {
             bail!("deleted source unexpectedly contains bytes");
         }
-    } else if !new_oid.starts_with(&item.new_oid) {
+    } else if verify_oid && !new_oid.starts_with(&item.new_oid) {
         bail!("patch differs from the captured new-source hash");
     }
     Ok(Reconstructed {

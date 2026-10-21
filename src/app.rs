@@ -23,8 +23,17 @@ pub struct App {
 
 impl App {
     pub fn new(capture: Capture, store: Store) -> Self {
-        let (marks, status, state_error) = match store.load(&capture.items) {
-            Ok(marks) => (marks, capture.diagnostic.clone(), false),
+        let (marks, status, state_error) = match store.load_report(&capture.items) {
+            Ok(loaded) => {
+                let mut status = capture.diagnostic.clone();
+                if loaded.pending_legacy {
+                    if !status.is_empty() {
+                        status.push_str("; ");
+                    }
+                    status.push_str("Some prior review marks remain pending because their complete comparison identity cannot be proven");
+                }
+                (loaded.marks, status, false)
+            }
             Err(error) => (
                 vec![false; capture.items.len()],
                 format!("{error:#}; marking is disabled to preserve prior state"),
@@ -149,6 +158,18 @@ impl App {
             return;
         }
         if self.state_error {
+            return;
+        }
+        if self
+            .capture
+            .items
+            .get(self.selected)
+            .is_some_and(|item| item.canonical_identity.is_none())
+            && !self.marks.get(self.selected).copied().unwrap_or(false)
+        {
+            self.status =
+                "Mark unavailable: complete compared contents could not be proven for this item"
+                    .into();
             return;
         }
         if let Some(mark) = self.marks.get(self.selected) {
