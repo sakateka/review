@@ -1,4 +1,4 @@
-use crate::git::{self, Item};
+use crate::git::{self, Item, SourceIdentity};
 use anyhow::{Context, Result, bail};
 use std::{io::Write, path::Path, process::Stdio};
 
@@ -41,22 +41,42 @@ pub(crate) fn hunk(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((old_start, old_count, new_start, new_count))
 }
 
-// Reconstruct the new side from a pinned old blob and exactly the captured
-// patch. We never read the checkout to fill gaps in an old or mutable side.
-pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
-    let old =
-        String::from_utf8(blob(cwd, &item.old_oid)?).context("compared source is not UTF-8")?;
-    let patch = std::str::from_utf8(&item.patch).context("patch is not UTF-8")?;
-    if patch.lines().any(|line| line.starts_with("\\ No newline")) {
-        bail!("source mapping for missing final newlines is unavailable");
+/// Parse the ASCII coordinate prefix without requiring source context in a
+/// hunk heading to be UTF-8.
+pub(crate) fn hunk_bytes(line: &[u8]) -> Option<(usize, usize, usize, usize)> {
+    let end = line.windows(3).position(|part| part == b" @@")? + 3;
+    hunk(std::str::from_utf8(&line[..end]).ok()?)
+}
+
+pub(crate) struct Reconstructed {
+    pub old: Vec<u8>,
+    pub new: Vec<u8>,
+    pub new_oid: String,
+}
+
+// Reconstruct bytes for identity/state independently from text enrichment.
+// Missing-newline markers describe the preceding source row; they are not
+// source bytes. All context still has to match the pinned old blob exactly.
+pub(crate) fn reconstruct(cwd: &Path, item: &Item) -> Result<Reconstructed> {
+    let old = match &item.old_source {
+        SourceIdentity::Blob(oid) => blob(cwd, oid)?,
+        SourceIdentity::Empty => Vec::new(),
+        _ => bail!("this representation has no proven ordinary old source"),
+    };
+    if !matches!(
+        item.new_source,
+        SourceIdentity::CapturedPatch | SourceIdentity::Empty
+    ) {
+        bail!("this representation has no proven ordinary new source");
     }
-    let old_lines: Vec<_> = old.split_inclusive('\n').collect();
-    let mut result = String::new();
+    let old_lines: Vec<_> = old.split_inclusive(|byte| *byte == b'\n').collect();
+    let lines: Vec<_> = item.patch.split_inclusive(|byte| *byte == b'\n').collect();
+    let mut result = Vec::new();
     let mut cursor = 0;
     let mut expected: Option<(usize, usize)> = None;
     let mut seen = (0, 0);
-    for line in patch.split_inclusive('\n') {
-        if let Some((start, count, new_start, new_count)) = hunk(line) {
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((start, count, new_start, new_count)) = hunk_bytes(line) {
             if expected.is_some_and(|value| value != seen) {
                 bail!("hunk counts do not map to compared source");
             }
@@ -69,7 +89,7 @@ pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
                 bail!("old hunk coordinate is unavailable");
             }
             for unchanged in &old_lines[cursor..target] {
-                result.push_str(unchanged);
+                result.extend_from_slice(unchanged);
             }
             cursor = target;
             let new_target = if new_count == 0 {
@@ -77,26 +97,38 @@ pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
             } else {
                 new_start.saturating_sub(1)
             };
-            if result.lines().count() != new_target {
+            if result.split_inclusive(|byte| *byte == b'\n').count() != new_target {
                 bail!("new hunk coordinate is unavailable");
             }
             expected = Some((count, new_count));
             seen = (0, 0);
         } else if expected.is_some() {
-            match line.as_bytes().first() {
+            if line.starts_with(b"\\ No newline at end of file") {
+                continue;
+            }
+            let mut payload = &line[1..];
+            if lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with(b"\\ No newline at end of file"))
+            {
+                payload = payload
+                    .strip_suffix(b"\n")
+                    .context("missing-newline marker has no source row")?;
+            }
+            match line.first() {
                 Some(b' ' | b'-') => {
-                    if old_lines.get(cursor).copied() != Some(&line[1..]) {
+                    if old_lines.get(cursor).copied() != Some(payload) {
                         bail!("patch differs from pinned old source");
                     }
                     cursor += 1;
                     seen.0 += 1;
-                    if let Some(context) = line.strip_prefix(' ') {
-                        result.push_str(context);
+                    if line[0] == b' ' {
+                        result.extend_from_slice(payload);
                         seen.1 += 1;
                     }
                 }
                 Some(b'+') => {
-                    result.push_str(&line[1..]);
+                    result.extend_from_slice(payload);
                     seen.1 += 1;
                 }
                 _ => bail!("patch contains an unmapped source line"),
@@ -107,35 +139,62 @@ pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
         bail!("incomplete captured hunk");
     }
     for unchanged in &old_lines[cursor..] {
-        result.push_str(unchanged);
+        result.extend_from_slice(unchanged);
     }
-    if !item.new_oid.bytes().all(|byte| byte == b'0') {
-        let mut child = git::command(cwd)
-            .args(["hash-object", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .context("cannot verify captured source")?
-            .write_all(result.as_bytes())?;
-        let hash = child.wait_with_output()?;
-        if !hash.status.success() || String::from_utf8_lossy(&hash.stdout).trim() != item.new_oid {
-            bail!("patch differs from the captured new-source hash");
+    let mut child = git::command(cwd)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("cannot verify captured source")?
+        .write_all(&result)?;
+    let hash = child.wait_with_output()?;
+    if !hash.status.success() {
+        bail!("cannot hash reconstructed source");
+    }
+    let new_oid = String::from_utf8(hash.stdout)?.trim().to_owned();
+    if item.new_source == SourceIdentity::Empty {
+        if !result.is_empty() {
+            bail!("deleted source unexpectedly contains bytes");
         }
-    } else if !result.is_empty() {
-        bail!("deleted source unexpectedly contains bytes");
+    } else if !new_oid.starts_with(&item.new_oid) {
+        bail!("patch differs from the captured new-source hash");
     }
+    Ok(Reconstructed {
+        old,
+        new: result,
+        new_oid,
+    })
+}
+
+// Enrichment retains its explicit text/newline limitations. State identity uses
+// the verified byte reconstruction above and does not depend on highlighting.
+pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
+    if ![&item.old_mode, &item.new_mode]
+        .iter()
+        .all(|mode| matches!(mode.as_str(), "100644" | "100755" | "000000"))
+    {
+        bail!("source enrichment requires ordinary file modes");
+    }
+    let patch = std::str::from_utf8(&item.patch).context("patch is not UTF-8")?;
+    if patch.lines().any(|line| line.starts_with("\\ No newline")) {
+        bail!("source mapping for missing final newlines is unavailable");
+    }
+    let reconstructed = reconstruct(cwd, item)?;
     Ok(Sources {
         old: Side {
             path: item.old_path.clone(),
-            content: old,
+            content: String::from_utf8(reconstructed.old)
+                .context("compared source is not UTF-8")?,
         },
         new: Side {
             path: item.new_path.clone(),
-            content: result,
+            content: String::from_utf8(reconstructed.new)
+                .context("compared source is not UTF-8")?,
         },
     })
 }

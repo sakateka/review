@@ -1,9 +1,19 @@
 use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsString,
-    path::Path,
-    process::{Command, Output},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus},
 };
+
+/// Only explicit identities authorize source access. A hash printed by Git is
+/// not by itself proof that a mutable, binary, or multi-parent side is a blob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceIdentity {
+    Blob(String),
+    Empty,
+    CapturedPatch,
+    Unavailable,
+}
 
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -11,25 +21,91 @@ pub struct Item {
     pub new_path: Vec<u8>,
     pub old_oid: String,
     pub new_oid: String,
+    pub old_mode: String,
+    pub new_mode: String,
+    pub status: String,
+    pub old_source: SourceIdentity,
+    pub new_source: SourceIdentity,
     pub patch: Vec<u8>,
     pub metadata: Vec<u8>,
+    pub legacy_fingerprints: Vec<String>,
 }
 
 impl Item {
     pub fn name(&self) -> String {
-        String::from_utf8_lossy(&self.new_path)
-            .escape_debug()
-            .to_string()
+        if self.old_path != self.new_path {
+            format!(
+                "{} → {}",
+                visible_name(&self.old_path),
+                visible_name(&self.new_path)
+            )
+        } else {
+            visible_name(&self.new_path)
+        }
     }
+}
+
+fn visible_name(bytes: &[u8]) -> String {
+    visible_bytes(bytes)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                character.escape_default().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Escape invalid UTF-8 individually, and escape literal backslashes so distinct
+/// native byte sequences cannot collapse to the same visible name/output.
+pub fn visible_bytes(mut bytes: &[u8]) -> String {
+    let mut result = String::new();
+    while !bytes.is_empty() {
+        let (valid, invalid) = match std::str::from_utf8(bytes) {
+            Ok(text) => (text.len(), 0),
+            Err(error) => (
+                error.valid_up_to(),
+                error
+                    .error_len()
+                    .unwrap_or(bytes.len() - error.valid_up_to()),
+            ),
+        };
+        for character in std::str::from_utf8(&bytes[..valid])
+            .expect("validated prefix")
+            .chars()
+        {
+            if character == '\\' {
+                result.push_str("\\\\");
+            } else if character.is_control()
+                && character != '\n'
+                && character != '\t'
+                && character != '\r'
+            {
+                result.extend(character.escape_default());
+            } else {
+                result.push(character);
+            }
+        }
+        for byte in &bytes[valid..valid + invalid] {
+            result.push_str(&format!("\\x{byte:02x}"));
+        }
+        bytes = &bytes[valid + invalid..];
+    }
+    result
 }
 
 #[derive(Debug)]
 pub struct Capture {
     pub items: Vec<Item>,
     pub original: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub status: ExitStatus,
     pub unavailable: Option<String>,
     pub diagnostic: String,
-    pub cwd: std::path::PathBuf,
+    pub cwd: PathBuf,
+    pub args: Vec<OsString>,
 }
 
 pub(crate) fn command(cwd: &Path) -> Command {
@@ -39,7 +115,8 @@ pub(crate) fn command(cwd: &Path) -> Command {
         .args(["-c", "core.fsmonitor=false"])
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_PAGER", "cat");
+        .env("GIT_PAGER", "cat")
+        .env("GIT_TERMINAL_PROMPT", "0");
     for (key, _) in std::env::vars_os() {
         if key.as_encoded_bytes().starts_with(b"GIT_TRACE") {
             command.env_remove(key);
@@ -48,233 +125,934 @@ pub(crate) fn command(cwd: &Path) -> Command {
     command
 }
 
-fn output(cwd: &Path, args: &[OsString], structured: bool) -> Result<Output> {
-    let mut command = command(cwd);
-    command.args(["--no-pager", "diff", "--no-ext-diff", "--no-textconv"]);
-    if structured {
-        command.args([
-            "--raw",
-            "-z",
-            "--patch",
-            "--full-index",
-            "--no-abbrev",
-            "--no-color",
-        ]);
-    }
-    let result = command
-        .args(args)
-        .output()
-        .context("cannot execute system Git")?;
-    let differences_are_success = args
-        .iter()
-        .any(|arg| arg == "--exit-code" || arg == "--quiet" || arg == "--no-index");
-    if !result.status.success() && !(differences_are_success && result.status.code() == Some(1)) {
-        bail!(
-            "Git comparison failed ({}): {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
-    Ok(result)
+#[derive(Default)]
+struct Analysis {
+    operands: Vec<OsString>,
+    paths: Vec<OsString>,
+    ext: Option<bool>,
+    textconv: Option<bool>,
+    index_only: bool,
+    no_index: bool,
+    ignore_submodules: Option<Vec<u8>>,
+    merge_base: bool,
+    immutable: bool,
+    opaque: bool,
+    custom_prefixes: bool,
 }
 
-// Unknown options are passed to Git unchanged in original-output mode. This
-// conservative nominal parser never guesses the boundaries of another format.
-fn nominal(args: &[OsString]) -> bool {
-    let mut after_paths = false;
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if after_paths {
-            continue;
+// Git's value-taking options own the following token even if it resembles a
+// flag or the inner separator. We never rewrite the tokens passed to Git.
+fn takes_value(option: &[u8], no_index: bool) -> bool {
+    const REQUIRED: &[&[u8]] = &[
+        b"--anchored",
+        b"--src-prefix",
+        b"--dst-prefix",
+        b"--line-prefix",
+        b"--output-indicator-new",
+        b"--output-indicator-old",
+        b"--output-indicator-context",
+        b"--diff-filter",
+        b"--find-object",
+        b"--diff-algorithm",
+        b"--word-diff-regex",
+        b"--ignore-matching-lines",
+        b"--color-moved-ws",
+        b"--ws-error-highlight",
+        b"--stat-width",
+        b"--stat-name-width",
+        b"--stat-count",
+        b"--stat-graph-width",
+        b"--inter-hunk-context",
+        b"--rotate-to",
+        b"--skip-to",
+    ];
+    if REQUIRED.contains(&option) {
+        return true;
+    }
+    if no_index && option.starts_with(b"--") && option.len() > 2 {
+        // These optional-value options accept their value only after '='. In
+        // particular --unified MUST NOT consume a following --output option.
+        const OPTIONAL_OR_FLAG: &[&[u8]] = &[
+            b"--stat",
+            b"--color",
+            b"--color-moved",
+            b"--color-words",
+            b"--word-diff",
+            b"--find-renames",
+            b"--find-copies",
+            b"--find-copies-harder",
+            b"--ignore-submodules",
+            b"--relative",
+            b"--submodule",
+            b"--shortstat",
+            b"--summary",
+            b"--diff-merges",
+            b"--output",
+            b"--abbrev",
+            b"--unified",
+            b"--indent-heuristic",
+            b"--minimal",
+        ];
+        return REQUIRED
+            .iter()
+            .filter(|full| full.starts_with(option))
+            .count()
+            == 1
+            && !OPTIONAL_OR_FLAG.iter().any(|full| full.starts_with(option));
+    }
+    if option.starts_with(b"-") && !option.starts_with(b"--") {
+        let flags = option[1..].iter().enumerate();
+        for (index, flag) in flags {
+            if b"SGOIl".contains(flag) {
+                return index + 2 == option.len();
+            }
+            if !b"psuWwbaRDcmrtzv".contains(flag) {
+                return false;
+            }
         }
-        if arg == "--" {
-            after_paths = true;
-            continue;
-        }
-        if arg == "-S" || arg == "-G" {
-            args.next();
-            continue;
-        }
+    }
+    false
+}
+
+fn analyze(cwd: &Path, args: &[OsString]) -> Result<Analysis> {
+    // Repository diff has an initial parser that does not accept the same
+    // abbreviations as the no-index parser. Probe only repository context;
+    // never execute a trial comparison to infer argument ownership.
+    let mut no_index = !command(cwd)
+        .args(["rev-parse", "--git-dir"])
+        .output()?
+        .status
+        .success();
+    let mut preflight = 0;
+    while let Some(arg) = args.get(preflight) {
+        preflight += 1;
         let bytes = arg.as_encoded_bytes();
-        if bytes.starts_with(b"-")
-            && !matches!(
-                bytes,
-                b"--cached"
-                    | b"--staged"
-                    | b"--pickaxe-all"
-                    | b"--exit-code"
-                    | b"--reverse"
-                    | b"-R"
-            )
-            && !bytes.starts_with(b"-S")
-            && !bytes.starts_with(b"-G")
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn reject_writes(args: &[OsString]) -> Result<()> {
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
+        if bytes == b"--" {
             break;
         }
-        if arg == "-S" || arg == "-G" {
-            args.next();
-            continue;
+        if bytes == b"--no-index" {
+            no_index = true;
         }
-        let bytes = arg.as_encoded_bytes();
-        if (bytes.starts_with(b"--out") && !bytes.starts_with(b"--output-indicator-"))
-            || (bytes.len() > 2 && b"--ext-diff".starts_with(bytes))
-            || bytes.starts_with(b"--ext-diff")
-            || (bytes.len() > 2 && bytes != b"--text" && b"--textconv".starts_with(bytes))
-            || bytes.starts_with(b"--textconv")
-        {
-            bail!(
-                "Git option {:?} conflicts with read-only capture (output destinations and external/textconv helpers are unavailable)",
-                arg
-            );
+        if takes_value(bytes, false) {
+            preflight += 1;
         }
     }
-    Ok(())
-}
 
-pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
-    reject_writes(args)?;
-    // Clean/process filters can execute arbitrary helpers while Git hashes the
-    // working tree, even with --no-textconv. Until a comparison-specific policy
-    // is available, diagnose configured filters rather than invoking them.
-    let filters = command(cwd)
+    let mut analysis = Analysis::default();
+    let mut src_default = true;
+    let mut dst_default = true;
+    let prefixes = command(cwd)
         .args([
             "config",
             "--null",
             "--get-regexp",
-            r"^filter\..*\.(clean|process)$",
+            r"^diff\.(srcprefix|dstprefix|noprefix|mnemonicprefix)$",
         ])
-        .output()
-        .context("cannot inspect Git's source-filter policy")?;
-    if filters.status.success() && !filters.stdout.is_empty() {
-        bail!(
-            "configured Git clean/process filters are unavailable during read-only review; their external helpers may write files"
-        );
+        .output()?;
+    if !prefixes.status.success() && prefixes.status.code() != Some(1) {
+        bail!("cannot inspect Git prefix configuration");
     }
-    if !filters.status.success() && filters.status.code() != Some(1) {
-        bail!(
-            "cannot inspect Git configuration: {}",
-            String::from_utf8_lossy(&filters.stderr)
-        );
-    }
-    if nominal(args) {
-        let result = output(cwd, args, true)?;
-        if let Some(items) = parse(&result.stdout) {
-            return Ok(Capture {
-                items,
-                original: Vec::new(),
-                unavailable: None,
-                diagnostic: String::from_utf8_lossy(&result.stderr).into_owned(),
-                cwd: cwd.into(),
-            });
+    for record in prefixes.stdout.split(|byte| *byte == 0) {
+        let Some(split) = record.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        let value = &record[split + 1..];
+        match &record[..split] {
+            b"diff.srcprefix" => src_default = value == b"a/",
+            b"diff.dstprefix" => dst_default = value == b"b/",
+            b"diff.noprefix" | b"diff.mnemonicprefix"
+                if !matches!(value, b"false" | b"no" | b"off" | b"0") =>
+            {
+                src_default = false;
+                dst_default = false;
+            }
+            _ => {}
         }
     }
-    let result = output(cwd, args, false)?;
-    Ok(Capture { items: Vec::new(), original: result.stdout,
-        unavailable: Some("File structure is unavailable for this output. Marks and source enrichment are disabled.".into()),
-        diagnostic: String::from_utf8_lossy(&result.stderr).into_owned(), cwd: cwd.into() })
+    let mut after_paths = false;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        index += 1;
+        let bytes = arg.as_encoded_bytes();
+        if after_paths {
+            analysis.paths.push(arg.clone());
+            continue;
+        }
+        if bytes == b"--" {
+            after_paths = true;
+            continue;
+        }
+        let option = bytes.split(|byte| *byte == b'=').next().unwrap_or(bytes);
+        if option.len() > 2 && b"--output".starts_with(option) || option == b"--output" {
+            bail!(
+                "Git option {arg:?} conflicts with read-only capture: output destinations are unavailable"
+            );
+        }
+        let value = bytes
+            .strip_prefix(option)
+            .and_then(|suffix| suffix.strip_prefix(b"="))
+            .or_else(|| args.get(index).map(|arg| arg.as_encoded_bytes()));
+        if option == b"--default-prefix" {
+            src_default = true;
+            dst_default = true;
+        }
+        if option == b"--no-prefix" {
+            src_default = false;
+            dst_default = false;
+        }
+        if option == b"--src-prefix"
+            || (no_index && takes_value(option, true) && b"--src-prefix".starts_with(option))
+        {
+            src_default = value == Some(b"a/".as_slice());
+        }
+        if option == b"--dst-prefix"
+            || (no_index && takes_value(option, true) && b"--dst-prefix".starts_with(option))
+        {
+            dst_default = value == Some(b"b/".as_slice());
+        }
+        // Git accepts unambiguous long-option abbreviations for helper flags.
+        if option.len() > 2 && b"--ext-diff".starts_with(option) {
+            analysis.ext = Some(true);
+        }
+        if option.len() > 2 && option != b"--text" && b"--textconv".starts_with(option) {
+            analysis.textconv = Some(true);
+        }
+        if option == b"--no-ext-diff" {
+            analysis.ext = Some(false);
+        }
+        if option == b"--no-textconv" {
+            analysis.textconv = Some(false);
+        }
+        if matches!(option, b"--cached" | b"--staged") {
+            analysis.index_only = true;
+        }
+        if option == b"--no-index" {
+            analysis.no_index = true;
+        }
+        if option == b"--ignore-submodules" {
+            analysis.ignore_submodules = Some(
+                bytes
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .map_or(b"all".as_slice(), |position| &bytes[position + 1..])
+                    .to_vec(),
+            );
+        }
+        if option == b"--no-ignore-submodules" {
+            analysis.ignore_submodules = Some(b"none".to_vec());
+        }
+        if option == b"--merge-base" {
+            analysis.merge_base = true;
+        }
+        if matches!(option, b"--no-patch" | b"-s" | b"--quiet") {
+            analysis.opaque = true;
+        }
+        if matches!(option, b"--patch" | b"-p" | b"--no-quiet") {
+            analysis.opaque = false;
+        }
+        if takes_value(option, no_index) && option == bytes {
+            index += 1;
+        } else if !bytes.starts_with(b"-") {
+            analysis.operands.push(arg.clone());
+        }
+    }
+    analysis.custom_prefixes = !src_default || !dst_default;
+    if analysis.ext == Some(true) || analysis.textconv == Some(true) {
+        bail!(
+            "Git helper option conflicts with read-only capture: external/textconv helpers are unavailable"
+        );
+    }
+    let mut revisions = 0;
+    for operand in &analysis.operands {
+        let result = command(cwd)
+            .args([
+                OsString::from("rev-parse"),
+                OsString::from("--revs-only"),
+                OsString::from("--end-of-options"),
+                operand.clone(),
+            ])
+            .output()?;
+        revisions += result
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| {
+                let line = line.strip_prefix(b"^").unwrap_or(line);
+                matches!(line.len(), 40 | 64) && line.iter().all(u8::is_ascii_hexdigit)
+            })
+            .count();
+    }
+    analysis.immutable = analysis.index_only || analysis.no_index || revisions >= 2;
+    Ok(analysis)
 }
 
-fn take_nul<'a>(bytes: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let end = bytes.iter().position(|byte| *byte == 0)?;
-    let value = &bytes[..end];
-    *bytes = &bytes[end + 1..];
-    Some(value)
+fn policy(cwd: &Path, analysis: &Analysis) -> Result<()> {
+    policy_depth(cwd, analysis, 0)
 }
 
-fn parse(mut bytes: &[u8]) -> Option<Vec<Item>> {
+fn policy_depth(cwd: &Path, analysis: &Analysis, depth: usize) -> Result<()> {
+    if depth > 16 {
+        bail!("nested submodule helper policy exceeds safe inspection depth");
+    }
+    if std::env::var_os("GIT_EXTERNAL_DIFF").is_some() && analysis.ext != Some(false) {
+        bail!(
+            "GIT_EXTERNAL_DIFF conflicts with read-only capture: external helpers are unavailable"
+        );
+    }
+    let config = command(cwd)
+        .args([
+            "config",
+            "--null",
+            "--get-regexp",
+            r"^(filter\..*\.(clean|process)|diff\..*\.(command|textconv)|diff\.external)$",
+        ])
+        .output()?;
+    if !config.status.success() && config.status.code() != Some(1) {
+        bail!(
+            "cannot inspect Git configuration: {}",
+            visible_bytes(&config.stderr)
+        );
+    }
+    let config_records: Vec<_> = config.stdout.split(|byte| *byte == 0).collect();
+    // This applies outside repositories too, before any enumeration can fail.
+    if analysis.ext != Some(false)
+        && config_records
+            .iter()
+            .any(|record| record.starts_with(b"diff.external\n"))
+    {
+        bail!("configured external diff helper conflicts with read-only capture");
+    }
+    let risky_driver = config_records.iter().any(|record| {
+        record.starts_with(b"diff.")
+            && ((analysis.ext != Some(false)
+                && record.windows(9).any(|part| part == b".command\n"))
+                || (analysis.textconv != Some(false)
+                    && record.windows(10).any(|part| part == b".textconv\n")))
+    });
+    let root = command(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()?;
+    if !root.status.success() || analysis.no_index {
+        if risky_driver {
+            bail!(
+                "cannot prove diff-driver applicability for this non-tree comparison under read-only capture"
+            );
+        }
+        return Ok(());
+    }
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let root = PathBuf::from(OsString::from_vec(
+        root.stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&root.stdout)
+            .to_vec(),
+    ));
+    let mut revisions = Vec::new();
+    let mut paths = analysis.paths.clone();
+    for operand in &analysis.operands {
+        let result = command(cwd)
+            .args([
+                OsString::from("rev-parse"),
+                OsString::from("--revs-only"),
+                OsString::from("--end-of-options"),
+                operand.clone(),
+            ])
+            .output()?;
+        let mut found = false;
+        for line in result.stdout.split(|byte| *byte == b'\n') {
+            let line = line.strip_prefix(b"^").unwrap_or(line);
+            if matches!(line.len(), 40 | 64) && line.iter().all(u8::is_ascii_hexdigit) {
+                revisions.push(OsString::from_vec(line.to_vec()));
+                found = true;
+            }
+        }
+        if !found {
+            paths.push(operand.clone());
+        }
+    }
+    if analysis.index_only && revisions.is_empty() {
+        // --cached/--staged implicitly compare HEAD to the index. A staged
+        // deletion is absent from the index but its HEAD-side driver applies.
+        // An unborn HEAD has no historical tree; Git then compares an empty
+        // old side, so the index candidates below remain sufficient.
+        let head = command(cwd)
+            .args(["rev-parse", "--verify", "HEAD^{tree}"])
+            .output()?;
+        if head.status.success() {
+            revisions.push(OsString::from_vec(
+                head.stdout
+                    .strip_suffix(b"\n")
+                    .unwrap_or(&head.stdout)
+                    .to_vec(),
+            ));
+        }
+    }
+    if analysis.merge_base && !revisions.is_empty() {
+        let mut args = revisions.clone();
+        if args.len() == 1 {
+            args.push("HEAD".into());
+        }
+        let bases = command(cwd)
+            .args(["merge-base", "--all"])
+            .args(args)
+            .output()?;
+        if !bases.status.success() {
+            bail!("cannot prove merge-base helper applicability under read-only capture");
+        }
+        revisions.extend(
+            bases
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| OsString::from_vec(line.to_vec())),
+        );
+    }
+    // No pathspec means git diff covers the whole repository even from sub/.
+    // With explicit pathspecs, execute ls-files from the original cwd so Git
+    // owns prefix, magic, exclusion and native-byte interpretation.
+    let exclusions_only = !paths.is_empty()
+        && paths.iter().all(|path| {
+            let bytes = path.as_encoded_bytes();
+            bytes.starts_with(b":!")
+                || bytes.starts_with(b":^")
+                || (bytes.starts_with(b":(")
+                    && bytes
+                        .iter()
+                        .position(|byte| *byte == b')')
+                        .is_some_and(|end| {
+                            bytes[2..end]
+                                .split(|byte| *byte == b',')
+                                .any(|magic| magic == b"exclude")
+                        }))
+        });
+    if paths.is_empty() || exclusions_only {
+        paths.insert(0, ":/".into());
+    }
+    let mut candidates = std::collections::BTreeSet::new();
+    for tree in std::iter::once(None).chain(revisions.iter().map(Some)) {
+        let mut list = command(cwd);
+        list.args(["ls-files", "--full-name", "--cached", "-z"]);
+        if let Some(tree) = tree {
+            let mut option = OsString::from("--with-tree=");
+            option.push(tree);
+            list.arg(option);
+        }
+        let files = list.arg("--").args(&paths).output()?;
+        if !files.status.success() {
+            if risky_driver || (!analysis.immutable && !config.stdout.is_empty()) {
+                bail!(
+                    "cannot prove complete helper candidates under read-only capture: {}",
+                    visible_bytes(&files.stderr)
+                );
+            }
+            continue;
+        }
+        candidates.extend(
+            files
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(Vec::from),
+        );
+    }
+    if !analysis.immutable {
+        let stages = command(cwd)
+            .args(["ls-files", "--full-name", "--stage", "-z", "--"])
+            .args(&paths)
+            .output()?;
+        if !stages.status.success() {
+            bail!("cannot inspect submodule helper applicability");
+        }
+        for entry in stages.stdout.split(|byte| *byte == 0) {
+            if !entry.starts_with(b"160000 ") {
+                continue;
+            }
+            let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+                bail!("cannot inspect submodule identity");
+            };
+            let path = &entry[tab + 1..];
+            if submodule_worktree_ignored(&root, path, analysis)? {
+                continue;
+            }
+            let nested = root.join(std::ffi::OsStr::from_bytes(path));
+            if nested.is_dir() && nested.join(".git").exists() {
+                policy_depth(&nested, &Analysis::default(), depth + 1)?;
+            }
+        }
+    }
+    if config.stdout.is_empty() {
+        return Ok(());
+    }
+    // File input avoids the two-pipe deadlock when check-attr emits output
+    // while consuming a large candidate set.
+    use std::io::{Seek, Write};
+    let mut input = tempfile::tempfile()?;
+    for path in candidates {
+        input.write_all(&path)?;
+        input.write_all(&[0])?;
+    }
+    input.rewind()?;
+    let attrs = command(&root)
+        .args(["check-attr", "-z", "--stdin", "filter", "diff"])
+        .stdin(input)
+        .output()?;
+    if !attrs.status.success() {
+        bail!("cannot inspect Git attributes safely");
+    }
+    for triple in attrs
+        .stdout
+        .split(|byte| *byte == 0)
+        .collect::<Vec<_>>()
+        .chunks_exact(3)
+    {
+        let attr = triple[1];
+        let driver = triple[2];
+        let prefix = if attr == b"filter" {
+            b"filter.".as_slice()
+        } else {
+            b"diff.".as_slice()
+        };
+        let mut key = prefix.to_vec();
+        key.extend(driver);
+        key.push(b'.');
+        let applicable = config_records.iter().any(|record| {
+            if !record.starts_with(&key) {
+                return false;
+            }
+            if attr == b"filter" {
+                !analysis.immutable
+            } else if record[key.len()..].starts_with(b"textconv\n") {
+                analysis.textconv != Some(false)
+            } else {
+                analysis.ext != Some(false)
+            }
+        });
+        if applicable {
+            bail!(
+                "applicable Git {} helper for {} conflicts with read-only capture; clean/process filters and external/textconv helpers cannot be executed safely",
+                visible_bytes(attr),
+                visible_bytes(triple[0])
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn submodule_worktree_ignored(root: &Path, path: &[u8], analysis: &Analysis) -> Result<bool> {
+    if let Some(ignore) = &analysis.ignore_submodules {
+        return Ok(matches!(ignore.as_slice(), b"all" | b"dirty"));
+    }
+    use std::os::unix::ffi::OsStringExt;
+    let modules = command(root)
+        .args([
+            "config",
+            "--file",
+            ".gitmodules",
+            "--null",
+            "--get-regexp",
+            r"^submodule\..*\.path$",
+        ])
+        .output()?;
+    for record in modules.stdout.split(|byte| *byte == 0) {
+        let Some(split) = record.iter().position(|byte| *byte == b'\n') else {
+            continue;
+        };
+        if &record[split + 1..] != path {
+            continue;
+        }
+        let mut key = record[..split]
+            .strip_suffix(b"path")
+            .context("invalid submodule path key")?
+            .to_vec();
+        key.extend_from_slice(b"ignore");
+        let key = OsString::from_vec(key);
+        for module_file in [false, true] {
+            let mut config = command(root);
+            config.arg("config");
+            if module_file {
+                config.args(["--file", ".gitmodules"]);
+            }
+            let setting = config.arg("--get").arg(&key).output()?;
+            if setting.status.success() {
+                return Ok(matches!(
+                    setting
+                        .stdout
+                        .strip_suffix(b"\n")
+                        .unwrap_or(&setting.stdout),
+                    b"all" | b"dirty"
+                ));
+            }
+            if setting.status.code() != Some(1) {
+                bail!("cannot inspect effective submodule ignore policy");
+            }
+        }
+    }
+    let setting = command(root)
+        .args(["config", "--get", "diff.ignoreSubmodules"])
+        .output()?;
+    if !setting.status.success() && setting.status.code() != Some(1) {
+        bail!("cannot inspect effective submodule ignore policy");
+    }
+    Ok(matches!(
+        setting
+            .stdout
+            .strip_suffix(b"\n")
+            .unwrap_or(&setting.stdout),
+        b"all" | b"dirty"
+    ))
+}
+
+pub fn capture(cwd: &Path, args: &[OsString]) -> Result<Capture> {
+    let analysis = analyze(cwd, args)?;
+    policy(cwd, &analysis)?;
+    // Exactly one comparison. Its bytes, diagnostics and actual status survive
+    // even when there is no provable mapping, or Git reports findings/errors.
+    let result = command(cwd)
+        .args(["--no-pager", "diff"])
+        .args(args)
+        .output()
+        .context("cannot execute system Git")?;
+    let mut items = if !analysis.opaque
+        && !analysis.custom_prefixes
+        && result.status.code().is_some_and(|code| code <= 1)
+    {
+        parse(cwd, &result.stdout)
+    } else {
+        None
+    };
+    if let Some(items) = &mut items {
+        for item in items {
+            item.legacy_fingerprints =
+                legacy_fingerprints(cwd, item, &analysis).unwrap_or_default();
+        }
+    }
+    let unavailable = items.is_none().then(|| "File structure is unavailable for this output. Marks and source enrichment are disabled.".into());
+    let diagnostic = if result.status.success() {
+        visible_bytes(&result.stderr)
+    } else {
+        format!(
+            "Git status {}{}{}",
+            result
+                .status
+                .code()
+                .map_or_else(|| "signal".into(), |code| code.to_string()),
+            if result.stderr.is_empty() { "" } else { ": " },
+            visible_bytes(&result.stderr)
+        )
+    };
+    Ok(Capture {
+        items: items.unwrap_or_default(),
+        original: result.stdout,
+        stderr: result.stderr,
+        status: result.status,
+        unavailable,
+        diagnostic,
+        cwd: cwd.into(),
+        args: args.to_vec(),
+    })
+}
+
+fn legacy_fingerprints(cwd: &Path, item: &Item, analysis: &Analysis) -> Option<Vec<String>> {
+    if item.old_path != item.new_path || !matches!(item.status.as_str(), "M" | "A" | "D" | "T") {
+        return None;
+    }
+    let sources = crate::source::reconstruct(cwd, item).ok()?;
+    let full_new = sources.new_oid;
+    let zero = "0".repeat(full_new.len());
+    let old = if item.old_source == SourceIdentity::Empty {
+        &zero
+    } else {
+        &item.old_oid
+    };
+    let new = if item.new_source == SourceIdentity::Empty {
+        &zero
+    } else {
+        &full_new
+    };
+    let mut canonical = Vec::new();
+    for line in item.patch.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(identity) = line.strip_prefix(b"index ") {
+            let suffix = identity
+                .iter()
+                .position(|byte| *byte == b' ')
+                .map(|position| &identity[position..])
+                .unwrap_or(b"\n");
+            canonical.extend_from_slice(format!("index {old}..{new}").as_bytes());
+            canonical.extend_from_slice(suffix);
+        } else {
+            canonical.extend_from_slice(line);
+        }
+    }
+    // For a worktree comparison Git can print either a zero raw ID or the
+    // index's full ID when the stat cache proves it already knows that side.
+    // Both baseline records describe these exact verified captured bytes.
+    let raw_ids = if analysis.immutable {
+        vec![new]
+    } else {
+        vec![new, &zero]
+    };
+    let mut fingerprints = Vec::new();
+    for raw_new in raw_ids {
+        let metadata = format!(
+            ":{} {} {old} {raw_new} {}",
+            item.old_mode, item.new_mode, item.status
+        );
+        fingerprints.push(crate::state::digest([
+            item.old_path.as_slice(),
+            &item.new_path,
+            metadata.as_bytes(),
+            canonical.as_slice(),
+        ]));
+    }
+    fingerprints.sort();
+    fingerprints.dedup();
+    Some(fingerprints)
+}
+
+fn oid(value: &[u8]) -> Option<String> {
+    (value.len() >= 4 && value.len() <= 64 && value.iter().all(u8::is_ascii_hexdigit))
+        .then(|| String::from_utf8_lossy(value).into_owned())
+}
+
+fn resolve_blob(cwd: &Path, value: &str) -> Option<String> {
+    let output = command(cwd)
+        .args(["rev-parse", "--verify", &format!("{value}^{{blob}}")])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
     if bytes.is_empty() {
         return Some(Vec::new());
     }
-    let mut items = Vec::new();
-    while bytes.first() == Some(&b':') {
-        let metadata = take_nul(&mut bytes)?;
-        let fields: Vec<_> = metadata.split(|byte| *byte == b' ').collect();
-        if fields.len() != 5 || !matches!(fields[4], b"M" | b"A" | b"D" | b"T") {
-            return None;
-        }
-        let old_oid = std::str::from_utf8(fields[2]).ok()?.to_owned();
-        let new_oid = std::str::from_utf8(fields[3]).ok()?.to_owned();
-        if ![&old_oid, &new_oid].iter().all(|oid| {
-            (oid.len() == 40 || oid.len() == 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) {
-            return None;
-        }
-        let path = take_nul(&mut bytes)?.to_vec();
-        items.push(Item {
-            old_path: path.clone(),
-            new_path: path,
-            old_oid,
-            new_oid,
-            patch: Vec::new(),
-            metadata: metadata.to_vec(),
-        });
-    }
-    if bytes.first() != Some(&0) {
+    if !bytes.starts_with(b"diff --git ") {
         return None;
     }
-    bytes = &bytes[1..];
-    let mut starts: Vec<usize> = bytes
+    // A source line in a unified hunk has a mandatory indicator, so these
+    // complete line starts cannot be confused with header-like source bytes.
+    let mut starts: Vec<_> = bytes
         .windows(11)
         .enumerate()
-        .filter_map(|(index, line)| {
-            (line == b"diff --git " && (index == 0 || bytes[index - 1] == b'\n')).then_some(index)
+        .filter_map(|(index, part)| {
+            (part == b"diff --git " && (index == 0 || bytes[index - 1] == b'\n')).then_some(index)
         })
         .collect();
-    if starts.len() != items.len() || starts.first() != Some(&0) {
-        return None;
-    }
     starts.push(bytes.len());
-    for (index, item) in items.iter_mut().enumerate() {
-        let patch = &bytes[starts[index]..starts[index + 1]];
-        // A textual patch's index record must agree with the raw item. Binary,
-        // mode-only and transformed patches safely retain original-output mode.
+    let mut items = Vec::new();
+    for bounds in starts.windows(2) {
+        let patch = &bytes[bounds[0]..bounds[1]];
+        if !valid_section(patch) {
+            return None;
+        }
         let lines: Vec<_> = patch.split(|byte| *byte == b'\n').collect();
-        let identity = lines.iter().find_map(|line| line.strip_prefix(b"index "))?;
-        let hashes = identity.split(|byte| *byte == b' ').next()?;
-        let hashes = std::str::from_utf8(hashes).ok()?;
-        let (old, new) = hashes.split_once("..")?;
-        if old != item.old_oid
-            || (item.new_oid.bytes().any(|byte| byte != b'0') && new != item.new_oid)
-            || new.len() != old.len()
-            || !new.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !lines.iter().any(|line| line.starts_with(b"@@ "))
+        let mut header = Vec::new();
+        for line in lines.iter().skip(1) {
+            if line.starts_with(b"@@ ") {
+                break;
+            }
+            header.push(*line);
+        }
+        let field = |prefix: &[u8]| header.iter().find_map(|line| line.strip_prefix(prefix));
+        let (mut old_path, mut new_path) = header_paths(lines[0].strip_prefix(b"diff --git ")?)?;
+        let mut old_mode = "100644".to_owned();
+        let mut new_mode = old_mode.clone();
+        for (prefix, target) in [
+            (b"old mode ".as_slice(), &mut old_mode),
+            (b"new mode ".as_slice(), &mut new_mode),
+        ] {
+            if let Some(mode) = field(prefix) {
+                *target = std::str::from_utf8(mode).ok()?.to_owned();
+            }
+        }
+        let mut status = "M".to_owned();
+        if let Some(mode) = field(b"new file mode ") {
+            status = "A".into();
+            old_mode = "000000".into();
+            new_mode = std::str::from_utf8(mode).ok()?.into();
+        }
+        if let Some(mode) = field(b"deleted file mode ") {
+            status = "D".into();
+            new_mode = "000000".into();
+            old_mode = std::str::from_utf8(mode).ok()?.into();
+        }
+        for (kind, from, to) in [
+            ("R", b"rename from ".as_slice(), b"rename to ".as_slice()),
+            ("C", b"copy from ".as_slice(), b"copy to ".as_slice()),
+        ] {
+            if let Some(path) = field(from) {
+                if unquote(path)? != old_path || unquote(field(to)?)? != new_path {
+                    return None;
+                }
+                status = format!(
+                    "{kind}{}",
+                    std::str::from_utf8(field(b"similarity index ")?.strip_suffix(b"%")?).ok()?
+                );
+            }
+        }
+        if let Some(score) = field(b"dissimilarity index ") {
+            status = format!("M{}", std::str::from_utf8(score.strip_suffix(b"%")?).ok()?);
+        }
+        let (mut old_oid, mut new_oid) = (String::new(), String::new());
+        if let Some(identity) = field(b"index ") {
+            let mut fields = identity.split(|byte| *byte == b' ');
+            let hashes = fields.next()?;
+            let split = hashes.windows(2).position(|part| part == b"..")?;
+            old_oid = oid(&hashes[..split])?;
+            new_oid = oid(&hashes[split + 2..])?;
+            if let Some(mode) = fields.next() {
+                old_mode = std::str::from_utf8(mode).ok()?.into();
+                new_mode = old_mode.clone();
+            }
+        }
+        if let Some(path) = field(b"--- ") {
+            let decoded = unquote(path.strip_suffix(b"\t").unwrap_or(path))?;
+            if decoded != b"/dev/null" && decoded.strip_prefix(b"a/") != Some(old_path.as_slice()) {
+                return None;
+            }
+        }
+        if let Some(path) = field(b"+++ ") {
+            let decoded = unquote(path.strip_suffix(b"\t").unwrap_or(path))?;
+            if decoded != b"/dev/null" && decoded.strip_prefix(b"b/") != Some(new_path.as_slice()) {
+                return None;
+            }
+        }
+        if ![&old_mode, &new_mode]
+            .iter()
+            .all(|mode| mode.len() == 6 && mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')))
         {
             return None;
         }
-        let old_path = lines.iter().find_map(|line| line.strip_prefix(b"--- "))?;
-        let new_path = lines.iter().find_map(|line| line.strip_prefix(b"+++ "))?;
-        if !matches_path(old_path, b"a/", &item.old_path, old)
-            || !matches_path(new_path, b"b/", &item.new_path, new)
+        if !lines.iter().any(|line| line.starts_with(b"@@ "))
+            && !(field(b"new file mode ").is_some()
+                || field(b"deleted file mode ").is_some()
+                || (field(b"old mode ").is_some() && field(b"new mode ").is_some())
+                || status.starts_with('R')
+                || status.starts_with('C')
+                || header.iter().any(|line| line.starts_with(b"Binary files ")))
         {
             return None;
         }
-        // The patch computes the actual mutable-side hash; the raw record may
-        // contain zeroes for that same side. Keep its proven content identity.
-        item.new_oid = new.to_owned();
-        item.patch = patch.to_vec();
+        let reconstructable =
+            matches!(old_mode.as_str(), "100644" | "100755" | "120000" | "000000")
+                && matches!(new_mode.as_str(), "100644" | "100755" | "120000" | "000000");
+        let textual = lines.iter().any(|line| line.starts_with(b"@@ "));
+        let old_source = if !reconstructable || !textual {
+            SourceIdentity::Unavailable
+        } else if old_oid.bytes().all(|byte| byte == b'0') {
+            SourceIdentity::Empty
+        } else if let Some(full) = resolve_blob(cwd, &old_oid) {
+            old_oid = full.clone();
+            SourceIdentity::Blob(full)
+        } else {
+            SourceIdentity::Unavailable
+        };
+        let new_source = if !reconstructable || !textual {
+            SourceIdentity::Unavailable
+        } else if new_oid.bytes().all(|byte| byte == b'0') {
+            SourceIdentity::Empty
+        } else {
+            SourceIdentity::CapturedPatch
+        };
+        // Keep the legacy record representation for ordinary items. Extended
+        // identities include both paths/modes/status in the persisted digest.
+        let metadata = format!(":{old_mode} {new_mode} {old_oid} {new_oid} {status}").into_bytes();
+        items.push(Item {
+            old_path: std::mem::take(&mut old_path),
+            new_path: std::mem::take(&mut new_path),
+            old_oid,
+            new_oid,
+            old_mode,
+            new_mode,
+            status,
+            old_source,
+            new_source,
+            patch: patch.to_vec(),
+            metadata,
+            legacy_fingerprints: Vec::new(),
+        });
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    if items
+        .iter()
+        .any(|item| !identities.insert((&item.old_path, &item.new_path)))
+    {
+        return None;
     }
     Some(items)
 }
 
-fn matches_path(encoded: &[u8], prefix: &[u8], path: &[u8], oid: &str) -> bool {
-    if oid.bytes().all(|byte| byte == b'0') {
-        return encoded == b"/dev/null";
+fn valid_section(patch: &[u8]) -> bool {
+    let mut remaining = (0usize, 0usize);
+    let mut in_hunk = false;
+    let mut evidence = false;
+    for line in patch.split_inclusive(|byte| *byte == b'\n').skip(1) {
+        if line.starts_with(b"@@ ") {
+            if remaining != (0, 0) {
+                return false;
+            }
+            let Some((_, old, _, new)) = crate::source::hunk_bytes(line) else {
+                return false;
+            };
+            remaining = (old, new);
+            in_hunk = true;
+            evidence = true;
+        } else if in_hunk {
+            match line.first() {
+                Some(b' ') if remaining.0 > 0 && remaining.1 > 0 => {
+                    remaining.0 -= 1;
+                    remaining.1 -= 1;
+                }
+                Some(b'-') if remaining.0 > 0 => remaining.0 -= 1,
+                Some(b'+') if remaining.1 > 0 => remaining.1 -= 1,
+                Some(b'\\') if line.starts_with(b"\\ No newline at end of file") => {}
+                _ => return false,
+            }
+        } else if [
+            b"old mode ".as_slice(),
+            b"new mode ",
+            b"new file mode ",
+            b"deleted file mode ",
+            b"similarity index ",
+            b"dissimilarity index ",
+            b"rename from ",
+            b"rename to ",
+            b"copy from ",
+            b"copy to ",
+            b"index ",
+            b"--- ",
+            b"+++ ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+            || (line.starts_with(b"Binary files ") && line.ends_with(b" differ\n"))
+        {
+            evidence = true;
+        } else {
+            // Includes binary-patch payloads, submodule summaries, unknown
+            // indicators and formats. Keep those complete native bytes opaque.
+            return false;
+        }
     }
-    let encoded = encoded.strip_suffix(b"\t").unwrap_or(encoded);
-    let Some(decoded) = unquote(encoded) else {
-        return false;
-    };
-    decoded.strip_prefix(prefix) == Some(path)
+    evidence && remaining == (0, 0)
+}
+
+fn header_paths(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut candidates = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b' ' {
+            continue;
+        }
+        if let (Some(old), Some(new)) = (unquote(&bytes[..index]), unquote(&bytes[index + 1..]))
+            && let (Some(old), Some(new)) = (old.strip_prefix(b"a/"), new.strip_prefix(b"b/"))
+        {
+            candidates.push((old.to_vec(), new.to_vec()));
+        }
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 fn unquote(encoded: &[u8]) -> Option<Vec<u8>> {

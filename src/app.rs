@@ -32,7 +32,17 @@ impl App {
             ),
         };
         let original = capture.unavailable.is_some();
-        let preview = original.then(|| Preview::original(&capture.original));
+        let preview = original.then(|| {
+            let mut output = capture.original.clone();
+            if !capture.stderr.is_empty() {
+                if !output.is_empty() && !output.ends_with(b"\n") {
+                    output.push(b'\n');
+                }
+                output.extend_from_slice(b"Git stderr:\n");
+                output.extend_from_slice(&capture.stderr);
+            }
+            Preview::original(&output)
+        });
         Self {
             capture,
             store,
@@ -67,7 +77,15 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Enter => {
                 if let Some(item) = self.capture.items.get(self.selected) {
-                    self.preview = Some(Preview::item(&self.capture.cwd, item));
+                    let mut preview = Preview::item(&self.capture.cwd, item);
+                    if !self.capture.stderr.is_empty() {
+                        let mut warning = b"\nGit stderr:\n".to_vec();
+                        warning.extend_from_slice(&self.capture.stderr);
+                        let warning = Preview::original(&warning);
+                        preview.width = preview.width.max(warning.width);
+                        preview.lines.extend(warning.lines);
+                    }
+                    self.preview = Some(preview);
                     self.focus = Focus::Preview;
                     self.top = 0;
                     self.left = 0;

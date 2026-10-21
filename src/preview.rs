@@ -99,7 +99,7 @@ fn offsets(text: &str) -> Vec<usize> {
 
 impl Preview {
     pub fn original(bytes: &[u8]) -> Self {
-        Self::compose(&String::from_utf8_lossy(bytes), None, None)
+        Self::compose(&crate::git::visible_bytes(bytes), None, None, false)
     }
 
     pub fn item(cwd: &Path, item: &Item) -> Self {
@@ -114,16 +114,26 @@ impl Preview {
                 Some(format!("Source enrichment unavailable: {error}")),
             ),
         };
+        let text = std::str::from_utf8(&item.patch);
+        let escaped = text
+            .is_err()
+            .then(|| crate::git::visible_bytes(&item.patch));
         Self::compose(
-            &String::from_utf8_lossy(&item.patch),
+            text.unwrap_or_else(|_| escaped.as_deref().expect("escaped invalid bytes")),
             mapped
                 .as_ref()
                 .map(|(sources, old, new)| (*sources, old.as_slice(), new.as_slice())),
             reason,
+            text.is_ok(),
         )
     }
 
-    fn compose(patch: &str, mapped: Option<MappedColors<'_>>, reason: Option<String>) -> Self {
+    fn compose(
+        patch: &str,
+        mapped: Option<MappedColors<'_>>,
+        reason: Option<String>,
+        escape_backslashes: bool,
+    ) -> Self {
         let raw: Vec<_> = patch.split_terminator('\n').collect();
         let mut remaining = (0, 0);
         let source_lines: Vec<_> = raw
@@ -225,7 +235,9 @@ impl Preview {
                         style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     }
                 }
-                let rendered = if grapheme == "\t" {
+                let rendered = if grapheme == "\\" && escape_backslashes {
+                    "\\\\".into()
+                } else if grapheme == "\t" {
                     " ".repeat(4 - column.saturating_sub(usize::from(source_line)) % 4)
                 } else {
                     grapheme

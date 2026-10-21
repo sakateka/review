@@ -38,15 +38,15 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     let args = match parse_args(std::env::args_os().skip(1))? {
         Cli::Help => {
             print!("{HELP}");
-            return Ok(());
+            return Ok(0);
         }
         Cli::Version => {
             println!("review {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+            return Ok(0);
         }
         Cli::Review(args) => args,
     };
@@ -55,15 +55,19 @@ fn run() -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("review requires an interactive terminal (use git diff for piped output)");
     }
-    let store = state::Store::for_session(&cwd, &args)?;
+    let store = state::Store::for_session(&capture.cwd, &capture.args)?;
     let mut app = app::App::new(capture, store);
-    ui::run(&mut app)
+    ui::run(&mut app)?;
+    Ok(app.capture.status.code().unwrap_or(1))
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("review: {error:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(status) => std::process::exit(status),
+        Err(error) => {
+            eprintln!("review: {error:#}");
+            std::process::exit(1);
+        }
     }
 }
 

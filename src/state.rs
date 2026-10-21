@@ -87,7 +87,14 @@ impl Store {
         }
         Ok(items
             .iter()
-            .map(|item| saved.marks.get(&digest([&item.new_path])) == Some(&fingerprint(item)))
+            .map(|item| {
+                saved
+                    .marks
+                    .get(&digest([&item.new_path]))
+                    .is_some_and(|saved| {
+                        saved == &fingerprint(item) || item.legacy_fingerprints.contains(saved)
+                    })
+            })
             .collect())
     }
 
