@@ -72,8 +72,12 @@ impl Worker {
         });
         Self { sender, receiver }
     }
-    pub fn request(&self, request: Request) -> bool {
-        self.sender.try_send(request).is_ok()
+    pub fn request(&self, request: Request) -> Result<(), Request> {
+        self.sender.try_send(request).map_err(|error| match error {
+            mpsc::TrySendError::Full(request) | mpsc::TrySendError::Disconnected(request) => {
+                request
+            }
+        })
     }
     pub fn poll(&self) -> Option<Results> {
         self.receiver.try_recv().ok()

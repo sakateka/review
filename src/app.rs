@@ -305,16 +305,18 @@ impl App {
             navigation: self.navigation.clone(),
         });
     }
-    fn abandon_navigation(&mut self) {
+    fn invalidate_analysis(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = None;
+    }
+    fn abandon_navigation(&mut self) {
+        self.invalidate_analysis();
         self.navigation = None;
         self.source = None;
         self.history.clear();
     }
     fn back(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.pending = None;
+        self.invalidate_analysis();
         if let Some(view) = self.history.pop() {
             self.preview = view.preview;
             self.top = view.top;
@@ -356,8 +358,7 @@ impl App {
             self.position_at_view()
         };
         self.save_view();
-        self.generation = self.generation.wrapping_add(1);
-        self.pending = None;
+        self.invalidate_analysis();
         self.navigation = Some(Navigation {
             position,
             operation,
@@ -406,16 +407,7 @@ impl App {
             }
         }
         if let Some(request) = self.pending.take() {
-            let retry = Request {
-                generation: request.generation,
-                position: request.position,
-                operation: request.operation,
-                query: request.query.clone(),
-                side: request.side,
-            };
-            if !self.worker.request(request) {
-                self.pending = Some(retry);
-            }
+            self.pending = self.worker.request(request).err();
         }
     }
     fn render_candidates(&mut self) {

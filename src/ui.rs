@@ -153,6 +153,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+}
+
 type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
 struct Restore {
     hook: PanicHook,
@@ -167,8 +172,7 @@ impl Drop for Restore {
             let hook = self.hook.clone();
             std::panic::set_hook(Box::new(move |info| hook(info)));
         }
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        restore_terminal();
     }
 }
 
@@ -183,8 +187,7 @@ pub fn run(app: &mut App) -> Result<()> {
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+            restore_terminal();
         }
         old_hook(info);
     }));
