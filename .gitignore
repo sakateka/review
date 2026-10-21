@@ -2,6 +2,7 @@
 /.agents/skills/bmad*/
 /.agents/skills/bmod-*/
 /_bmad/
+/_bmad-output/
 /skills-lock.json
 /.bmad-help-setup-modules*.toml
 /.v6-v7-migration-backup-*/
