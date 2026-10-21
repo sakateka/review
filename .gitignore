@@ -5,3 +5,4 @@
 /skills-lock.json
 /.bmad-help-setup-modules*.toml
 /.v6-v7-migration-backup-*/
+/target/

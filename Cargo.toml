@@ -1,0 +1,21 @@
+[package]
+name = "review"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Review captured Git diffs locally with explicit persistent file marks"
+license = "MIT"
+
+[dependencies]
+anyhow = "=1.0.104"
+crossterm = "=0.29.0"
+ratatui = "=0.29.0"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+similar = "=2.7.0"
+tempfile = "=3.27.0"
+tree-sitter-highlight = "=0.25.10"
+tree-sitter-rust = "=0.24.2"
+unicode-segmentation = "=1.13.3"
+unicode-width = "=0.2.0"
