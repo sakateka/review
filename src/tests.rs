@@ -154,7 +154,7 @@ fn navigation_preview_focus_mark_and_restart() {
     assert_eq!(app.focus, Focus::Files);
     app.key(KeyCode::Down);
     assert!(app.preview.is_none());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [false, true]);
     let mut restarted = application(directory.path(), state.path());
     assert_eq!(restarted.marks, [false, true]);
@@ -253,7 +253,7 @@ fn original_output_is_faithful_and_marks_are_disabled() {
             captured,
             state::Store::at(state.path(), directory.path(), &[]),
         );
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         assert!(app.marks.is_empty());
         assert!(app.status.contains("unavailable"));
         assert!(!app.store.path.exists());
@@ -298,7 +298,7 @@ fn empty_comparison_controls_are_safe() {
         KeyCode::Up,
         KeyCode::Left,
         KeyCode::Right,
-        KeyCode::Char(' '),
+        KeyCode::Char('m'),
     ] {
         app.key(key);
     }
@@ -314,7 +314,7 @@ fn save_failure_preserves_visible_marks_and_prior_state() {
     let state = tempfile::tempdir().unwrap();
     change(directory.path());
     let mut app = application(directory.path(), state.path());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(app.marks[0]);
     let prior_path = app.store.path.clone();
     let prior = std::fs::read(&prior_path).unwrap();
@@ -322,7 +322,7 @@ fn save_failure_preserves_visible_marks_and_prior_state() {
     let obstacle = state.path().join("regular-file");
     std::fs::write(&obstacle, b"occupied").unwrap();
     app.store.path = obstacle.join("state.json");
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(app.marks[0]);
     assert!(app.status.contains("not saved"));
     assert_eq!(std::fs::read(prior_path).unwrap(), prior);
@@ -337,7 +337,7 @@ fn corrupt_state_is_diagnosed_and_preserved() {
     std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
     std::fs::write(&store.path, b"invalid json").unwrap();
     let mut app = application(directory.path(), state.path());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [false, false]);
     assert!(app.status.contains("corrupt"));
     assert_eq!(std::fs::read(store.path).unwrap(), b"invalid json");
@@ -500,9 +500,9 @@ fn nominal_changed_patch_clears_only_its_mark_and_sessions_are_separate() {
     let state = tempfile::tempdir().unwrap();
     change(directory.path());
     let mut app = application(directory.path(), state.path());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     app.key(KeyCode::Down);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     std::fs::write(
         directory.path().join("one.rs"),
         "fn one() { let changed = 9; }\n",
@@ -789,7 +789,7 @@ fn no_index_marks_follow_captured_file_bytes_and_invalidate_on_change() {
     assert!(captured.items[0].canonical_identity.is_some());
     let store = state::Store::at(state_dir.path(), directory.path(), &args);
     let mut app = App::new(captured, store);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [true]);
     assert_eq!(
         App::new(
@@ -843,7 +843,7 @@ fn identical_mode_only_patch_with_changed_sides_clears_mark() {
     let first_patch = first.items[0].patch.clone();
     let store = state::Store::at(state_dir.path(), directory.path(), &args);
     let mut app = App::new(first, store);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(app.marks[0]);
 
     git_run(directory.path(), &["switch", "left"]);
@@ -929,7 +929,7 @@ fn unrelated_commit_movement_preserves_unchanged_item_mark() {
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
     assert_eq!(app.capture.items.len(), 1);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(app.marks[0]);
 
     std::fs::write(directory.path().join("unrelated.txt"), b"unrelated\n").unwrap();
@@ -960,9 +960,9 @@ fn staged_content_change_clears_only_its_mark() {
         git::capture(directory.path(), &args).unwrap(),
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     app.key(KeyCode::Down);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [true, true]);
     std::fs::write(directory.path().join("one.rs"), b"different staged bytes\n").unwrap();
     git_run(directory.path(), &["add", "one.rs"]);
@@ -997,7 +997,7 @@ fn mutations_at_capture_boundary_disable_proof_but_post_capture_marks_stay_bound
         unstable,
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(!app.marks[app.selected]);
     assert!(app.status.contains("could not be proven"));
 
@@ -1009,7 +1009,7 @@ fn mutations_at_capture_boundary_disable_proof_but_post_capture_marks_stay_bound
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
     std::fs::write(&changed_path, b"changed after capture\n").unwrap();
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert!(app.marks[0]);
     assert_eq!(
         App::new(
@@ -1085,7 +1085,7 @@ fn metadata_only_items_renames_and_binary_changes_can_be_marked_and_restarted() 
     let mut app = application(directory.path(), state.path());
     app.key(KeyCode::Enter);
     assert!(app.preview.is_some());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(application(directory.path(), state.path()).marks, [true]);
     git_run(directory.path(), &["add", "."]);
     git_run(directory.path(), &["commit", "-qm", "mode"]);
@@ -1894,7 +1894,7 @@ fn structured_warning_bytes_remain_scrollable_after_marking_and_reopening() {
     );
     assert!(app.preview.is_none());
     app.key(KeyCode::Enter);
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.status, "Review mark saved");
     assert!(app.marks[0]);
     assert_eq!(app.capture.items[0].patch, patch);
@@ -2100,7 +2100,7 @@ fn custom_a_b_shaped_prefixes_never_create_fictitious_item_identities() {
             captured,
             state::Store::at(base.path(), directory.path(), &[]),
         );
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         assert!(app.marks.is_empty());
         assert!(app.status.contains("unavailable"));
     }
@@ -2182,9 +2182,9 @@ fn staged_metadata_marks_use_base_tree_and_index_for_modes_and_exact_renames() {
             first,
             state::Store::at(state_dir.path(), directory.path(), &args),
         );
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         app.key(KeyCode::Down);
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         assert_eq!(app.marks, [true, true]);
         assert_eq!(
             state::Store::at(state_dir.path(), directory.path(), &args)
@@ -2241,7 +2241,7 @@ fn staged_metadata_marks_use_base_tree_and_index_for_modes_and_exact_renames() {
     );
     assert!(app.capture.items[0].status.starts_with('R'));
     assert!(app.capture.items[0].canonical_identity.is_some());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     let store = state::Store::at(state_dir.path(), directory.path(), &args);
     assert_eq!(
         store
@@ -2284,7 +2284,7 @@ fn subdirectory_worktree_capture_uses_native_root_relative_paths() {
     );
     assert_eq!(app.capture.items.len(), 1);
     assert!(app.capture.items[0].canonical_identity.is_some());
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [true]);
     let store = state::Store::at(state_dir.path(), &sub, &args);
     assert_eq!(
@@ -2328,7 +2328,7 @@ fn pending_legacy_survives_v2_saves_and_migrated_unmarks_never_resurrect() {
     let mut app = App::new(git::capture(directory.path(), &args).unwrap(), store);
     assert_eq!(app.marks, [true]);
     assert!(app.status.contains("pending"));
-    app.key(KeyCode::Char(' ')); // Persist explicit unmark of migrated one.rs.
+    app.key(KeyCode::Char('m')); // Persist explicit unmark of migrated one.rs.
     assert_eq!(app.marks, [false]);
     assert!(app.store.path.exists());
     let loaded = app
@@ -2527,7 +2527,7 @@ fn worktree_exact_rename_mark_restarts_and_invalidates_changed_destination() {
         captured,
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [true]);
     let store = state::Store::at(state_dir.path(), directory.path(), &args);
     assert_eq!(
@@ -3964,11 +3964,55 @@ fn configurable_keymaps_validate_and_replace_every_default() {
         bindings.resolve(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), true),
         Resolution::Action(Action::GoToDefinition)
     ));
+    for keymap in [Keymap::Vim, Keymap::Emacs] {
+        let mut defaults = keybindings::Bindings::new(keymap, true, &Default::default()).unwrap();
+        for (code, expected) in [
+            (KeyCode::Enter, Action::OpenDiffView),
+            (KeyCode::Char(' '), Action::OpenDiffView),
+            (KeyCode::Char('m'), Action::ToggleMark),
+        ] {
+            assert!(
+                matches!(defaults.resolve(KeyEvent::new(code, KeyModifiers::NONE), false), Resolution::Action(found) if found == expected)
+            );
+        }
+        assert!(defaults.help().contains("open_diff_view: enter, space"));
+        assert!(defaults.help().contains("toggle_mark: m"));
+        let mut custom =
+            config::Config::parse("[keybindings]\nopen_diff_view='o'\ntoggle_mark='space'")
+                .unwrap()
+                .bindings(Some(keymap))
+                .unwrap();
+        assert!(matches!(
+            custom.resolve(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            Resolution::Unbound
+        ));
+        assert!(matches!(
+            custom.resolve(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), false),
+            Resolution::Unbound
+        ));
+        assert!(matches!(
+            custom.resolve(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), false),
+            Resolution::Action(Action::ToggleMark)
+        ));
+        let mut disabled =
+            config::Config::parse("[keybindings]\nopen_diff_view=''\ntoggle_mark=''")
+                .unwrap()
+                .bindings(Some(keymap))
+                .unwrap();
+        for code in [KeyCode::Enter, KeyCode::Char(' '), KeyCode::Char('m')] {
+            assert!(matches!(
+                disabled.resolve(KeyEvent::new(code, KeyModifiers::NONE), false),
+                Resolution::Unbound
+            ));
+        }
+    }
     for invalid in [
         "[features]\nkeymap='unknown'",
         "[features]\nunknown=true",
         "[keybindings]\nunknown='x'",
         "[keybindings]\ncursor_down='k'",
+        "[keybindings]\ntoggle_mark='space'",
+        "[keybindings]\nopen_diff_view='m'",
         "[keybindings]\ncursor_down='g'",
         "[keybindings]\ncursor_down='ctrl-bogus'",
         "[keybindings]\nquit='ctrl-c'",
@@ -5002,7 +5046,7 @@ fn documentation_view_returns_exact_origin_and_respects_keys_marks_and_stale_res
                 .iter()
                 .any(|line| line.to_string().contains("Captured documentation for"))
         );
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         assert!(app.marks.iter().all(|mark| !mark));
         app.key(KeyCode::Char(']'));
         assert!(app.documentation);
@@ -5483,7 +5527,7 @@ fn preview_returns_snapshot_origin_and_respects_configured_keys() {
                 .iter()
                 .any(|line| line.to_string().contains("live_replacement"))
         );
-        app.key(KeyCode::Char(' '));
+        app.key(KeyCode::Char('m'));
         assert!(app.marks.iter().all(|mark| !mark));
         app.key(KeyCode::Char('q'));
         assert!(!app.definition_preview);
@@ -5981,7 +6025,7 @@ fn file_statistics_rows_keep_names_styles_marks_and_resize_safe() {
             .iter()
             .any(|cell| cell.symbol() == "-" && cell.fg == Color::Red)
     );
-    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Char('m'));
     app.key(KeyCode::Enter);
     assert!(screen_text(&screen(&mut app, 100, 24)).contains("2 +-"));
     app.key(KeyCode::Esc);
