@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod comments;
 mod config;
 mod git;
 mod keybindings;
@@ -30,7 +31,7 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
     if bindings.keymap == keybindings::Keymap::Vim {
         text.push_str("Vim counts repeat configured motions and line jumps.\n");
     }
-    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nReviewing requires system Git and an interactive terminal.\n");
+    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nReviewing requires system Git and an interactive terminal.\n");
     text.push_str(
         "\nCommand line (command_line): Enter runs, Escape cancels, Tab/Shift-Tab complete.\n",
     );

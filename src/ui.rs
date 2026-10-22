@@ -1,17 +1,20 @@
 use crate::app::{App, Focus};
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::Style,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::{
     io,
@@ -234,10 +237,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             inner.width,
             inner.height.min(1),
         );
-        app.preview_area = content;
-        app.layout_preview(content.height as usize, content.width as usize);
+        // Commented diffs reserve a two-cell icon column at the right edge.
+        let markers = app.comment_markers();
+        let mut text_area = content;
+        if markers.is_some() {
+            text_area.width = text_area.width.saturating_sub(2);
+        }
+        app.preview_area = text_area;
+        app.layout_preview(text_area.height as usize, text_area.width as usize);
         let preview = app.preview.as_ref().expect("preview exists");
-        let lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
+        let mut lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
+        if let Some((first, last)) = app.selected_rows() {
+            for (offset, line) in lines.iter_mut().enumerate() {
+                if (first..=last).contains(&(app.top + offset)) {
+                    if line.spans.is_empty() {
+                        line.spans.push(Span::raw(" "));
+                    }
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(app.theme.selection);
+                    }
+                }
+            }
+        }
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -253,7 +274,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 })),
             area,
         );
-        frame.render_widget(Paragraph::new(lines), content);
+        frame.render_widget(Paragraph::new(lines), text_area);
+        if let Some(markers) = &markers
+            && content.width >= 2
+        {
+            for offset in 0..app.viewport.0 {
+                if let Some(Some(outdated)) = markers.get(app.top + offset) {
+                    let style = if *outdated {
+                        Style::default()
+                            .fg(app.theme.comment_outdated)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.comment)
+                    };
+                    frame.buffer_mut().set_string(
+                        content.x + content.width - 2,
+                        content.y + offset as u16,
+                        "💬",
+                        style,
+                    );
+                }
+            }
+        }
         let total = preview.lines.len();
         let (row, column) = if total == 0 {
             (0, 0)
@@ -320,9 +362,67 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(status), areas[1]);
     }
     frame.render_widget(Paragraph::new(app.bindings.legend()), areas[2]);
+    if let Some(editor) = &app.editor {
+        draw_editor(frame, editor, &app.theme);
+    }
 }
 
+/// Centered floating comment editor; owns the terminal cursor while open.
+fn draw_editor(frame: &mut Frame, editor: &crate::comments::Editor, theme: &crate::theme::Theme) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(90);
+    let height = screen.height.saturating_sub(4).min(14);
+    if width < 3 || height < 3 {
+        return;
+    }
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focused))
+        .title(format!(" Comment · {} ", editor.title))
+        .title_bottom(" enter save · ctrl-enter/alt-enter/ctrl-j newline · esc cancel ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows = inner.height as usize;
+    let columns = inner.width as usize;
+    if rows == 0 || columns == 0 {
+        return;
+    }
+    let top = (editor.row + 1).saturating_sub(rows);
+    let line = &editor.lines[editor.row];
+    let before: String = line.chars().take(editor.column).collect();
+    let cursor = before.width();
+    let left = (cursor + 1).saturating_sub(columns);
+    let text: Vec<Line> = editor
+        .lines
+        .iter()
+        .skip(top)
+        .take(rows)
+        .map(|line| Line::raw(line.clone()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(text).scroll((0, left.min(u16::MAX as usize) as u16)),
+        inner,
+    );
+    frame.set_cursor_position((
+        inner.x + (cursor - left) as u16,
+        inner.y + (editor.row - top) as u16,
+    ));
+}
+
+/// Whether keyboard enhancement flags were pushed and must be popped.
+static ENHANCED_KEYBOARD: AtomicBool = AtomicBool::new(false);
+
 fn restore_terminal() {
+    if ENHANCED_KEYBOARD.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         io::stdout(),
@@ -358,6 +458,23 @@ pub fn run(app: &mut App) -> Result<()> {
     };
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // Disambiguated key codes distinguish Ctrl+Enter/Shift+Enter from Enter in
+    // the comment editor. Alternate keys keep shifted Alt chords such as
+    // alt-< reported as their shifted character. Only pushed when the terminal
+    // answers the kitty keyboard query; every restore path pops it.
+    if matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            )
+        )?;
+        ENHANCED_KEYBOARD.store(true, Ordering::SeqCst);
+    }
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
@@ -389,7 +506,7 @@ pub fn run(app: &mut App) -> Result<()> {
                 continue;
             }
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if key.code == event::KeyCode::Char('c')
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {

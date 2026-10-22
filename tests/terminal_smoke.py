@@ -74,7 +74,10 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
 
     class Session:
-        def __init__(self, command=None, scenario=None, cwd=None):
+        def __init__(self, command=None, scenario=None, cwd=None, kitty=False):
+            # Like a real terminal, answer primary device attributes; answer
+            # the kitty keyboard-protocol query only when modelling kitty.
+            self.kitty = kitty
             self.master, self.slave = pty.openpty()
             self.original = termios.tcgetattr(self.slave)
             fcntl.ioctl(self.slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 140, 0, 0))
@@ -110,7 +113,11 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
                         self.pending = self.pending[2:]
                         continue
                     parameters, _, command = match.groups()
-                    numbers = [int(n) if n else 0 for n in parameters.lstrip("?").split(";")]
+                    if command == "u" and parameters == "?" and self.kitty:
+                        os.write(self.master, b"\x1b[?0u")
+                    elif command == "c" and parameters == "":
+                        os.write(self.master, b"\x1b[?62;22c")
+                    numbers = [int(n) if n else 0 for n in parameters.lstrip("?<>=").split(";")]
                     value = numbers[0] if numbers else 0
                     if command == "m":
                         i = 0
@@ -281,6 +288,8 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(b"colo\t")
     session.wait_text(":colorscheme ")
     session.send(b" gru\t")
+    session.wait_text(":colorscheme gruvbox-baby")
+    session.send(b"\t")
     session.wait_text(":colorscheme gruvbox-dark")
     session.send(b"\t")
     session.wait_text(":colorscheme gruvbox-light")
@@ -1353,5 +1362,170 @@ pub fn invoke(worker: Worker) -> u32 {
     merge = subprocess.run([git, "merge", "--no-edit", right], cwd=acceptance, env=env, capture_output=True)
     assert merge.returncode == 1, merge.stdout
     check_native(["--cc"], True)
+
+    # Story 18: persistent review comments in the launch directory.
+    comments_repo = root / "comments"
+    comments_repo.mkdir()
+    def comments_git(*words):
+        return subprocess.check_output([git, *words], cwd=comments_repo, env=env, stderr=subprocess.STDOUT)
+    comments_git("init", "-q")
+    comments_git("config", "user.name", "Comments acceptance")
+    comments_git("config", "user.email", "comments@example.invalid")
+    for name in ["one.rs", "two.rs"]:
+        (comments_repo / name).write_text("fn " + name[:-3] + "() {\n    let answer = 1;\n}\n")
+    comments_git("add", ".")
+    comments_git("commit", "-qm", "base")
+    for name in ["one.rs", "two.rs"]:
+        (comments_repo / name).write_text("fn " + name[:-3] + "() {\n    let answer = 100;\n}\n")
+    comments_file = comments_repo / "review-HEAD.comments"
+    comments_before = snapshot(comments_repo)
+    comments_state = snapshot(root / "state")
+    def comment_session(*options):
+        return Session([str(binary), *options, "--", "HEAD"], cwd=comments_repo)
+    def save_comment(session, title, text):
+        session.wait_text("Comment · " + title)
+        session.send(text.encode())
+        session.send(b"\r")
+        session.wait_text("Comment saved")
+        assert "Comment · " not in session.text(), session.text()
+    def icons(session):
+        found = []
+        for row, line in enumerate(session.text().splitlines()):
+            if "💬" in line:
+                found.append((row, session.colors[(row, line.index("💬"))]))
+        return found
+    # one.rs rows: 0 diff --git .. 4 @@, 5 context, 6 removed, 7 added, 8 context.
+    session = comment_session()
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("let answer = 100;")
+    session.send(b"jjjjjjj")
+    session.send(b"c")
+    save_comment(session, "one.rs:2 (new)", "Line note")
+    assert len(icons(session)) == 1, session.text()
+    assert comments_file.exists()
+    session.send(b"gg")
+    session.send(b"jjjjj")
+    session.send(b"v")
+    session.send(b"j")
+    session.send(b"c")
+    save_comment(session, "one.rs:old 2, new 1 (mixed)", "Range note")
+    session.send(b"gg")
+    session.send(b"c")
+    save_comment(session, "one.rs (file)", "File note")
+    assert len(icons(session)) == 7, icons(session)
+    # A range overlapping an existing comment is refused; editing prefills.
+    session.send(b"jjjjjv")
+    session.send(b"jjc")
+    session.wait_text("overlaps an existing comment")
+    session.send(b"c")
+    session.wait_text("Comment · one.rs:2 (new)")
+    session.wait_text("Line note")
+    # Alt+Enter (ESC CR) and Ctrl-J (LF) insert newlines; Ctrl-S is a save alias.
+    session.send(b" edited\x1b\rsecond\nthird")
+    session.wait_text("third")
+    assert "Comment · one.rs:2 (new)" in session.text(), session.text()
+    session.send(b"\x13")
+    session.wait_text("Comment saved")
+    session.send(b"c")
+    session.wait_text("Comment · one.rs:2 (new)")
+    session.send(b"\x1b")
+    session.wait_text("Comment edit cancelled")
+    assert "┌Diff" in session.text(), "Escape in the editor closed the diff"
+    session.send(b",q")
+    session.finish()
+    assert b"\x1b[>" not in session.output, "keyboard enhancement pushed without terminal support"
+    text = comments_file.read_text()
+    assert text.startswith("---\nreview-comments: v1\n"), text
+    for heading in ["## one.rs (file)", "## one.rs:old 2, new 1 (mixed)", "## one.rs:2 (new)"]:
+        assert "\n" + heading + "\n" in text, (heading, text)
+    assert "Line note edited\nsecond\nthird\n" in text and "comments: 3\noutdated: 0\n" in text, text
+    assert 'command: "git diff HEAD"' in text, text
+    # Emacs controls in a restarted session reuse the same file.
+    session = comment_session("--keymap", "emacs")
+    session.wait_text("Files")
+    session.send(b"\x0e")
+    session.send(b"\r")
+    session.wait_text("fn two()")
+    session.send(b"\x0e" * 6)
+    session.send(b"\x00")
+    session.send(b"\x0e")
+    session.send(b"c")
+    session.wait_text("Comment · two.rs:old 2, new 2 (mixed)")
+    session.send(b"discard")
+    session.send(b"\x07")
+    session.wait_text("Comment edit cancelled")
+    session.send(b"\x00")
+    session.send(b"\x10")
+    session.send(b"\x07")
+    session.wait_text("Selection cancelled")
+    session.send(b"\x00\x0ec")
+    save_comment(session, "two.rs:old 2, new 2 (mixed)", "Emacs note")
+    session.send(b",q")
+    session.finish()
+    assert "comments: 4\n" in comments_file.read_text()
+    # Restart restores icons without changing marks.
+    session = comment_session()
+    session.wait_text("4 comment(s) loaded")
+    session.send(b"\r")
+    session.wait_text("let answer = 100;")
+    assert len(icons(session)) == 7, icons(session)
+    session.send(b",q")
+    session.finish()
+    # Changed code: the line comment becomes outdated and its icon gray.
+    (comments_repo / "one.rs").write_text("fn one() {\n    let answer = 101;\n}\n")
+    session = comment_session()
+    session.wait_text("4 comment(s) loaded, 1 outdated")
+    session.send(b"\r")
+    session.wait_text("let answer = 101;")
+    found = icons(session)
+    assert len(found) == 7, found
+    current = {color for _, color in found[:-1]}
+    assert len(current) == 1 and found[-1][1] not in current, found
+    assert "## one.rs:2 (new) [outdated]" in comments_file.read_text()
+    # Deleting every comment removes the owned file.
+    session.send(b"ggdc")
+    session.wait_text("Comment deleted")
+    session.send(b"jjjjjdc")
+    session.send(b"jjdc")
+    session.send(b"\x1b")
+    session.send(b"j")
+    session.send(b"\r")
+    session.wait_text("fn two()")
+    session.send(b"jjjjjjdc")
+    session.wait_text("comments file removed")
+    assert not comments_file.exists()
+    session.send(b",q")
+    session.finish()
+    # A kitty-protocol terminal gets disambiguated keys: Ctrl+Enter and
+    # Shift+Enter insert newlines, CSI-u Escape still closes, and the flags
+    # are popped on exit.
+    session = Session([str(binary), "--", "HEAD"], cwd=comments_repo, kitty=True)
+    session.wait_text("Files")
+    assert b"\x1b[>5u" in session.output, session.output[-300:]
+    session.send(b"\r")
+    session.wait_text("let answer = 101;")
+    session.send(b"jjjjjjjc")
+    session.wait_text("Comment · one.rs:2 (new)")
+    session.send(b"kitty\x1b[13;5uctrl\x1b[13;2ushift")
+    session.wait_text("shift")
+    session.send(b"\r")
+    session.wait_text("Comment saved")
+    assert "kitty\nctrl\nshift\n" in comments_file.read_text()
+    session.send(b"dc")
+    session.wait_text("comments file removed")
+    session.send(b"\x1b[27u")
+    session.wait_text("Files")
+    session.pump(0.3)
+    assert "┌Diff" not in session.text(), session.text()
+    session.send(b",q")
+    session.finish()
+    assert b"\x1b[<1u" in session.output, "keyboard enhancement flags not popped"
+    assert not comments_file.exists()
+    after = snapshot(comments_repo)
+    assert after.pop("one.rs") != comments_before.pop("one.rs")
+    assert after == comments_before, "comments changed repository bytes beyond the owned file"
+    assert snapshot(root / "state") == comments_state, "comments changed review marks"
+    print("PTY passed: line/range/header comments in Vim and Emacs keymaps, Enter save, Ctrl/Shift/Alt+Enter and Ctrl-J newlines, kitty keyboard push/pop, icons, edit, restart, outdated detection and file removal", flush=True)
 
 print("PTY passed: installed language navigation, terminal lifecycle, R1-R13 workflow, diff cursor/scroll status, branch/ref/staged/worktree/no-index invalidation, Git compatibility and original-output fallback" + (", injected panic/I/O failure" if args.test_binary else ""))

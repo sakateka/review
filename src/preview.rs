@@ -546,6 +546,28 @@ impl Preview {
         }
     }
 
+    /// Captured patch row index behind each displayed row, in either the
+    /// ordinary or the after-changes view. Appended rows (Git stderr) have none.
+    pub fn patch_rows(&self) -> Vec<Option<usize>> {
+        let ordinary = self.ordinary.as_deref().unwrap_or(self);
+        let total = ordinary.locations.len();
+        let rows: Vec<usize> = if self.ordinary.is_some() {
+            (0..ordinary.lines.len())
+                .filter(|row| {
+                    !ordinary
+                        .removed
+                        .as_ref()
+                        .is_some_and(|rows| rows.get(*row) == Some(&true))
+                })
+                .collect()
+        } else {
+            (0..self.lines.len()).collect()
+        };
+        rows.into_iter()
+            .map(|row| (row < total).then_some(row))
+            .collect()
+    }
+
     /// Append another rendering's rows below this one.
     pub fn append(&mut self, other: Preview) {
         self.width = self.width.max(other.width);

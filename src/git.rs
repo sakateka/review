@@ -2049,3 +2049,209 @@ fn no_index_catalog(
     };
     Some((select(operands[1]), select(operands[0])))
 }
+
+/// One compared side as recorded in the comments file header.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideProvenance {
+    pub label: String,
+    pub reference: Option<String>,
+    pub commit: Option<String>,
+    pub object: Option<String>,
+}
+
+/// Read-only description of a comparison for the comments file header.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    pub no_index: bool,
+    pub repository: Option<String>,
+    pub remote: Option<String>,
+    pub old: SideProvenance,
+    pub new: SideProvenance,
+    pub merge_base: Option<String>,
+}
+
+fn query(cwd: &Path, args: &[OsString]) -> Option<String> {
+    let output = command(cwd).args(args).output().ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim_end_matches('\n');
+    (output.status.success() && !text.is_empty()).then(|| text.to_owned())
+}
+
+fn resolve_side(cwd: &Path, operand: &OsString) -> SideProvenance {
+    let verify = |suffix: &str| {
+        let mut expression = operand.clone();
+        expression.push(suffix);
+        query(
+            cwd,
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                "--end-of-options".into(),
+                expression,
+            ],
+        )
+    };
+    let commit = verify("^{commit}");
+    SideProvenance {
+        label: visible_name(operand.as_encoded_bytes()),
+        reference: query(
+            cwd,
+            &[
+                "rev-parse".into(),
+                "--symbolic-full-name".into(),
+                operand.clone(),
+            ],
+        ),
+        object: commit.is_none().then(|| verify("")).flatten(),
+        commit,
+    }
+}
+
+/// Describe the captured comparison with read-only Git queries. Used only when
+/// the comments file is written, so ordinary review never runs these queries.
+pub fn provenance(cwd: &Path, args: &[OsString]) -> Provenance {
+    use std::os::unix::ffi::OsStringExt;
+    let labeled = |label: &str| SideProvenance {
+        label: label.into(),
+        ..SideProvenance::default()
+    };
+    let Ok(analysis) = analyze(cwd, args) else {
+        return Provenance {
+            old: labeled("unavailable"),
+            new: labeled("unavailable"),
+            ..Provenance::default()
+        };
+    };
+    if analysis.no_index {
+        let side = |index: usize, name: &str| {
+            labeled(&match analysis.operands.get(index) {
+                Some(path) => format!("{name} file {}", visible_name(path.as_encoded_bytes())),
+                None => format!("{name} file"),
+            })
+        };
+        return Provenance {
+            no_index: true,
+            old: side(0, "old"),
+            new: side(1, "new"),
+            ..Provenance::default()
+        };
+    }
+    let repository = query(cwd, &["rev-parse".into(), "--show-toplevel".into()]);
+    let remote = query(cwd, &["remote".into()]).and_then(|names| {
+        let names: Vec<_> = names.lines().collect();
+        let name = names
+            .iter()
+            .find(|name| **name == "origin")
+            .or(names.first())?;
+        query(cwd, &["remote".into(), "get-url".into(), (*name).into()])
+            .map(|url| strip_userinfo(&url))
+    });
+    let mut operands = analysis.operands.clone();
+    let mut symmetric = analysis.merge_base;
+    if operands.len() == 1 && !analysis.index_only {
+        let bytes = operands[0].as_encoded_bytes();
+        let split = bytes
+            .windows(3)
+            .position(|part| part == b"...")
+            .map(|index| (index, 3))
+            .or_else(|| {
+                bytes
+                    .windows(2)
+                    .position(|part| part == b"..")
+                    .map(|index| (index, 2))
+            });
+        if let Some((index, length)) = split {
+            symmetric |= length == 3;
+            let part = |range: &[u8]| {
+                OsString::from_vec(if range.is_empty() {
+                    b"HEAD".to_vec()
+                } else {
+                    range.to_vec()
+                })
+            };
+            operands = vec![part(&bytes[..index]), part(&bytes[index + length..])];
+        }
+    }
+    // Pathspecs without Git's separator are operands too; keep revisions only.
+    operands.retain(|operand| {
+        query(
+            cwd,
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                "--quiet".into(),
+                "--end-of-options".into(),
+                operand.clone(),
+            ],
+        )
+        .is_some()
+    });
+    let worktree = || labeled("working tree, uncommitted");
+    let index = || labeled("index");
+    let (mut old, mut new) = if analysis.index_only {
+        let base = operands
+            .first()
+            .cloned()
+            .unwrap_or_else(|| OsString::from("HEAD"));
+        (resolve_side(cwd, &base), index())
+    } else {
+        match operands.as_slice() {
+            [] => (index(), worktree()),
+            [one] => (resolve_side(cwd, one), worktree()),
+            [first, .., last] => (resolve_side(cwd, first), resolve_side(cwd, last)),
+        }
+    };
+    let merge_base = symmetric
+        .then(|| {
+            let left = old.commit.clone()?;
+            let right = new.commit.clone().or_else(|| {
+                query(
+                    cwd,
+                    &[
+                        "rev-parse".into(),
+                        "--verify".into(),
+                        "--quiet".into(),
+                        "HEAD^{commit}".into(),
+                    ],
+                )
+            })?;
+            query(cwd, &["merge-base".into(), left.into(), right.into()])
+        })
+        .flatten();
+    if analysis.reverse {
+        std::mem::swap(&mut old, &mut new);
+    }
+    Provenance {
+        no_index: false,
+        repository,
+        remote,
+        old,
+        new,
+        merge_base,
+    }
+}
+
+/// Remove credentials from a scheme URL (`https://user:token@host/...`);
+/// scp-style `git@host:path` has no scheme and is kept as is.
+pub(crate) fn strip_userinfo(url: &str) -> String {
+    let Some(scheme) = url.find("://") else {
+        return url.into();
+    };
+    let rest = &url[scheme + 3..];
+    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
+    match authority.rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme + 3], &rest[at + 1..]),
+        None => url.into(),
+    }
+}
+
+/// Whether a path in `cwd` is tracked by Git; never writable for comments.
+pub fn tracked(cwd: &Path, name: &Path) -> bool {
+    command(cwd)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}

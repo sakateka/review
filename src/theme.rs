@@ -138,6 +138,9 @@ pub struct Theme {
     pub border_unfocused: Color,
     pub metrics: Color,
     pub selection: Style,
+    /// Comment icon; outdated comments use the gray `comment_outdated`.
+    pub comment: Color,
+    pub comment_outdated: Color,
 }
 
 impl Default for Theme {
@@ -174,6 +177,8 @@ impl Theme {
             border_unfocused: Color::DarkGray,
             metrics: Color::Cyan,
             selection: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            comment: Color::Yellow,
+            comment_outdated: Color::DarkGray,
         }
     }
 
@@ -210,6 +215,8 @@ impl Theme {
             border_unfocused: medium_gray,
             metrics: dark_gray,
             selection: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            comment: soft_yellow,
+            comment_outdated: comment,
         }
     }
 
@@ -363,6 +370,12 @@ impl Theme {
             border_unfocused: unfocused,
             metrics: accent,
             selection: classic.selection,
+            comment: if pending == comment {
+                classic.comment
+            } else {
+                pending
+            },
+            comment_outdated: comment,
         }
     }
 

@@ -4262,6 +4262,9 @@ fn keymap_regression_escape_cannot_complete_a_pending_sequence() {
     assert!(app.preview.is_some());
     app.key(KeyCode::Char('d'));
     assert!(app.navigation.is_none());
+    // `d` now starts the `dc` (delete_comment) sequence; Escape cancels it.
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_some());
     app.key(KeyCode::Esc);
     assert!(app.preview.is_none());
 }
@@ -7579,5 +7582,772 @@ fn gruvbox_dark_default_colors_captured_source_views_for_rust_yaml_and_toml() {
                 .flat_map(|line| &line.spans)
                 .all(|span| span.style.bg.is_none())
         );
+    }
+}
+
+mod review_comments {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    fn ctrl(app: &mut App, character: char) {
+        app.key_event(KeyEvent::new(
+            KeyCode::Char(character),
+            KeyModifiers::CONTROL,
+        ));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for character in text.chars() {
+            if character == '\n' {
+                ctrl(app, 'j');
+            } else {
+                app.key(KeyCode::Char(character));
+            }
+        }
+    }
+
+    /// Open the first item's diff and put the cursor on display `row`.
+    fn open_at(app: &mut App, row: usize) {
+        app.key(KeyCode::Enter);
+        assert_eq!(app.focus, Focus::Preview);
+        for _ in 0..row {
+            app.key(KeyCode::Char('j'));
+        }
+        assert_eq!(app.cursor.0, row);
+    }
+
+    fn comment_at(app: &mut App, row: usize, text: &str) {
+        open_at(app, row);
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_some(), "{}", app.status);
+        type_text(app, text);
+        ctrl(app, 's');
+        assert!(app.editor.is_none());
+    }
+
+    fn file(directory: &Path, name: &str) -> String {
+        std::fs::read_to_string(directory.join(name)).unwrap()
+    }
+
+    fn icon_rows(app: &mut App) -> Vec<(usize, Color)> {
+        let buffer = screen(app, 120, 30);
+        let mut rows = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "💬" {
+                    rows.push((y as usize, cell.fg));
+                }
+            }
+        }
+        rows
+    }
+
+    // one.rs patch rows: 0 diff --git, 1 index, 2 ---, 3 +++, 4 @@,
+    // 5 context 1, 6 removed old 2, 7 added new 2, 8 context 3.
+
+    #[test]
+    fn editor_enter_saves_and_modified_enter_or_ctrl_j_inserts_newlines() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 7);
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "a");
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+        ] {
+            app.key_event(KeyEvent::new(KeyCode::Enter, modifiers));
+            type_text(&mut app, "b");
+        }
+        ctrl(&mut app, 'j');
+        type_text(&mut app, "c");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "a\nb\nb\nb\nc");
+        app.key(KeyCode::Enter);
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("Comment saved"), "{}", app.status);
+        assert!(file(directory.path(), "review-HEAD.comments").contains("a\nb\nb\nb\nc\n"));
+        // Escape cancels without changing the saved comment.
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "x");
+        app.key(KeyCode::Esc);
+        assert!(app.editor.is_none() && app.preview.is_some());
+        assert_eq!(app.comments.comments[0].text, "a\nb\nb\nb\nc");
+        // Enter on emptied text deletes the existing comment.
+        app.key(KeyCode::Char('c'));
+        for _ in 0..9 {
+            app.key(KeyCode::Backspace);
+        }
+        app.key(KeyCode::Enter);
+        assert!(app.comments.comments.is_empty());
+        assert!(!directory.path().join("review-HEAD.comments").exists());
+    }
+
+    #[test]
+    fn owned_file_after_a_candidate_gap_is_loaded_and_reused() {
+        let directory = fixture();
+        change(directory.path());
+        std::fs::write(directory.path().join("review-HEAD.comments"), "foreign\n").unwrap();
+        std::fs::write(
+            directory.path().join("review-HEAD-2.comments"),
+            "foreign 2\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        comment_at(&mut app, 7, "ours");
+        assert!(directory.path().join("review-HEAD-3.comments").exists());
+        std::fs::remove_file(directory.path().join("review-HEAD-2.comments")).unwrap();
+        let mut again = application(directory.path(), state.path());
+        assert_eq!(again.comments.comments.len(), 1);
+        comment_at(&mut again, 0, "file");
+        assert!(!directory.path().join("review-HEAD-2.comments").exists());
+        assert!(file(directory.path(), "review-HEAD-3.comments").contains("comments: 2\n"));
+        assert_eq!(file(directory.path(), "review-HEAD.comments"), "foreign\n");
+    }
+
+    #[test]
+    fn tracked_owned_file_is_not_removed_and_mouse_waits_for_the_editor() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        comment_at(&mut app, 0, "file");
+        // `dc` on the @@ row deletes the file comment, like `c` edits it.
+        for _ in 0..4 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('d'));
+        app.key(KeyCode::Char('c'));
+        assert!(app.comments.comments.is_empty(), "{}", app.status);
+        assert!(!directory.path().join("review-HEAD.comments").exists());
+        comment_at_current(&mut app, 7, "line");
+        git_run(directory.path(), &["add", "review-HEAD.comments"]);
+        let before = file(directory.path(), "review-HEAD.comments");
+        app.key(KeyCode::Char('d'));
+        app.key(KeyCode::Char('c'));
+        assert!(app.status.contains("tracked by Git"), "{}", app.status);
+        assert_eq!(file(directory.path(), "review-HEAD.comments"), before);
+        // Mouse events are ignored while the editor is open.
+        let _ = screen(&mut app, 120, 30);
+        app.key(KeyCode::Char('c'));
+        let cursor = app.cursor;
+        for kind in [
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            crossterm::event::MouseEventKind::ScrollDown,
+        ] {
+            app.mouse(mouse_event(kind, 50, 3), std::time::Instant::now());
+            app.mouse(mouse_event(kind, 2, 2), std::time::Instant::now());
+        }
+        assert_eq!(app.cursor, cursor);
+        assert_eq!((app.selected, app.top), (0, 0));
+        assert!(app.editor.is_some());
+    }
+
+    #[test]
+    fn remote_credentials_are_stripped() {
+        assert_eq!(
+            git::strip_userinfo("https://user:token@example.com/org/repo.git"),
+            "https://example.com/org/repo.git"
+        );
+        assert_eq!(
+            git::strip_userinfo("ssh://git@example.com:22/repo"),
+            "ssh://example.com:22/repo"
+        );
+        assert_eq!(
+            git::strip_userinfo("https://a@b@example.com/x@y"),
+            "https://example.com/x@y"
+        );
+        assert_eq!(
+            git::strip_userinfo("git@example.com:org/repo.git"),
+            "git@example.com:org/repo.git"
+        );
+        assert_eq!(
+            git::strip_userinfo("https://example.com/r"),
+            "https://example.com/r"
+        );
+    }
+
+    #[test]
+    fn summaries_and_candidate_filenames() {
+        let summary =
+            |args: &[&str]| comments::summary(&args.iter().map(OsString::from).collect::<Vec<_>>());
+        assert_eq!(summary(&["main..feat"]), "main..feat");
+        assert_eq!(summary(&["main", "feat"]), "main-feat");
+        assert_eq!(summary(&["main", "--", "a", "b/c"]), "main-a-b-c");
+        assert_eq!(summary(&[]), "worktree");
+        assert_eq!(summary(&["--", "//"]), "worktree");
+        assert_eq!(summary(&["--cached"]), "cached");
+        assert_eq!(summary(&["ä b"]), "b");
+        let long = "x".repeat(300);
+        assert_eq!(summary(&[long.as_str()]).len(), 100);
+        assert_eq!(comments::filename("HEAD", 1), "review-HEAD.comments");
+        assert_eq!(comments::filename("HEAD", 2), "review-HEAD-2.comments");
+        assert_eq!(comments::shell_quote("main..feat"), "main..feat");
+        assert_eq!(comments::shell_quote("a b"), "'a b'");
+        assert_eq!(comments::shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(comments::shell_quote(""), "''");
+        assert_eq!(comments::utc_for_test(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            comments::utc_for_test(1_792_670_400),
+            "2026-10-22T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn line_comment_is_saved_shown_and_marks_stay_unchanged() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let state_before = snapshot(state.path());
+        let mut app = application(directory.path(), state.path());
+        let marks = app.marks.clone();
+        comment_at(&mut app, 7, "Rename `answer`\nsecond line");
+        assert!(
+            app.status.contains("review-HEAD.comments"),
+            "{}",
+            app.status
+        );
+        let text = file(directory.path(), "review-HEAD.comments");
+        assert!(text.starts_with("---\nreview-comments: v1\n"), "{text}");
+        assert!(text.contains("args: [\"HEAD\"]\n"), "{text}");
+        assert!(text.contains("command: \"git diff HEAD\"\n"), "{text}");
+        assert!(
+            text.contains("label: \"working tree, uncommitted\""),
+            "{text}"
+        );
+        let head = String::from_utf8(git_run(directory.path(), &["rev-parse", "HEAD"])).unwrap();
+        assert!(
+            text.contains(&format!("commit: \"{}\"", head.trim())),
+            "{text}"
+        );
+        assert!(text.contains("comments: 1\noutdated: 0\n---\n"), "{text}");
+        assert!(text.contains(comments::INSTRUCTION));
+        assert!(text.contains("\n## one.rs:2 (new)\n"), "{text}");
+        assert!(text.contains("  2 +\tlet answer = 100;\n"), "{text}");
+        assert!(text.contains("Rename `answer`\nsecond line\n"), "{text}");
+        // Icon on the commented display row only (preview rows start at y=1).
+        let icons = icon_rows(&mut app);
+        assert_eq!(icons.len(), 1, "{icons:?}");
+        assert_eq!(icons[0].0, 1 + 7);
+        assert_eq!(icons[0].1, app.theme.comment);
+        assert_eq!(app.marks, marks);
+        assert_eq!(snapshot(state.path()), state_before);
+        // Restart with the same arguments restores the comment and marks.
+        let mut restarted = application(directory.path(), state.path());
+        assert_eq!(restarted.marks, marks);
+        assert_eq!(restarted.comments.comments, app.comments.comments);
+        assert!(restarted.status.contains("1 comment(s) loaded"));
+        restarted.key(KeyCode::Enter);
+        assert_eq!(icon_rows(&mut restarted).len(), 1);
+        // Editing prefills the stored text and rewrites the same file.
+        for _ in 0..7 {
+            restarted.key(KeyCode::Char('j'));
+        }
+        restarted.key(KeyCode::Char('c'));
+        let editor = restarted.editor.as_ref().unwrap();
+        assert_eq!(editor.text(), "Rename `answer`\nsecond line");
+        assert_eq!(editor.title, "one.rs:2 (new)");
+        type_text(&mut restarted, "!");
+        ctrl(&mut restarted, 's');
+        assert!(file(directory.path(), "review-HEAD.comments").contains("second line!\n"));
+        assert!(!directory.path().join("review-HEAD-2.comments").exists());
+    }
+
+    #[test]
+    fn mixed_range_header_and_after_changes_anchors() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 6);
+        app.key(KeyCode::Char('v'));
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('j'));
+        assert_eq!(app.selected_rows(), Some((6, 8)));
+        app.key(KeyCode::Char('c'));
+        assert_eq!(
+            app.editor.as_ref().unwrap().title,
+            "one.rs:old 2, new 2-3 (mixed)"
+        );
+        type_text(&mut app, "mixed");
+        ctrl(&mut app, 's');
+        assert!(app.selection.is_none());
+        let text = file(directory.path(), "review-HEAD.comments");
+        assert!(
+            text.contains("## one.rs:old 2, new 2-3 (mixed)\n"),
+            "{text}"
+        );
+        // Header row creates the file comment.
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "file level");
+        ctrl(&mut app, 's');
+        let text = file(directory.path(), "review-HEAD.comments");
+        assert!(text.contains("## one.rs (file)\n"), "{text}");
+        assert!(
+            text.find("## one.rs (file)").unwrap() < text.find("## one.rs:old").unwrap(),
+            "file comments come first: {text}"
+        );
+        assert!(text.contains("comments: 2\n"));
+        // Every header row and every anchored source row shows the icon.
+        let icons = icon_rows(&mut app);
+        assert_eq!(
+            icons.iter().map(|(row, _)| row - 1).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 6, 7, 8]
+        );
+        // The @@ row of a file that already has a file comment edits it.
+        for _ in 0..4 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "file level");
+        app.key(KeyCode::Esc);
+        assert!(app.editor.is_none());
+        assert!(
+            app.preview.is_some(),
+            "Escape in the editor closed the diff"
+        );
+        // After-changes view: the context row anchors through locations.
+        app.key(KeyCode::Char('a'));
+        let second = &app.capture.items[1];
+        assert!(second.name() == "two.rs");
+        app.go_down_files_and_back();
+        app.key(KeyCode::Enter);
+        app.key(KeyCode::Char('a'));
+        // two.rs after-changes rows: 0..=4 header/@@, 5 context, 6 added, 7 context.
+        for _ in 0..6 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        assert_eq!(app.editor.as_ref().unwrap().title, "two.rs:2 (new)");
+        type_text(&mut app, "after");
+        ctrl(&mut app, 's');
+        assert!(file(directory.path(), "review-HEAD.comments").contains("## two.rs:2 (new)\n"));
+    }
+
+    impl App {
+        fn go_down_files_and_back(&mut self) {
+            self.key(KeyCode::Esc);
+            self.key(KeyCode::Char('j'));
+        }
+    }
+
+    fn two_hunks(directory: &Path) {
+        let lines: Vec<String> = (1..=20).map(|n| format!("line {n}")).collect();
+        std::fs::write(directory.join("long.txt"), lines.join("\n") + "\n").unwrap();
+        git_run(directory, &["add", "long.txt"]);
+        git_run(directory, &["commit", "-qm", "long"]);
+        let mut changed = lines.clone();
+        changed[1] = "line two".into();
+        changed[18] = "line nineteen".into();
+        std::fs::write(directory.join("long.txt"), changed.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn cross_hunk_header_mix_and_trailing_hunk_header_are_refused() {
+        let directory = fixture();
+        two_hunks(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        let patch = String::from_utf8(app.capture.items[0].patch.clone()).unwrap();
+        let rows = comments::rows(&patch);
+        let second = rows
+            .iter()
+            .position(|row| row.kind == comments::RowKind::Hunk(1))
+            .unwrap();
+        // Range across hunks.
+        open_at(&mut app, 6);
+        app.key(KeyCode::Char('v'));
+        for _ in 6..second + 2 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("within one hunk"), "{}", app.status);
+        // Range ending on the second @@.
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        for _ in 0..second - 1 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('v'));
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("hunk header"), "{}", app.status);
+        // Range from the file header into a hunk.
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('v'));
+        for _ in 0..6 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("within one hunk"), "{}", app.status);
+        // Header-only range makes a file comment.
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('v'));
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('c'));
+        assert_eq!(app.editor.as_ref().unwrap().title, "long.txt (file)");
+        ctrl(&mut app, 'g');
+        assert!(app.editor.is_none());
+        // Escape cancels a selection without closing the diff.
+        app.key(KeyCode::Char('v'));
+        assert!(app.selection.is_some());
+        app.key(KeyCode::Esc);
+        assert!(app.selection.is_none() && app.preview.is_some());
+        assert!(!directory.path().join("review-HEAD.comments").exists());
+        // A new range overlapping an existing comment is refused.
+        comment_at_current(&mut app, 6, "first");
+        app.key(KeyCode::Char('k'));
+        app.key(KeyCode::Char('v'));
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("overlaps"), "{}", app.status);
+        assert_eq!(app.comments.comments.len(), 1);
+    }
+
+    fn comment_at_current(app: &mut App, row: usize, text: &str) {
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        for _ in 0..row {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        type_text(app, text);
+        ctrl(app, 's');
+    }
+
+    #[test]
+    fn editor_cancel_empty_save_and_delete_last_remove_the_file() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let before = snapshot(directory.path());
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 7);
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "draft");
+        app.key(KeyCode::Esc);
+        assert!(app.comments.comments.is_empty());
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "  \n");
+        ctrl(&mut app, 's');
+        assert!(app.status.contains("Empty comment discarded"));
+        assert_eq!(snapshot(directory.path()), before);
+        // Editor keys: arrows, backspace across lines.
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "ab\ncd");
+        app.key(KeyCode::Left);
+        app.key(KeyCode::Left);
+        app.key(KeyCode::Backspace);
+        app.key(KeyCode::Up);
+        app.key(KeyCode::Right);
+        type_text(&mut app, "X");
+        assert_eq!(app.editor.as_ref().unwrap().text(), "abcXd");
+        ctrl(&mut app, 's');
+        assert!(directory.path().join("review-HEAD.comments").exists());
+        app.key(KeyCode::Char('d'));
+        app.key(KeyCode::Char('c'));
+        assert!(
+            app.status.contains("comments file removed"),
+            "{}",
+            app.status
+        );
+        assert_eq!(snapshot(directory.path()), before);
+        // dc on an uncommented line explains; an empty save deletes.
+        app.key(KeyCode::Char('d'));
+        app.key(KeyCode::Char('c'));
+        assert_eq!(app.status, "No comment on this line");
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "x");
+        ctrl(&mut app, 's');
+        app.key(KeyCode::Char('c'));
+        app.key(KeyCode::Backspace);
+        ctrl(&mut app, 's');
+        assert!(app.comments.comments.is_empty());
+        assert_eq!(snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn foreign_and_tracked_files_are_never_touched() {
+        let directory = fixture();
+        std::fs::write(
+            directory.path().join("review-HEAD-2.comments"),
+            "---\nreview-comments: v1\nargs: [\"HEAD\"]\n---\n",
+        )
+        .unwrap();
+        git_run(directory.path(), &["add", "review-HEAD-2.comments"]);
+        git_run(directory.path(), &["commit", "-qm", "tracked comments"]);
+        change(directory.path());
+        std::fs::write(directory.path().join("review-HEAD.comments"), "foreign\n").unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        assert!(app.comments.comments.is_empty());
+        comment_at(&mut app, 7, "ours");
+        assert_eq!(file(directory.path(), "review-HEAD.comments"), "foreign\n");
+        assert_eq!(
+            file(directory.path(), "review-HEAD-2.comments"),
+            "---\nreview-comments: v1\nargs: [\"HEAD\"]\n---\n"
+        );
+        assert!(file(directory.path(), "review-HEAD-3.comments").contains("ours"));
+        // A different argument list never reuses this file.
+        let other = App::new(
+            capture(directory.path(), &["HEAD", "--", "one.rs"]),
+            state::Store::at(state.path(), directory.path(), &["HEAD".into()]),
+        );
+        assert!(other.comments.comments.is_empty());
+        // Same arguments reuse the owned file.
+        let again = application(directory.path(), state.path());
+        assert_eq!(again.comments.comments.len(), 1);
+        assert_eq!(
+            again.comments.path.as_deref(),
+            Some(directory.path().join("review-HEAD-3.comments").as_path())
+        );
+    }
+
+    #[test]
+    fn changed_code_marks_comments_outdated_without_relocation() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        comment_at(&mut app, 7, "on 100");
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('g'));
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "file");
+        ctrl(&mut app, 's');
+        // A comment for a file that disappears from the comparison.
+        app.key(KeyCode::Esc);
+        app.key(KeyCode::Char('j'));
+        comment_at(&mut app, 7, "two");
+        std::fs::write(
+            directory.path().join("one.rs"),
+            "fn one() {\n\tlet answer = 101;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("two.rs"),
+            "fn two() {\n\tlet answer = 2;\n}\n",
+        )
+        .unwrap();
+        let mut restarted = application(directory.path(), state.path());
+        assert_eq!(restarted.capture.items.len(), 1);
+        assert_eq!(restarted.comments.comments.len(), 3);
+        assert!(
+            restarted.status.contains("3 comment(s) loaded, 2 outdated"),
+            "{}",
+            restarted.status
+        );
+        let text = file(directory.path(), "review-HEAD.comments");
+        assert!(text.contains("## one.rs:2 (new) [outdated]\n"), "{text}");
+        assert!(text.contains("## one.rs (file)\n"), "{text}");
+        assert!(text.contains("## two.rs:2 (new) [outdated]\n"), "{text}");
+        assert!(text.contains("outdated: 2\n"), "{text}");
+        // Absent files follow present ones; the reviewed excerpt is kept.
+        assert!(text.find("## two.rs").unwrap() > text.find("## one.rs:2").unwrap());
+        assert!(text.contains("\tlet answer = 100;"), "{text}");
+        restarted.key(KeyCode::Enter);
+        let icons = icon_rows(&mut restarted);
+        let line = icons.iter().find(|(row, _)| *row == 1 + 7).unwrap();
+        assert_eq!(line.1, restarted.theme.comment_outdated);
+        assert!(
+            icons
+                .iter()
+                .any(|(row, color)| *row == 1 && *color == restarted.theme.comment)
+        );
+    }
+
+    #[test]
+    fn no_index_comparison_records_unavailable_repository_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(directory.path().join("b.rs"), "fn b() {}\n").unwrap();
+        let args: Vec<OsString> = ["--no-index", "a.rs", "b.rs"].map(OsString::from).to_vec();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state.path(), directory.path(), &args),
+        );
+        let patch = String::from_utf8(app.capture.items[0].patch.clone()).unwrap();
+        let added = comments::rows(&patch)
+            .iter()
+            .position(|row| row.text.starts_with('+') && !row.text.starts_with("+++"))
+            .unwrap();
+        comment_at(&mut app, added, "no index");
+        let text = file(directory.path(), "review-no-index-a.rs-b.rs.comments");
+        assert!(
+            text.contains("repository: unavailable\nremote: unavailable\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("label: \"old file a.rs\"\n  commit: unavailable\n"),
+            "{text}"
+        );
+        assert!(text.contains("label: \"new file b.rs\""), "{text}");
+        assert!(
+            text.contains("command: \"git diff --no-index a.rs b.rs\""),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn merge_base_ranges_record_full_shas_and_branches() {
+        let directory = fixture();
+        git_run(directory.path(), &["branch", "base"]);
+        change(directory.path());
+        git_run(directory.path(), &["commit", "-qam", "feature"]);
+        git_run(
+            directory.path(),
+            &["remote", "add", "upstream", "https://example.invalid/u.git"],
+        );
+        let args: Vec<OsString> = ["base...HEAD"].map(OsString::from).to_vec();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            git::capture(directory.path(), &args).unwrap(),
+            state::Store::at(state.path(), directory.path(), &args),
+        );
+        comment_at(&mut app, 7, "range");
+        let text = file(directory.path(), "review-base...HEAD.comments");
+        let sha = |rev: &str| {
+            String::from_utf8(git_run(directory.path(), &["rev-parse", rev]))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        assert!(
+            text.contains(&format!(
+                "label: \"base\"\n  ref: \"refs/heads/base\"\n  commit: \"{}\"",
+                sha("base")
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("commit: \"{}\"", sha("HEAD"))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("merge-base: \"{}\"", sha("base"))),
+            "{text}"
+        );
+        assert!(
+            text.contains("remote: \"https://example.invalid/u.git\""),
+            "{text}"
+        );
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        assert!(
+            text.contains(&format!("repository: \"{}\"", root.display())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unwritable_launch_directory_keeps_the_comment_in_memory() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        let mode = std::fs::metadata(directory.path()).unwrap().permissions();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        comment_at(&mut app, 7, "kept");
+        std::fs::set_permissions(directory.path(), mode).unwrap();
+        assert_eq!(app.comments.comments.len(), 1);
+        assert!(app.status.contains("not written"), "{}", app.status);
+        assert!(!directory.path().join("review-HEAD.comments").exists());
+        assert_eq!(icon_rows(&mut app).len(), 1);
+    }
+
+    #[test]
+    fn backticks_and_multiline_text_round_trip_as_valid_markdown() {
+        let comment = comments::Comment {
+            old_path: "a.md".into(),
+            new_path: "b.md".into(),
+            old: None,
+            new: Some((1, 2)),
+            anchors: vec![comments::Anchor {
+                old: None,
+                new: Some(1),
+                text: "+```` --> <!-- x".into(),
+            }],
+            excerpt: vec!["  1 +```` --> <!-- x".into(), "".into()],
+            text: "Use ```rust\nfences ``` here\n\n## not a heading\n".into(),
+            outdated: true,
+        };
+        let comments = vec![comment];
+        let text = comments::serialize(
+            &comments,
+            &[OsString::from("a b"), OsString::from("it's")],
+            &git::Provenance::default(),
+            std::time::UNIX_EPOCH,
+        );
+        assert_eq!(comments::parse(&text).unwrap(), comments);
+        assert!(
+            text.contains("\n`````\n  1 +```` --> <!-- x\n\n`````\n"),
+            "{text}"
+        );
+        assert!(text.contains("\n````text\nUse ```rust\n"), "{text}");
+        assert!(
+            text.contains("## a.md → b.md:1-2 (new) [outdated]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("command: \"git diff 'a b' 'it'\\\\''s'\"\n"),
+            "{text}"
+        );
+        assert!(comments::owned(
+            &text,
+            &[OsString::from("a b"), OsString::from("it's")]
+        ));
+        assert!(!comments::owned(&text, &[OsString::from("a b")]));
+        // The metadata comment cannot be closed early by content.
+        let marker = text
+            .lines()
+            .find(|l| l.starts_with("<!-- review-comment "))
+            .unwrap();
+        assert_eq!(marker.matches("-->").count(), 1);
+    }
+
+    #[test]
+    fn comments_need_a_structured_diff() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            capture(directory.path(), &["--stat", "HEAD"]),
+            state::Store::at(
+                state.path(),
+                directory.path(),
+                &["--stat".into(), "HEAD".into()],
+            ),
+        );
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(
+            app.status.contains("Comments are unavailable"),
+            "{}",
+            app.status
+        );
+        let mut app = application(directory.path(), state.path());
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_none());
+        assert!(app.status.contains("Open a file diff"), "{}", app.status);
+        let emacs =
+            keybindings::Bindings::new(keybindings::Keymap::Emacs, true, &Default::default())
+                .unwrap();
+        assert!(emacs.help().contains("select_range: ctrl-space\n"));
+        assert!(app.bindings.help().contains("select_range: v\n"));
+        assert!(app.bindings.help().contains("delete_comment: dc\n"));
+        assert!(app.bindings.legend().contains("c comment"));
     }
 }

@@ -45,6 +45,7 @@ actions! {
     ToggleAfterChanges => "toggle_after_changes",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
     CommandLine => "command_line",
+    Comment => "comment", SelectRange => "select_range", DeleteComment => "delete_comment",
 }
 #[derive(Clone)]
 struct Binding {
@@ -102,6 +103,8 @@ impl Bindings {
             (SearchWordBackward, &["#"]),
             (SearchNext, &["n"]),
             (SearchPrevious, &["N"]),
+            (Comment, &["c"]),
+            (DeleteComment, &["dc"]),
         ];
         let vim: &[(Action, &[&str])] = &[
             (GoToDefinition, &["gd"]),
@@ -127,6 +130,7 @@ impl Bindings {
             (PageUp, &["ctrl-b"]),
             (PageDown, &["ctrl-f"]),
             (CommandLine, &[":"]),
+            (SelectRange, &["v"]),
         ];
         let emacs: &[(Action, &[&str])] = &[
             (GoToDefinition, &["alt-."]),
@@ -145,6 +149,7 @@ impl Bindings {
             (PageDown, &["ctrl-v"]),
             (PageUp, &["alt-v"]),
             (CommandLine, &["alt-x"]),
+            (SelectRange, &["ctrl-space"]),
         ];
         for (action, labels) in
             defaults
@@ -321,6 +326,7 @@ impl Bindings {
             (CloseOrQuit, "close/quit"),
             (Quit, "quit"),
             (CommandLine, "command"),
+            (Comment, "comment"),
         ]
         .into_iter()
         .filter_map(|(action, text)| {

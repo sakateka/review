@@ -45,6 +45,10 @@ pub struct App {
     pub bindings: Bindings,
     pub theme: Theme,
     pub command: Option<CommandLine>,
+    pub comments: crate::comments::Store,
+    /// Display row where an active line-range selection started.
+    pub selection: Option<usize>,
+    pub editor: Option<crate::comments::Editor>,
 }
 
 #[derive(Clone)]
@@ -91,6 +95,14 @@ impl App {
                 true,
             ),
         };
+        let (comments, loaded) = crate::comments::Store::load(&capture);
+        let mut status = status;
+        if let Some(loaded) = loaded {
+            if !status.is_empty() {
+                status.push_str("; ");
+            }
+            status.push_str(&loaded);
+        }
         let original = capture.unavailable.is_some();
         let theme = Theme::default();
         let preview = original.then(|| {
@@ -124,6 +136,9 @@ impl App {
             bindings: Bindings::default(),
             theme,
             command: None,
+            comments,
+            selection: None,
+            editor: None,
             history: Vec::new(),
             capture,
             store,
@@ -222,6 +237,10 @@ impl App {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
+        // The comment editor is modal; the mouse never acts behind it.
+        if self.editor.is_some() {
+            return;
+        }
         let point = ratatui::layout::Position::new(mouse.column, mouse.row);
         let files = self.file_area.contains(point);
         let preview = self.preview.is_some() && self.preview_area.contains(point);
@@ -299,6 +318,9 @@ impl App {
 
     pub fn key_event(&mut self, key: KeyEvent) -> bool {
         self.last_click = None;
+        if self.editor.is_some() {
+            return self.editor_key(key);
+        }
         if self.command.is_some() {
             return self.command_key(key);
         }
@@ -353,6 +375,16 @@ impl App {
             self.bindings.clear();
             self.motion_count = 0;
             self.status.clear();
+            return false;
+        }
+        if self.selection.is_some()
+            && (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('g')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            self.selection = None;
+            self.motion_count = 0;
+            self.status = "Selection cancelled".into();
             return false;
         }
         if self.bindings.keymap == Keymap::Vim
@@ -473,6 +505,7 @@ impl App {
                     && !self.definition_preview
                     && self.capture.unavailable.is_none() =>
             {
+                self.selection = None;
                 if let Some(preview) = &mut self.preview {
                     (self.cursor.0, self.top) =
                         preview.toggle_after_changes(self.cursor.0, self.top);
@@ -500,6 +533,9 @@ impl App {
                 );
             }
             ToggleMark => self.toggle_mark(),
+            SelectRange => self.select_range(),
+            Comment => self.comment(),
+            DeleteComment => self.delete_comment(),
             CursorDown | CursorUp => {
                 let direction = if action == CursorDown {
                     count as isize
@@ -674,6 +710,7 @@ impl App {
             self.source = None;
             self.cursor = (0, 0);
             self.navigation = None;
+            self.selection = None;
             let mut preview = Preview::item(&self.capture.cwd, item, &self.theme);
             if !self.capture.stderr.is_empty() {
                 let mut warning = b"\nGit stderr:\n".to_vec();
@@ -734,6 +771,7 @@ impl App {
     }
 
     fn close_preview(&mut self) {
+        self.selection = None;
         self.abandon_navigation();
         self.preview = None;
         self.focus = Focus::Files;
@@ -744,6 +782,7 @@ impl App {
     }
 
     fn select(&mut self, direction: isize) {
+        self.selection = None;
         self.abandon_navigation();
         self.selected = self
             .selected
@@ -764,6 +803,7 @@ impl App {
     }
 
     fn save_view(&mut self) {
+        self.selection = None;
         if self.history.len() == 64 {
             self.history.remove(0);
         }
@@ -796,6 +836,7 @@ impl App {
         self.history.clear();
     }
     fn back(&mut self) {
+        self.selection = None;
         self.invalidate_analysis();
         if let Some(view) = self.history.pop() {
             self.preview = view.preview;
@@ -1238,6 +1279,276 @@ impl App {
                 Err(error) => self.status = format!("Mark not saved: {error:#}"),
             }
         }
+    }
+}
+
+impl App {
+    /// The selected item when a structured item diff with captured source
+    /// numbers is showing (the `ToggleAfterChanges` guard plus locations).
+    fn diff_item(&self) -> Result<usize, String> {
+        if self.capture.unavailable.is_some() {
+            return Err("Comments are unavailable: file boundaries were not proven".into());
+        }
+        let Some(preview) = &self.preview else {
+            return Err(format!(
+                "Open a file diff with {} to comment",
+                self.bindings.label(Action::OpenDiffView)
+            ));
+        };
+        if self.navigation.is_some()
+            || self.source.is_some()
+            || self.documentation
+            || self.definition_preview
+            || self.capture.items.get(self.selected).is_none()
+        {
+            return Err("Comments are available only in a file diff".into());
+        }
+        if !preview
+            .locations
+            .iter()
+            .any(|location| *location != (None, None))
+        {
+            return Err(
+                "Comments are unavailable: this diff has no captured source line numbers".into(),
+            );
+        }
+        Ok(self.selected)
+    }
+
+    fn comment_target(&self) -> Result<usize, String> {
+        let item = self.diff_item()?;
+        if self.focus != Focus::Preview {
+            return Err(format!(
+                "Focus the diff with {} to comment",
+                self.bindings.label(Action::SwitchPane)
+            ));
+        }
+        Ok(item)
+    }
+
+    /// Classified patch row behind a display row of the current diff.
+    fn row_kind(&self, item: usize, row: usize) -> Option<(usize, crate::comments::RowKind)> {
+        let patch_row = (*self.preview.as_ref()?.patch_rows().get(row)?)?;
+        let patch = std::str::from_utf8(&self.capture.items.get(item)?.patch).ok()?;
+        let kind = crate::comments::rows(patch).get(patch_row)?.kind;
+        Some((patch_row, kind))
+    }
+
+    /// Per displayed row: `Some(outdated)` where a comment is anchored.
+    /// `None` when the diff has no comments, so no icon column is reserved.
+    pub fn comment_markers(&self) -> Option<Vec<Option<bool>>> {
+        let index = self.diff_item().ok()?;
+        let item = &self.capture.items[index];
+        self.comments.for_item(item).next()?;
+        let patch = std::str::from_utf8(&item.patch).ok()?;
+        let kinds = crate::comments::rows(patch);
+        let preview = self.preview.as_ref()?;
+        Some(
+            preview
+                .patch_rows()
+                .into_iter()
+                .map(|row| {
+                    let kind = kinds.get(row?)?.kind;
+                    self.comments
+                        .for_item(item)
+                        .find(|(_, comment)| comment.owns(kind))
+                        .map(|(_, comment)| comment.outdated)
+                })
+                .collect(),
+        )
+    }
+
+    /// Inclusive displayed rows of the active selection.
+    pub fn selected_rows(&self) -> Option<(usize, usize)> {
+        self.selection
+            .map(|start| (start.min(self.cursor.0), start.max(self.cursor.0)))
+    }
+
+    fn select_range(&mut self) {
+        if self.selection.take().is_some() {
+            self.status = "Selection cancelled".into();
+            return;
+        }
+        match self.comment_target() {
+            Ok(_) => {
+                self.selection = Some(self.cursor.0);
+                self.status = format!(
+                    "Selecting lines: move to extend, {} comments, Escape cancels",
+                    self.bindings.label(Action::Comment)
+                );
+            }
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn comment(&mut self) {
+        let selection = self.selected_rows();
+        self.selection = None;
+        let item_index = match self.comment_target() {
+            Ok(item) => item,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let (first, last) = selection.unwrap_or((self.cursor.0, self.cursor.0));
+        let Some(patch_rows) = (first..=last)
+            .map(|row| {
+                self.row_kind(item_index, row)
+                    .map(|(patch_row, _)| patch_row)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            self.status = "No captured patch line here to comment on".into();
+            return;
+        };
+        let item = &self.capture.items[item_index];
+        if first == last
+            && let Some((_, kind)) = self.row_kind(item_index, first)
+            && let Some(existing) = self.comments.at(item, kind)
+        {
+            let draft = self.comments.comments[existing].clone();
+            self.editor = Some(crate::comments::Editor::new(draft, Some(existing)));
+            self.bindings.clear();
+            return;
+        }
+        let draft = match crate::comments::build(item, &patch_rows) {
+            Ok(draft) => draft,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let overlap = self
+            .comments
+            .comments
+            .iter()
+            .position(|comment| comment.overlaps(&draft));
+        match overlap {
+            Some(existing) if first == last => {
+                let draft = self.comments.comments[existing].clone();
+                self.editor = Some(crate::comments::Editor::new(draft, Some(existing)));
+            }
+            Some(_) => {
+                self.status = format!(
+                    "Selection overlaps an existing comment; use {} on a commented line to edit it",
+                    self.bindings.label(Action::Comment)
+                );
+                return;
+            }
+            None => self.editor = Some(crate::comments::Editor::new(draft, None)),
+        }
+        self.bindings.clear();
+    }
+
+    fn delete_comment(&mut self) {
+        self.selection = None;
+        let item_index = match self.comment_target() {
+            Ok(item) => item,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let item = &self.capture.items[item_index];
+        // Like `c`, an `@@` row addresses the file comment.
+        let Some(existing) = self
+            .row_kind(item_index, self.cursor.0)
+            .map(|(_, kind)| match kind {
+                crate::comments::RowKind::Hunk(_) => crate::comments::RowKind::FileHeader,
+                kind => kind,
+            })
+            .and_then(|kind| self.comments.at(item, kind))
+        else {
+            self.status = "No comment on this line".into();
+            return;
+        };
+        self.comments.comments.remove(existing);
+        self.persist_comments("Comment deleted");
+    }
+
+    fn persist_comments(&mut self, done: &str) {
+        self.status = match self.comments.persist(&self.capture.items) {
+            Ok(Some(path)) => format!(
+                "{done}; saved to {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            Ok(None) => format!("{done}; no comments remain, comments file removed"),
+            Err(error) => format!("{done} in memory only; comments file not written: {error:#}"),
+        };
+    }
+
+    fn save_comment(&mut self) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let text = editor.text();
+        if text.trim().is_empty() {
+            match editor.existing {
+                Some(existing) => {
+                    self.comments.comments.remove(existing);
+                    self.persist_comments("Empty comment deleted");
+                }
+                None => self.status = "Empty comment discarded".into(),
+            }
+            return;
+        }
+        let mut comment = editor.draft;
+        comment.text = text;
+        match editor.existing {
+            Some(existing) => self.comments.comments[existing] = comment,
+            None => self.comments.comments.push(comment),
+        }
+        self.persist_comments("Comment saved");
+    }
+
+    /// Modal editor keys: Enter (or Ctrl-S) saves, Ctrl/Shift/Alt+Enter and
+    /// Ctrl-J insert a newline, Escape or Ctrl-G cancels. `ctrl-c` is handled
+    /// by the terminal loop as quit.
+    fn editor_key(&mut self, key: KeyEvent) -> bool {
+        self.bindings.clear();
+        self.motion_count = 0;
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(editor) = &mut self.editor else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.editor = None;
+                self.status = "Comment edit cancelled".into();
+            }
+            KeyCode::Char('g') if control => {
+                self.editor = None;
+                self.status = "Comment edit cancelled".into();
+            }
+            // Ctrl+Enter, Shift+Enter and Alt+Enter (ESC CR) insert a newline;
+            // Ctrl-J is the raw-mode LF fallback for terminals that send a
+            // plain CR for Ctrl+Enter.
+            KeyCode::Enter
+                if key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+                ) =>
+            {
+                editor.newline()
+            }
+            KeyCode::Char('j') if control => editor.newline(),
+            KeyCode::Enter => self.save_comment(),
+            KeyCode::Char('s') if control => self.save_comment(),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Left => editor.left(),
+            KeyCode::Right => editor.right(),
+            KeyCode::Up => editor.vertical(false),
+            KeyCode::Down => editor.vertical(true),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.insert(character)
+            }
+            _ => {}
+        }
+        false
     }
 }
 
