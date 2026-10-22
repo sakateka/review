@@ -3,7 +3,7 @@ use crate::{
     navigation::{Candidate, Operation, Request, Worker},
     source::ComparedSide,
 };
-use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,8 @@ pub struct App {
     pub preview_area: Rect,
     pub file_offset: usize,
     last_click: Option<(usize, Instant)>,
+    motion_count: usize,
+    pending_g: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,8 @@ impl App {
             preview_area: Rect::default(),
             file_offset: 0,
             last_click: None,
+            motion_count: 0,
+            pending_g: false,
             history: Vec::new(),
             capture,
             store,
@@ -259,6 +263,149 @@ impl App {
         }
     }
 
+    pub fn key_event(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !self.navigation.as_ref().is_some_and(|nav| nav.editing)
+        {
+            self.pending_g = false;
+            let count = self.motion_count.max(1);
+            self.motion_count = 0;
+            match key.code {
+                KeyCode::Char('o') => self.back(),
+                KeyCode::Char('u' | 'd' | 'f' | 'b') => {
+                    let half = matches!(key.code, KeyCode::Char('u' | 'd'));
+                    let rows = if half {
+                        self.viewport.0 / 2
+                    } else {
+                        self.viewport.0
+                    };
+                    let direction = if matches!(key.code, KeyCode::Char('u' | 'b')) {
+                        -1
+                    } else {
+                        1
+                    };
+                    self.scroll_preview(direction * rows.max(1).saturating_mul(count) as isize, 0);
+                }
+                _ => {}
+            }
+            return false;
+        }
+        self.key(key.code)
+    }
+
+    fn vim_motion(&mut self, key: KeyCode) -> bool {
+        if let KeyCode::Char(digit @ '0'..='9') = key
+            && (digit != '0' || self.motion_count > 0)
+        {
+            self.motion_count =
+                (self.motion_count * 10 + digit.to_digit(10).unwrap() as usize).min(9999);
+            return true;
+        }
+        let count = self.motion_count.max(1);
+        let explicit_count = self.motion_count > 0;
+        self.motion_count = 0;
+        if self.pending_g {
+            self.pending_g = false;
+            match key {
+                KeyCode::Char('d') => {
+                    self.begin_navigation(Operation::Definitions);
+                    return true;
+                }
+                KeyCode::Char('r') => {
+                    self.begin_navigation(Operation::References);
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    self.go_to_row(count.saturating_sub(1));
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        match key {
+            KeyCode::Char('g') => {
+                self.pending_g = true;
+                self.motion_count = if explicit_count { count } else { 0 };
+            }
+            KeyCode::Char('G') => {
+                let last = if self.focus == Focus::Files {
+                    self.capture.items.len()
+                } else {
+                    self.preview.as_ref().map_or(0, |p| p.lines.len())
+                };
+                self.go_to_row(if explicit_count {
+                    count.saturating_sub(1)
+                } else {
+                    last.saturating_sub(1)
+                });
+            }
+            KeyCode::Char('w' | 'W' | 'b' | 'B' | 'e' | 'E')
+                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            {
+                if let (Some(preview), KeyCode::Char(motion)) = (&self.preview, key) {
+                    self.cursor = crate::motion::word(&preview.lines, self.cursor, motion, count);
+                }
+                self.keep_cursor_visible();
+            }
+            KeyCode::Char('0' | '^' | '$')
+                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            {
+                if let Some(line) = self
+                    .preview
+                    .as_ref()
+                    .and_then(|p| p.lines.get(self.cursor.0))
+                {
+                    self.cursor.1 = match key {
+                        KeyCode::Char('0') => 0,
+                        KeyCode::Char('^') => {
+                            use unicode_width::UnicodeWidthStr;
+                            let text = line.to_string();
+                            text[..text.len() - text.trim_start().len()].width()
+                        }
+                        _ => line.width().saturating_sub(1),
+                    };
+                }
+                self.keep_cursor_visible();
+            }
+            KeyCode::Char('j' | 'k' | 'h' | 'l')
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+                if count > 1 =>
+            {
+                for _ in 0..count {
+                    self.key(key);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn go_to_row(&mut self, row: usize) {
+        if let Some(nav) = &mut self.navigation {
+            nav.selected = row.min(nav.candidates.len().saturating_sub(1));
+            self.render_candidates();
+        } else if self.focus == Focus::Files {
+            self.selected = row.min(self.capture.items.len().saturating_sub(1));
+            self.select(0);
+        } else {
+            self.cursor.0 = row;
+            self.keep_cursor_visible();
+        }
+    }
+
+    fn close_preview(&mut self) {
+        self.abandon_navigation();
+        self.preview = None;
+        self.focus = Focus::Files;
+        self.cursor = (0, 0);
+        self.top = 0;
+        self.left = 0;
+        self.status.clear();
+    }
+
     // Returns true only for an explicit quit. Drawing has no state/store effects.
     pub fn key(&mut self, key: KeyCode) -> bool {
         self.last_click = None;
@@ -290,8 +437,19 @@ impl App {
             }
             return false;
         }
+        if key == KeyCode::Esc {
+            self.motion_count = 0;
+            self.pending_g = false;
+            if self.capture.unavailable.is_none() {
+                self.close_preview();
+            }
+            return false;
+        }
+        if self.vim_motion(key) {
+            return false;
+        }
         match key {
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') | KeyCode::Char('/') => {
                 self.begin_navigation(Operation::Search);
                 return false;
             }
@@ -318,11 +476,7 @@ impl App {
                 self.left = 0;
                 self.cursor = (0, 0);
                 self.focus = Focus::Preview;
-                self.status = "Analysis coverage and limits; b returns to candidates".into();
-                return false;
-            }
-            KeyCode::Char('b') => {
-                self.back();
+                self.status = "Analysis details; Ctrl-O returns".into();
                 return false;
             }
             KeyCode::Char('[') | KeyCode::Char(']') => {
@@ -349,7 +503,7 @@ impl App {
                 self.render_candidates();
                 return false;
             }
-            KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('q') => return true,
             KeyCode::Char('h') | KeyCode::Left
                 if self.focus == Focus::Preview && self.navigation.is_none() =>
             {
@@ -396,9 +550,7 @@ impl App {
                 };
             }
             KeyCode::Char(' ') if self.navigation.is_some() || self.source.is_some() => {
-                self.status =
-                    "Return to the captured diff/file list with b or Tab then h before marking"
-                        .into();
+                self.status = "Close the source view with Escape before marking".into();
             }
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -547,9 +699,7 @@ impl App {
                     Some(self.side)
                 },
             });
-            self.status =
-                "Analysis queued/running; input and quit remain available (work is not cancelled)"
-                    .into();
+            self.status = "Searching…".into();
             self.poll_analysis();
         }
     }
@@ -575,7 +725,7 @@ impl App {
             return;
         };
         let mut text = format!(
-            "{:?} candidates for {:?} — {} results\nEnter opens selected; b returns; [ old / ] new\n",
+            "{:?} candidates for {:?} — {} results\nEnter opens selected; Ctrl-O returns; [ old / ] new\n",
             nav.operation,
             nav.query,
             nav.candidates.len()
@@ -600,7 +750,13 @@ impl App {
             .saturating_sub(self.viewport.0.saturating_sub(3));
         self.left = 0;
         self.cursor = (nav.selected + 2, 0);
-        self.status = nav.coverage.clone();
+        self.status = if nav.coverage.contains("Analysis failed") {
+            "Analysis failed; ? for details".into()
+        } else if nav.coverage.contains("no tagged symbol") {
+            "No symbol at cursor".into()
+        } else {
+            format!("{} results", nav.candidates.len())
+        };
     }
     fn open_candidate(&mut self) {
         let Some(candidate) = self
@@ -638,12 +794,7 @@ impl App {
         // expansion have separate screen coordinates.
         self.left = left;
         self.focus = Focus::Preview;
-        self.status = format!(
-            "Captured target {}:{} (scalar column {}); navigation never marks",
-            candidate.tag.name,
-            candidate.tag.line,
-            candidate.tag.col + 1
-        );
+        self.status.clear();
     }
     fn change_side(&mut self, side: ComparedSide) {
         if let Some(nav) = &mut self.navigation {
@@ -673,7 +824,7 @@ impl App {
             }
         } else {
             self.side = side;
-            self.status = format!("Navigation side: {}", side.label());
+            self.status.clear();
         }
     }
     fn symbol_at_view(&self) -> Option<String> {

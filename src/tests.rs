@@ -2849,10 +2849,19 @@ fn navigation_controls_open_candidates_go_back_choose_old_side_and_never_mark() 
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
-    app.key(KeyCode::Char('b'));
-    app.key(KeyCode::Char('b'));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
     assert!(app.navigation.is_some());
-    app.key(KeyCode::Char('b'));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
     assert!(app.preview.is_some());
     assert!(app.marks.iter().all(|mark| !mark));
     assert!(!state_dir.path().read_dir().unwrap().any(|_| true));
@@ -3459,21 +3468,27 @@ fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "old_symbol");
     assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
-    app.key(KeyCode::Char('b'));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
     assert_eq!((app.cursor, app.top, app.left), saved);
     app.cursor = (new_row, 8);
     app.key(KeyCode::Char(']'));
     app.key(KeyCode::Char('r'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "new_symbol");
-    app.key(KeyCode::Char('b'));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
     // A mapped whitespace cell cannot search forward to the next identifier.
     app.cursor = (new_row, 5 + 2);
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert!(app.navigation.as_ref().unwrap().query.is_empty());
     assert!(app.navigation.as_ref().unwrap().candidates.is_empty());
-    assert!(app.status.contains("exact cursor"));
+    assert!(app.status.contains("No symbol at cursor"));
     assert!(app.marks.iter().all(|mark| !mark));
     assert!(state.path().read_dir().unwrap().next().is_none());
     assert_eq!(
@@ -3611,4 +3626,167 @@ fn review_fix_target_retention_uses_expanded_tab_mapping() {
             .to_string()
             .starts_with("target")
     );
+}
+
+#[test]
+fn vim_motions_counts_and_escape_preserve_read_only_state() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.preview = Some(preview::Preview::original(
+        b"  alpha.beta  gamma\n  second line\nlast\n",
+    ));
+    app.focus = Focus::Preview;
+    app.viewport = (2, 12);
+    app.key(KeyCode::Char('w'));
+    assert_eq!(app.cursor, (0, 2));
+    app.key(KeyCode::Char('e'));
+    assert_eq!(app.cursor, (0, 6));
+    app.key(KeyCode::Char('w'));
+    assert_eq!(app.cursor, (0, 7));
+    app.key(KeyCode::Char('b'));
+    assert_eq!(app.cursor, (0, 2));
+    app.key(KeyCode::Char('W'));
+    assert_eq!(app.cursor, (0, 14));
+    app.key(KeyCode::Char('B'));
+    assert_eq!(app.cursor, (0, 2));
+    app.key(KeyCode::Char('$'));
+    assert_eq!(app.cursor, (0, 18));
+    app.key(KeyCode::Char('0'));
+    assert_eq!(app.cursor, (0, 0));
+    app.key(KeyCode::Char('^'));
+    assert_eq!(app.cursor, (0, 2));
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('d'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(app.top, 1);
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(app.top, 0);
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('g'));
+    for c in "2j".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    assert_eq!(app.cursor.0, 2);
+    for c in "gg".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    assert_eq!(app.cursor.0, 0);
+    for c in "2gg".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    assert_eq!(app.cursor.0, 1);
+    app.key(KeyCode::Char('G'));
+    assert_eq!(app.cursor.0, 2);
+    assert!(!app.key(KeyCode::Esc));
+    assert!(app.preview.is_none());
+    assert_eq!(app.focus, Focus::Files);
+    assert!(!app.key(KeyCode::Esc));
+    assert!(app.key(KeyCode::Char('q')));
+    assert!(app.marks.iter().all(|mark| !mark));
+    assert!(state.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn source_targets_highlight_every_supported_language_without_changing_cell_maps() {
+    for name in [
+        "sample.rs",
+        "sample.c",
+        "sample.h",
+        "sample.cpp",
+        "sample.go",
+        "sample.py",
+        "sample.zig",
+        "sample.sh",
+        "sample.bash",
+        "sample.yaml",
+        "sample.json",
+    ] {
+        let bytes = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/navigation")
+                .join(name),
+        )
+        .unwrap();
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::Old,
+            name.as_bytes().to_vec(),
+            bytes.clone(),
+        );
+        let rendered = preview::Preview::source(&catalog.sources[0]);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg.is_some()),
+            "{name} has no syntax colors"
+        );
+        assert!(rendered.title.as_ref().unwrap().contains(name));
+        for (row, cells) in rendered.cells.iter().enumerate() {
+            assert_eq!(cells.len(), rendered.lines[row].width());
+        }
+    }
+}
+
+#[test]
+fn vim_definition_jump_is_highlighted_and_footer_keeps_analysis_details_on_demand() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for ch in "two".chars() {
+        app.key(KeyCode::Char(ch));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let text = screen_text(&screen(&mut app, 120, 24));
+    assert!(!text.contains("Partial name/syntax"));
+    assert!(!text.contains("never binding"));
+    app.key(KeyCode::Enter);
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.fg.is_some())
+    );
+    for c in "gd".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
+    app.key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    assert!(app.navigation.is_none());
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("two.rs")
+    );
+    for c in "gr".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    await_navigation(&mut app);
+    assert_eq!(
+        app.navigation.as_ref().unwrap().operation,
+        navigation::Operation::References
+    );
+    app.key(KeyCode::Char('?'));
+    assert!(screen_text(&screen(&mut app, 120, 24)).contains("Partial name/syntax"));
+    assert!(!app.key(KeyCode::Esc));
+    assert!(app.preview.is_none());
 }

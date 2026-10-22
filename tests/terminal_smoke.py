@@ -179,7 +179,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.send(b"d")
         session.wait_text("Definitions candidates")
         session.wait_text("1 results")
-        session.send(b"br")
+        session.send(b"\x0fr")
         session.wait_text("References candidates")
         session.wait_text("1 results")
         session.send(b"h")
@@ -190,7 +190,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.wait_text("Captured old sample." + extension)
         session.send(b"d")
         session.wait_text("Definitions candidates")
-        session.send(b"br")
+        session.send(b"\x0fr")
         session.wait_text("References candidates")
         session.wait_text("0 results")
         session.send(b"h")
@@ -204,7 +204,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Captured old")
     session.send(b"]r")
     session.wait_text("References")
-    session.send(b"\rbb\th")
+    session.send(b"\r\x0f\x0f\th")
     for shape in [(1, 1), (3, 8), (30, 140)]:
         session.resize(*shape)
     session.send(b" ")
@@ -332,15 +332,19 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(pointer(0, x, y) + pointer(0, x, y, True) + pointer(0, x, y) + pointer(0, x, y, True))
     session.wait_text("old_symbol_03")
     # Scroll to the added rows, then click the exact transformed/tabbed symbol.
-    # New rows follow 46 removed rows, so page down twice then wheel back as needed.
-    session.send(b"\x1b[6~" * 2)
+    # New rows follow 46 removed rows; Vim counts reach them independently of pane height.
+    session.send(b"gg60j")
     session.wait_text("new_symbol_03")
     x, y = locate("new_symbol_03")
-    session.send(pointer(0, x + 2, y) + pointer(0, x + 2, y, True) + b"d")
+    session.send(pointer(0, x + 2, y) + pointer(0, x + 2, y, True) + b"gd")
     session.wait_text('Definitions candidates for "new_symbol_03"')
     session.wait_text("1 results")
     session.send(b"\r")
     session.wait_text("Captured new a03.rs")
+    assert "Partial name/syntax" not in session.text()
+    assert "never binding" not in session.text()
+    symbol_x, symbol_y = locate("new_symbol_03")
+    assert session.colors[(symbol_y, symbol_x)] is not None, "jump target lost syntax highlighting"
     cursor = (session.row, session.col)
     session.send(b"l")
     assert (session.row, session.col) == (cursor[0], cursor[1] + 1), (cursor, session.row, session.col)
@@ -348,12 +352,12 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     assert (session.row, session.col) == cursor
     session.send(b"d")
     session.wait_text('Definitions candidates for "new_symbol_03"')
-    session.send(b"b")
+    session.send(b"\x0f")
     session.wait_text("Captured new a03.rs")
     assert (session.row, session.col) == cursor, "back did not restore the cursor"
     session.send(b"[d")
     session.wait_text('Definitions candidates for "old_symbol_03"')
-    session.send(b"b")
+    session.send(b"\x0f")
     session.wait_text("Captured old a03.rs")
     # Wheel the preview while files hold focus, then move files to prove focus stayed.
     session.send(b"\t")
@@ -371,6 +375,13 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(pointer(0, x, y) + pointer(0, x, y, True) + pointer(0, x, y) + pointer(0, x, y, True))
     session.wait_text("Diff")
     session.send(b"\x1b[6~\x1b[5~")
+    session.send(b"\x1b")
+    closed(session)
+    assert session.process.poll() is None, "Escape exited instead of closing the diff"
+    session.send(b"\x1b")
+    assert session.process.poll() is None, "Escape exited from the file list"
+    session.send(b"\r")
+    session.wait_text("Diff")
     for shape in [(1, 1), (3, 8), (30, 140)]:
         session.resize(*shape)
     session.send(b"q")

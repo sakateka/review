@@ -27,7 +27,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -115,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .title(if original {
                         "Original Git output — file actions disabled"
                     } else {
-                        "Diff"
+                        preview.title.as_deref().unwrap_or("Diff")
                     })
                     .border_style(Style::default().fg(if app.focus == Focus::Preview {
                         Color::Cyan
@@ -132,37 +132,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ));
         }
     }
-    let explanation = [
-        app.preview
-            .as_ref()
-            .and_then(|preview| preview.reason.as_deref()),
-        app.capture.unavailable.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" | ");
     let prompt = app.navigation.as_ref().filter(|n| n.editing).map(|n| {
         format!(
             "Search/outline: {}_ (Enter searches both sides; Escape returns)",
             n.query
         )
     });
-    let status = [
-        explanation.as_str(),
-        prompt.as_deref().unwrap_or(app.status.trim()),
-    ]
-    .into_iter()
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join(" | ");
-    frame.render_widget(
-        Paragraph::new(status).wrap(ratatui::widgets::Wrap { trim: false }),
-        areas[1],
-    );
+    let omission = app
+        .preview
+        .as_ref()
+        .and_then(|p| p.reason.as_deref())
+        .and_then(|reason| {
+            reason
+                .split("; ")
+                .find(|note| note.starts_with("Display omitted"))
+        });
+    let status = prompt.as_deref().or(omission).unwrap_or(app.status.trim());
+    frame.render_widget(Paragraph::new(status), areas[1]);
     frame.render_widget(
         Paragraph::new(
-            "arrows/hjkl move · Tab focus · Enter open · files: h close/l open · PgUp/Dn scroll · s search · d defs/r refs · b back · [old ]new · Space mark · q quit",
+            "hjkl move · w/b/e words · gg/G jump · gd/gr navigate · Ctrl-O back · / symbols · Esc close · q quit",
         ),
         areas[2],
     );
@@ -241,7 +230,7 @@ pub fn run(app: &mut App) -> Result<()> {
                     {
                         break;
                     }
-                    if app.key(key.code) {
+                    if app.key_event(key) {
                         break;
                     }
                 }

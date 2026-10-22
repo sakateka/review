@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 pub struct Preview {
     pub lines: Vec<Line<'static>>,
     pub reason: Option<String>,
+    pub title: Option<String>,
     pub width: usize,
     /// One-based old/new source rows, independent of syntax enrichment.
     pub locations: Vec<(Option<usize>, Option<usize>)>,
@@ -27,10 +28,51 @@ type MappedColors<'a> = (
 );
 
 fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
-    anyhow::ensure!(
-        side.path.ends_with(b".rs"),
-        "syntax highlighting currently supports Rust (.rs); other languages retain basic output"
-    );
+    let path = std::path::Path::new(std::str::from_utf8(&side.path)?);
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let (language, query) = match extension {
+        "rs" => (
+            tree_sitter_rust::LANGUAGE,
+            tree_sitter_rust::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        "c" | "h" => (
+            tree_sitter_c::LANGUAGE,
+            tree_sitter_c::HIGHLIGHT_QUERY.to_owned(),
+        ),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => (
+            tree_sitter_cpp::LANGUAGE,
+            format!(
+                "{}\n{}",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY
+            ),
+        ),
+        "go" => (
+            tree_sitter_go::LANGUAGE,
+            tree_sitter_go::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        "py" | "pyi" => (
+            tree_sitter_python::LANGUAGE,
+            tree_sitter_python::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        "zig" => (
+            tree_sitter_zig::LANGUAGE,
+            tree_sitter_zig::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        "sh" | "bash" => (
+            tree_sitter_bash::LANGUAGE,
+            tree_sitter_bash::HIGHLIGHT_QUERY.to_owned(),
+        ),
+        "yaml" | "yml" => (
+            tree_sitter_yaml::LANGUAGE,
+            tree_sitter_yaml::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        "json" => (
+            tree_sitter_json::LANGUAGE,
+            tree_sitter_json::HIGHLIGHTS_QUERY.to_owned(),
+        ),
+        _ => anyhow::bail!("syntax highlighting unavailable for this file type"),
+    };
     anyhow::ensure!(
         side.content.len() <= 1024 * 1024,
         "source exceeds highlighting limit"
@@ -50,13 +92,8 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
         Color::Cyan,
         Color::White,
     ];
-    let mut configuration = HighlightConfiguration::new(
-        tree_sitter_rust::LANGUAGE.into(),
-        "rust",
-        tree_sitter_rust::HIGHLIGHTS_QUERY,
-        "",
-        "",
-    )?;
+    let mut configuration =
+        HighlightConfiguration::new(language.into(), extension, &query, "", "")?;
     configuration.configure(&names);
     let mut highlighter = Highlighter::new();
     let events =
@@ -361,6 +398,7 @@ impl Preview {
         let mut preview = Self {
             lines,
             reason,
+            title: None,
             width,
             locations,
             cells,
@@ -437,6 +475,38 @@ impl Preview {
                 return preview;
             }
         };
+        if let Ok(text) = std::str::from_utf8(&source.bytes)
+            && let Ok(colors) = syntax(&source::Side {
+                path: source.path.clone(),
+                content: text.into(),
+            })
+        {
+            let starts = offsets(text);
+            for (row, (line, raw)) in preview
+                .lines
+                .iter_mut()
+                .zip(text.split_terminator('\n'))
+                .enumerate()
+            {
+                let bytes: Vec<_> = raw.char_indices().map(|(byte, _)| byte).collect();
+                let mut cell = 0;
+                for span in &mut line.spans {
+                    if let Some(Some(scalar)) =
+                        preview.cells.get(row).and_then(|cells| cells.get(cell))
+                        && let Some(byte) = bytes.get(*scalar)
+                        && let Some(Some(color)) = colors.get(starts[row] + byte)
+                    {
+                        span.style = span.style.fg(*color);
+                    }
+                    cell += span.width();
+                }
+            }
+        }
+        preview.title = Some(format!(
+            "Captured {} {}",
+            source.side.label(),
+            crate::git::visible_bytes(&source.path)
+        ));
         preview.locations = (1..=preview.lines.len())
             .map(|line| match source.side {
                 source::ComparedSide::Old => (Some(line), None),

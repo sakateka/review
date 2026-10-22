@@ -1,5 +1,6 @@
 mod app;
 mod git;
+mod motion;
 mod navigation;
 mod preview;
 mod source;
@@ -9,7 +10,7 @@ mod ui;
 use anyhow::{Result, bail};
 use std::{ffi::OsString, io::IsTerminal};
 
-const HELP: &str = "review [--help | --version] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\n\nControls: arrows/hjkl move the read-only preview cursor; up/down or j/k select files;\nEnter opens a diff; in files, l opens and h closes; Tab switches pane focus;\nPageUp/PageDown scroll; click selects/positions, double-click opens, wheel scrolls;\nSpace toggles an explicit review mark;\ns searches/outline (type then Enter); d/r definition/reference candidates at the exact cursor position;\nb returns; [ old / ] new side; Enter explicitly opens a candidate.\nq/Escape exits. Changing the selected file closes the preview.\n\nMarks are saved immediately under $XDG_STATE_HOME/review, or\n$HOME/.local/state/review. Unsupported output stays readable with file actions\ndisabled. Requires system Git and an interactive terminal; no delta required.\n";
+const HELP: &str = "review [--help | --version] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\n\nControls: hjkl/arrows move; w/b/e and W/B/E move by words; 0/^/$ move within a line;\ngg/G jump to first/last line; counts work (10j, 3w, 20gg).\nCtrl-U/D scroll half pages; Ctrl-B/F or PageUp/PageDown scroll pages.\nEnter opens; Escape closes the open view; Tab switches panes; q quits.\n/ searches symbols; gd/gr finds definitions/references; Ctrl-O goes back;\n[ and ] choose old/new side; ? in candidates shows analysis details.\nClick selects/positions; double-click opens; wheel scrolls.\nSpace toggles and immediately saves the selected file's review mark.\n\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nRequires system Git and an interactive terminal.\n";
 
 #[derive(Debug, PartialEq)]
 enum Cli {
