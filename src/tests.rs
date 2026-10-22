@@ -6964,6 +6964,7 @@ fn theme_registry_lists_bundled_names_and_classic_matches_literals() {
         "gruvbox-light",
         "Dracula",
         "review-classic",
+        "gruvbox-baby",
         "ansi",
     ] {
         assert!(names.contains(&name), "{name}");
@@ -6987,6 +6988,56 @@ fn theme_registry_lists_bundled_names_and_classic_matches_literals() {
         assert_ne!(theme.border_focused, theme.border_unfocused, "{name}");
         assert_ne!(theme.search_bg, theme.added_bg, "{name}");
         assert_ne!(theme.search_bg, theme.removed_bg, "{name}");
+    }
+}
+
+#[test]
+fn gruvbox_baby_uses_the_upstream_tree_sitter_palette() {
+    let theme = theme::Theme::named("Gruvbox-Baby").unwrap();
+    assert_eq!(theme, theme::Theme::gruvbox_baby());
+    assert_eq!(theme.name, "gruvbox-baby");
+    assert_eq!(theme.default_fg, Some(Color::Rgb(0xeb, 0xdb, 0xb2)));
+    assert_eq!(theme.added_bg, Color::Rgb(0x26, 0x33, 0x2c));
+    assert_eq!(theme.removed_bg, Color::Rgb(0x57, 0x2e, 0x33));
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"one.rs".to_vec(),
+        b"// note\nfn one() -> u8 {\n\tlet answer = \"text\";\n\ttrue;\n\tlet n = 7;\n}\n".to_vec(),
+    );
+    let view = preview::Preview::source(&catalog.sources[0], &theme);
+    let fg_of = |token: &str| {
+        let line = view
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(token))
+            .unwrap_or_else(|| panic!("{token}"));
+        let start = line.to_string().find(token).unwrap();
+        let mut offset = 0;
+        line.spans
+            .iter()
+            .find_map(|span| {
+                let contains = offset <= start && start < offset + span.content.len();
+                offset += span.content.len();
+                contains.then_some(span.style.fg)
+            })
+            .unwrap()
+    };
+    for (token, color) in [
+        ("// note", (0x66, 0x5c, 0x54)),
+        ("fn", (0xfb, 0x49, 0x34)),
+        ("one", (0xee, 0xbd, 0x35)),
+        ("u8", (0x8e, 0xc0, 0x7c)),
+        ("\"text\"", (0x98, 0x97, 0x1a)),
+        // Rust literals are @constant.builtin, which gruvbox-baby colors pink.
+        ("true", (0xd4, 0x87, 0x9c)),
+        ("7;", (0xd4, 0x87, 0x9c)),
+    ] {
+        assert_eq!(
+            fg_of(token),
+            Some(Color::Rgb(color.0, color.1, color.2)),
+            "{token}"
+        );
     }
 }
 
@@ -7183,14 +7234,16 @@ fn command_line_tab_completion_cycles_in_place() {
     assert_eq!(text(&app), "colorscheme");
     type_text(&mut app, " gru");
     app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme gruvbox-baby");
+    app.key(KeyCode::Tab);
     assert_eq!(text(&app), "colorscheme gruvbox-dark");
+    app.key(KeyCode::BackTab);
+    assert_eq!(text(&app), "colorscheme gruvbox-baby");
+    app.key(KeyCode::Tab);
     app.key(KeyCode::Tab);
     assert_eq!(text(&app), "colorscheme gruvbox-light");
-    app.key(KeyCode::BackTab);
-    assert_eq!(text(&app), "colorscheme gruvbox-dark");
     app.key(KeyCode::Tab);
-    app.key(KeyCode::Tab);
-    assert_eq!(text(&app), "colorscheme gruvbox-dark");
+    assert_eq!(text(&app), "colorscheme gruvbox-baby");
     app.key(KeyCode::Esc);
     app.key(KeyCode::Char(':'));
     type_text(&mut app, "set appe");
@@ -7205,9 +7258,9 @@ fn command_line_tab_completion_cycles_in_place() {
     app.key(KeyCode::Char(':'));
     type_text(&mut app, "set appearance.colorscheme = gru");
     app.key(KeyCode::Tab);
-    assert_eq!(text(&app), "set appearance.colorscheme = gruvbox-dark");
+    assert_eq!(text(&app), "set appearance.colorscheme = gruvbox-baby");
     app.key(KeyCode::Enter);
-    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(app.theme.name, "gruvbox-baby");
     for unmatched in [
         "zzz",
         "colorscheme zzz",

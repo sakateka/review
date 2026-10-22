@@ -1,5 +1,5 @@
 //! Color themes: the bundled bat themes from two-face plus the original
-//! `review-classic` palette. Themes are resolved eagerly into a small
+//! `review-classic` palette and the `gruvbox-baby` Neovim palette. Themes are resolved eagerly into a small
 //! copyable table of capture colors and interface roles.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -11,6 +11,7 @@ use two_face::re_exports::syntect::{
 use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 pub const CLASSIC: &str = "review-classic";
+pub const GRUVBOX_BABY: &str = "gruvbox-baby";
 pub const DEFAULT: &str = "gruvbox-dark";
 
 /// Tree-sitter capture names that previews may request, with the TextMate
@@ -69,6 +70,26 @@ const CAPTURES: &[(&str, &[&str], Color)] = &[
     ),
 ];
 const CAPTURE_COUNT: usize = CAPTURES.len();
+
+/// Capture colors of luisiacc/gruvbox-baby (MIT) with its default medium
+/// background, taken from its tree-sitter highlight groups.
+const GRUVBOX_BABY_CAPTURES: &[(&str, Color)] = &[
+    ("comment", Color::Rgb(0x66, 0x5c, 0x54)),
+    ("string", Color::Rgb(0x98, 0x97, 0x1a)),
+    ("keyword", Color::Rgb(0xfb, 0x49, 0x34)),
+    ("function", Color::Rgb(0xee, 0xbd, 0x35)),
+    ("type", Color::Rgb(0x8e, 0xc0, 0x7c)),
+    ("constant", Color::Rgb(0xd4, 0x87, 0x9c)),
+    ("number", Color::Rgb(0xb1, 0x62, 0x86)),
+    ("operator", Color::Rgb(0xeb, 0xdb, 0xb2)),
+    ("variable", Color::Rgb(0x7f, 0xa2, 0xac)),
+    ("property", Color::Rgb(0x45, 0x85, 0x88)),
+    ("boolean", Color::Rgb(0xd6, 0x5d, 0x0e)),
+    ("label", Color::Rgb(0x45, 0x85, 0x88)),
+    ("attribute", Color::Rgb(0xd6, 0x5d, 0x0e)),
+    ("punctuation", Color::Rgb(0xeb, 0xdb, 0xb2)),
+    ("string.special", Color::Rgb(0x83, 0xa5, 0x98)),
+];
 
 /// Index of a capture name in the shared capture table.
 pub fn capture(name: &str) -> Option<u8> {
@@ -156,21 +177,61 @@ impl Theme {
         }
     }
 
+    pub fn gruvbox_baby() -> Self {
+        let mut captures = [None; CAPTURE_COUNT];
+        for (name, color) in GRUVBOX_BABY_CAPTURES {
+            let index = capture(name).expect("known gruvbox-baby capture");
+            captures[index as usize] = Some(*color);
+        }
+        let foreground = Color::Rgb(0xeb, 0xdb, 0xb2);
+        let comment = Color::Rgb(0x66, 0x5c, 0x54);
+        let soft_yellow = Color::Rgb(0xee, 0xbd, 0x35);
+        let dark_gray = Color::Rgb(0x83, 0xa5, 0x98);
+        let medium_gray = Color::Rgb(0x50, 0x49, 0x45);
+        let added = Color::Rgb(0x68, 0x9d, 0x6a);
+        let removed = Color::Rgb(0xfb, 0x49, 0x34);
+        Self {
+            name: GRUVBOX_BABY,
+            captures,
+            default_fg: Some(foreground),
+            added_fg: added,
+            added_bg: Color::Rgb(0x26, 0x33, 0x2c),
+            removed_fg: removed,
+            removed_bg: Color::Rgb(0x57, 0x2e, 0x33),
+            hunk: dark_gray,
+            search_bg: medium_gray,
+            reviewed_mark: comment,
+            pending_mark: soft_yellow,
+            reviewed_name: comment,
+            pending_name: foreground,
+            stat_plus: added,
+            stat_minus: removed,
+            border_focused: dark_gray,
+            border_unfocused: medium_gray,
+            metrics: dark_gray,
+            selection: Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        }
+    }
+
     /// All selectable theme names, sorted case-insensitively.
     pub fn names() -> Vec<&'static str> {
         let mut names: Vec<_> = EmbeddedLazyThemeSet::theme_names()
             .iter()
             .map(|name| name.as_name())
-            .chain([CLASSIC])
+            .chain([CLASSIC, GRUVBOX_BABY])
             .collect();
         names.sort_by_key(|name| name.to_lowercase());
         names
     }
 
-    /// Case-insensitive lookup of a bundled theme or `review-classic`.
+    /// Case-insensitive lookup of a bundled theme, `review-classic` or
+    /// `gruvbox-baby`.
     pub fn named(name: &str) -> Option<Self> {
         if name.eq_ignore_ascii_case(CLASSIC) {
             return Some(Self::classic());
+        }
+        if name.eq_ignore_ascii_case(GRUVBOX_BABY) {
+            return Some(Self::gruvbox_baby());
         }
         let embedded = *EmbeddedLazyThemeSet::theme_names()
             .iter()
