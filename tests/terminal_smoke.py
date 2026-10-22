@@ -48,6 +48,12 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         "mod two { fn preview_ambiguous() {} }\n" + preview_ambiguous_caller + "\n"
         "fn variable_owner() { let preview_variable = 1; }\n"
     )
+    centered_caller = "fn centered_caller() { centered_start(); centered_middle(); centered_end(); }"
+    centered_source = ["// captured context" for _ in range(101)]
+    for row, name in [(1, "start"), (50, "middle"), (99, "end")]:
+        centered_source[row] = f"fn centered_{name}() {{}}"
+    centered_source[10] = centered_caller
+    (repo / "centered.rs").write_text("\n".join(centered_source) + "\n")
     long_line = "\t// " + "界e\u0301🙂" * 150 + "\n"
     (repo / "caller.rs").write_text("fn caller() { main_target(); }\n" + long_line)
     fixture_root = pathlib.Path(__file__).resolve().parent / "fixtures" / "navigation"
@@ -567,6 +573,38 @@ go_to_definition = "gD"
     # Definition previews use captured function/type targets and reversible views.
     preview_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     preview_marks = {str(p.relative_to(root / "state")): p.read_bytes() for p in (root / "state").rglob("*") if p.is_file()}
+    for target_row, name in [(1, "start"), (50, "middle"), (99, "end")]:
+        session = Session()
+        session.wait_text("Files")
+        session.send(b"/centered_caller\r")
+        session.wait_text("Search candidates")
+        session.send(b"\r")
+        session.wait_text("Captured old centered.rs")
+        session.send(b"0" + str(centered_caller.index("centered_" + name)).encode() + b"l")
+        origin = (session.text(), session.row, session.col)
+        session.send(b"P")
+        session.wait_text("Definition preview")
+        session.wait_text("Captured old centered.rs")
+        content_height = 25  # terminal rows minus borders, status and global rows
+        top = min(max(0, target_row - content_height // 2), 101 - content_height)
+        assert session.cursor_visible
+        assert session.row == 1 + target_row - top, (name, session.row, session.text())
+        assert session.cells[(session.row, session.col)] == "c", session.text()
+        opening_row = session.row
+        session.send(b"j")
+        assert session.row == opening_row + 1, "ordinary motion recentered preview"
+        session.resize(3, 8)
+        assert not session.cursor_visible
+        session.resize(6, 140)
+        assert session.cursor_visible and session.row == 1
+        session.resize(30, 140)
+        assert session.cursor_visible and 1 <= session.row <= content_height
+        session.send(b"m")
+        session.send(b"q")
+        session.wait_text("Captured old centered.rs")
+        assert (session.text(), session.row, session.col) == origin, "centered preview lost origin"
+        session.send(b",q")
+        session.finish()
     for symbol in ["preview_unique", "PreviewType"]:
         for dismiss in [b"q", b"\x1b", b"\x0f"]:
             session = Session()

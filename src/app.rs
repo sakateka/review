@@ -34,6 +34,7 @@ pub struct App {
     source: Option<usize>,
     pub documentation: bool,
     pub definition_preview: bool,
+    center_preview_on_layout: Option<(usize, usize)>,
     pub cursor: (usize, usize),
     history: Vec<View>,
     pub file_area: Rect,
@@ -65,6 +66,7 @@ struct View {
     navigation: Option<Navigation>,
     documentation: bool,
     definition_preview: bool,
+    center_preview_on_layout: Option<(usize, usize)>,
     focus: Focus,
     status: String,
 }
@@ -109,6 +111,7 @@ impl App {
             source: None,
             documentation: false,
             definition_preview: false,
+            center_preview_on_layout: None,
             cursor: (0, 0),
             file_area: Rect::default(),
             preview_area: Rect::default(),
@@ -175,6 +178,22 @@ impl App {
         self.clamp_scroll();
     }
 
+    pub fn layout_preview(&mut self, height: usize, width: usize) {
+        self.viewport = (height, width);
+        // Opening must wait for the real content rectangle. A zero-height
+        // frame cannot position the target; consume the request on first layout
+        // with content, and center only if the cursor is still where the
+        // preview opened, so earlier user movement is never overridden.
+        if height > 0
+            && let Some(opened) = self.center_preview_on_layout.take()
+            && opened == self.cursor
+        {
+            self.clamp_cursor();
+            self.top = self.cursor.0.saturating_sub(height / 2);
+        }
+        self.keep_cursor_visible();
+    }
+
     fn move_cursor(&mut self, rows: isize, columns: isize) {
         self.cursor.0 = self.cursor.0.saturating_add_signed(rows);
         self.cursor.1 = self.cursor.1.saturating_add_signed(columns);
@@ -182,6 +201,7 @@ impl App {
     }
 
     pub fn scroll_preview(&mut self, rows: isize, columns: isize) {
+        self.center_preview_on_layout = None;
         self.top = self.top.saturating_add_signed(rows);
         self.left = self.left.saturating_add_signed(columns);
         self.clamp_scroll();
@@ -577,6 +597,7 @@ impl App {
             return;
         }
         if let Some(item) = self.capture.items.get(self.selected) {
+            self.center_preview_on_layout = None;
             self.source = None;
             self.cursor = (0, 0);
             self.navigation = None;
@@ -685,6 +706,7 @@ impl App {
             navigation: self.navigation.clone(),
             documentation: self.documentation,
             definition_preview: self.definition_preview,
+            center_preview_on_layout: self.center_preview_on_layout,
             focus: self.focus,
             status: self.status.clone(),
         });
@@ -698,6 +720,7 @@ impl App {
         self.navigation = None;
         self.documentation = false;
         self.definition_preview = false;
+        self.center_preview_on_layout = None;
         self.source = None;
         self.history.clear();
     }
@@ -713,9 +736,11 @@ impl App {
             self.navigation = view.navigation;
             self.documentation = view.documentation;
             self.definition_preview = view.definition_preview;
+            self.center_preview_on_layout = view.center_preview_on_layout;
             self.focus = view.focus;
             self.status = view.status;
         } else {
+            self.center_preview_on_layout = None;
             self.navigation = None;
             self.status = "No earlier navigation target".into();
         }
@@ -771,6 +796,7 @@ impl App {
         let target_side = self.side;
         self.side = origin_side;
         self.save_view();
+        self.center_preview_on_layout = None;
         self.side = target_side;
         self.documentation = false;
         self.invalidate_analysis();
@@ -1000,6 +1026,7 @@ impl App {
         self.source = Some(candidate.source);
         self.top = candidate.tag.line.saturating_sub(1) as usize;
         self.cursor = (candidate.tag.line.saturating_sub(1) as usize, left);
+        self.center_preview_on_layout = is_definition_preview.then_some(self.cursor);
         // Source columns are Unicode scalars; rendered prefixes/backslash/tab
         // expansion have separate screen coordinates.
         self.left = left;

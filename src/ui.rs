@@ -224,9 +224,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             inner.width,
             inner.height.min(1),
         );
-        app.viewport = (content.height as usize, content.width as usize);
         app.preview_area = content;
-        app.keep_cursor_visible();
+        app.layout_preview(content.height as usize, content.width as usize);
         let preview = app.preview.as_ref().expect("preview exists");
         let lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
         frame.render_widget(

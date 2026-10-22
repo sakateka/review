@@ -6678,3 +6678,197 @@ fn toml_colors_preserve_captured_sources_coordinates_and_diff_emphasis() {
         new
     );
 }
+
+#[test]
+fn definition_preview_centers_once_with_rendered_geometry_and_restores_origin() {
+    use source::ComparedSide;
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    for short in [false, true] {
+        let lines: usize = if short { 6 } else { 101 };
+        let mut text = String::new();
+        for row in 0..lines {
+            text.push_str(&format!("fn center_target_{row:03}() {{}}\n"));
+        }
+        std::fs::write(directory.path().join("one.rs"), &text).unwrap();
+        git_run(directory.path(), &["add", "."]);
+        git_run(
+            directory.path(),
+            &["commit", "-qm", "captured centering fixture"],
+        );
+        // A same-length live edit captures both sides with identical rows.
+        let text = text.replacen("fn center_target_000() {}", "fn center_target_000() { }", 1);
+        std::fs::write(directory.path().join("one.rs"), &text).unwrap();
+        for side in [ComparedSide::Old, ComparedSide::New] {
+            for target in [1, lines / 2, lines - 2] {
+                // Both sides are captured before replacing the live checkout.
+                let mut app = application(directory.path(), state.path());
+                app.key(KeyCode::Char('/'));
+                for c in format!("center_target_{target:03}").chars() {
+                    app.key(KeyCode::Char(c));
+                }
+                app.key(KeyCode::Enter);
+                await_navigation(&mut app);
+                let index = app
+                    .navigation
+                    .as_ref()
+                    .unwrap()
+                    .candidates
+                    .iter()
+                    .position(|c| app.capture.catalog.sources[c.source].side == side)
+                    .unwrap();
+                for _ in 0..index {
+                    app.key(KeyCode::Char('j'));
+                }
+                let origin = screen(&mut app, 100, 24);
+                let origin_position = (app.cursor, app.top, app.left, app.side);
+                let selection = app.navigation.as_ref().unwrap().selected;
+                std::fs::write(
+                    directory.path().join("one.rs"),
+                    "fn checkout_replaced() {}\n",
+                )
+                .unwrap();
+                app.key(KeyCode::Char('P'));
+                await_navigation(&mut app);
+                assert!(app.definition_preview, "{}", app.status);
+                // The first content layout differs from the origin dimensions.
+                screen(&mut app, 100, 16);
+                let height = app.viewport.0;
+                assert_eq!(height, app.preview_area.height as usize);
+                assert_eq!(height, 11); // borders, pane status and global rows excluded
+                let expected_top = target
+                    .saturating_sub(height / 2)
+                    .min(lines.saturating_sub(height));
+                assert_eq!(app.top, expected_top, "{side:?} target {target}");
+                assert_eq!(app.cursor.0, target);
+                assert_eq!(app.side, side);
+                let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+                let frame = terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+                assert!(!screen_text(frame.buffer).contains("checkout_replaced"));
+                use ratatui::backend::Backend;
+                assert_eq!(
+                    terminal.backend_mut().get_cursor_position().unwrap().y,
+                    app.preview_area.y + (target - expected_top) as u16
+                );
+                let opening_top = app.top;
+                app.key(KeyCode::Char('j'));
+                screen(&mut app, 100, 16);
+                assert_eq!(app.top, opening_top); // ordinary motion does not recenter
+                if !short {
+                    app.scroll_preview(3, 0);
+                    let scrolled = app.top;
+                    screen(&mut app, 100, 16);
+                    assert_eq!(app.top, scrolled);
+                }
+                for (width, height) in [(0, 0), (1, 1), (8, 3), (8, 6), (100, 24)] {
+                    screen(&mut app, width, height);
+                    assert!(app.cursor.0 < lines);
+                    if app.viewport.0 > 0 {
+                        assert!(app.cursor.0 >= app.top);
+                        assert!(app.cursor.0 - app.top < app.viewport.0);
+                    }
+                }
+                app.key(KeyCode::Char('m'));
+                app.key(KeyCode::Char('q'));
+                assert_eq!(screen(&mut app, 100, 24), origin);
+                assert_eq!((app.cursor, app.top, app.left, app.side), origin_position);
+                assert_eq!(app.navigation.as_ref().unwrap().selected, selection);
+                assert!(app.marks.iter().all(|mark| !mark));
+                std::fs::write(directory.path().join("one.rs"), &text).unwrap();
+            }
+        }
+    }
+    assert!(state.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn definition_preview_zero_height_defers_centering_and_dismissal_clears_it() {
+    let directory = fixture();
+    let text = (0..80)
+        .map(|i| format!("fn deferred_target_{i}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(directory.path().join("one.rs"), text).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "deferred_target_40".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let origin = screen(&mut app, 100, 24);
+    for dismiss_before_layout in [true, false] {
+        app.key(KeyCode::Char('P'));
+        await_navigation(&mut app);
+        screen(&mut app, 8, 3);
+        assert_eq!(app.viewport.0, 0);
+        if !dismiss_before_layout {
+            screen(&mut app, 100, 24);
+            assert_eq!(app.top, 40 - app.viewport.0 / 2);
+            // Nested ordinary source navigation inherits definition_preview but
+            // must retain ordinary opening positioning.
+            app.key(KeyCode::Char('g'));
+            app.key(KeyCode::Char('d'));
+            await_navigation(&mut app);
+            app.key(KeyCode::Enter);
+            screen(&mut app, 100, 24);
+            assert_eq!(app.top, 40);
+            app.key(KeyCode::Char('q'));
+            app.key(KeyCode::Char('q'));
+        }
+        app.key(KeyCode::Char('q'));
+        assert_eq!(screen(&mut app, 100, 24), origin);
+    }
+}
+
+#[test]
+fn definition_preview_movement_before_layout_consumes_centering() {
+    let directory = fixture();
+    let text = (0..80)
+        .map(|i| format!("fn consumed_target_{i}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(directory.path().join("one.rs"), text).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "consumed_target_40".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let origin = screen(&mut app, 100, 24);
+    for motion in ["j", "scroll", "G"] {
+        app.key(KeyCode::Char('P'));
+        await_navigation(&mut app);
+        assert!(app.definition_preview, "{}", app.status);
+        screen(&mut app, 8, 3);
+        assert_eq!(app.viewport.0, 0);
+        match motion {
+            "scroll" => app.scroll_preview(3, 0),
+            "G" => {
+                // A counted jump bypasses ordinary row motion.
+                for c in "20G".chars() {
+                    app.key(KeyCode::Char(c));
+                }
+            }
+            _ => {
+                app.key(KeyCode::Char('j'));
+            }
+        }
+        let moved_top = app.top;
+        let moved_cursor = app.cursor.0;
+        screen(&mut app, 100, 24);
+        let height = app.viewport.0;
+        assert!(height > 0);
+        assert_ne!(app.top, 40 - height / 2, "{motion} recentered");
+        assert_ne!(
+            app.top,
+            moved_cursor.saturating_sub(height / 2).min(80 - height),
+            "{motion} recentered on the moved cursor"
+        );
+        assert_eq!(app.top, moved_top.min(80 - height), "{motion}");
+        assert!(app.cursor.0 >= app.top && app.cursor.0 - app.top < app.viewport.0);
+        app.key(KeyCode::Char('q'));
+        assert_eq!(screen(&mut app, 100, 24), origin);
+    }
+}
