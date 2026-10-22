@@ -193,7 +193,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             os.close(self.slave)
 
     # The palette assertions below pin the discovered config to review-classic;
-    # the theme block checks the gruvbox-dark default without any config.
+    # the theme block checks the gruvbox-baby default without any config.
     config_dir = root / "config" / "review"
     config_dir.mkdir(parents=True)
     config_file = config_dir / "config.toml"
@@ -268,7 +268,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     git_run("commit", "-qm", "remove toml fixture")
     before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
 
-    # Installed themes and command line: gruvbox-dark without config, runtime-only
+    # Installed themes and command line: gruvbox-baby without config, runtime-only
     # switching, completion, cancel, errors, Emacs alt-x and invalid startup names.
     config_file.unlink()
     def token_color(session, row_text, token):
@@ -281,7 +281,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(b"\r")
     session.wait_text("+fn caller()")
     assert token_color(session, "+fn caller()", "fn") == (251, 73, 52), session.colors
-    assert token_color(session, "+fn caller()", "caller") == (142, 192, 124)
+    assert token_color(session, "+fn caller()", "caller") == (238, 189, 53)
     session.send(b":")
     assert status_row(session).startswith(":"), session.text()
     assert session.cursor_visible and (session.row, session.col) == (28, 1), (session.row, session.col)
@@ -316,7 +316,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(b"\x1bx")
     assert status_row(session).startswith(":"), session.text()
     session.send(b"colorscheme\r")
-    session.wait_text("appearance.colorscheme=gruvbox-dark")
+    session.wait_text("appearance.colorscheme=gruvbox-baby")
     session.send(b",q")
     session.finish()
     # Default-theme Rust captured source view and YAML/TOML diffs and source.
@@ -329,8 +329,8 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Captured ")
     assert "caller.rs" in session.text(), session.text()
     # The view opens scrolled to the symbol column, so "fn" is off-screen.
-    assert token_color(session, "caller() {", "caller") == (142, 192, 124), session.text()
-    assert token_color(session, "// ", "//") == (146, 131, 116), session.text()
+    assert token_color(session, "caller() {", "caller") == (238, 189, 53), session.text()
+    assert token_color(session, "// ", "//") == (102, 92, 84), session.text()
     session.send(b",q")
     session.finish()
     (repo / "colors.yaml").write_text(yaml_text)
@@ -344,14 +344,14 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     session.send(b"\r")
     session.wait_text("+  count: 43")
-    for row_text, token, color in [("+  count: 43", "count", (131, 165, 152)), ("+  count: 43", "43", (211, 134, 155))]:
+    for row_text, token, color in [("+  count: 43", "count", (69, 133, 136)), ("+  count: 43", "43", (177, 98, 134))]:
         assert token_color(session, row_text, token) == color, (token, session.text())
     session.send(b"\x1b")
     session.send(b"/service\r")
     session.wait_text("Search candidates")
     session.send(b"\r")
     session.wait_text("Captured old colors.yaml")
-    for token, color in [("service:", (131, 165, 152)), ("café", (184, 187, 38)), ("42", (211, 134, 155)), ("# review", (146, 131, 116))]:
+    for token, color in [("service:", (69, 133, 136)), ("café", (152, 151, 26)), ("42", (177, 98, 134)), ("# review", (102, 92, 84))]:
         assert token_color(session, token, token) == color, (token, session.text())
     session.send(b",q")
     session.finish()
@@ -359,9 +359,9 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     session.send(b"\r")
     session.wait_text("+count = 43")
-    for row_text, token, color in [("+count = 43", "count", (131, 165, 152)), ("+count = 43", "43", (211, 134, 155))]:
+    for row_text, token, color in [("+count = 43", "count", (69, 133, 136)), ("+count = 43", "43", (177, 98, 134))]:
         assert token_color(session, row_text, token) == color, (token, session.text())
-    for token, color in [("café", (184, 187, 38)), ("# review", (146, 131, 116))]:
+    for token, color in [("café", (152, 151, 26)), ("# review", (102, 92, 84))]:
         assert token_color(session, token, token) == color, (token, session.text())
     session.send(b",q")
     session.finish()
@@ -1189,13 +1189,22 @@ pub fn invoke(worker: Worker) -> u32 {
     closed(session)
     session.wait_text("3 ++-")
     session.wait_text("binary")
+    # The whole-diff total sums the numstat oracle: +2 -1 and one binary.
+    session.wait_text("Σ +2 −1 · 1 binary")
     def stats_row(name):
         return next(line for line in session.text().splitlines() if name in line)
     assert "binary" in stats_row("binary.dat")
     assert re.search(r"mode.txt +0", stats_row("mode.txt")), session.text()
+    # An open diff hides per-file statistics and the totals line.
     session.send(b"\r")
-    session.wait_text("3 ++-")
+    session.wait_text("+extra")
+    end = time.monotonic() + 10
+    while "3 ++-" in session.text() or "Σ" in session.text():
+        session.pump(0.1)
+        assert time.monotonic() < end, session.text()
     session.send(b"\x1b")
+    session.wait_text("Σ +2 −1 · 1 binary")
+    session.wait_text("3 ++-")
     session.send(b"jk")
     for shape in [(30, 28), (3, 8), (1, 1), (30, 140)]:
         session.resize(*shape)

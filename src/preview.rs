@@ -763,6 +763,9 @@ impl Preview {
                         let end = column + span.width();
                         if matches.iter().any(|m| column < m.end && end > m.start) {
                             span.style = span.style.bg(self.theme.search_bg);
+                            if let Some(fg) = self.theme.search_fg {
+                                span.style = span.style.fg(fg);
+                            }
                         }
                         column = end;
                     }

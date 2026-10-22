@@ -3868,7 +3868,7 @@ fn vim_star_search_wraps_whole_words_with_counts_and_keeps_source_styles() {
     );
     app.preview = Some(preview::Preview::source(
         &catalog.sources[0],
-        &theme::Theme::default(),
+        &theme::Theme::named("gruvbox-dark").unwrap(),
     ));
     app.focus = Focus::Preview;
     app.viewport = (2, 10);
@@ -6077,8 +6077,10 @@ fn file_statistics_rows_keep_names_styles_marks_and_resize_safe() {
     );
     app.key(KeyCode::Char('m'));
     app.key(KeyCode::Enter);
-    assert!(screen_text(&screen(&mut app, 100, 24)).contains("2 +-"));
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(!text.contains("2 +-") && !text.contains('Σ'), "{text}");
     app.key(KeyCode::Esc);
+    assert!(screen_text(&screen(&mut app, 100, 24)).contains("2 +-"));
     app.key(KeyCode::Down);
     app.key(KeyCode::Up);
     assert_eq!(app.marks, [true, false]);
@@ -6972,7 +6974,7 @@ fn theme_registry_lists_bundled_names_and_classic_matches_literals() {
     ] {
         assert!(names.contains(&name), "{name}");
     }
-    assert_eq!(theme::Theme::default().name, "gruvbox-dark");
+    assert_eq!(theme::Theme::default().name, "gruvbox-baby");
     assert_eq!(theme::Theme::named("dracula").unwrap().name, "Dracula");
     assert!(theme::Theme::named("nope").is_none());
     let classic = theme::Theme::named("REVIEW-CLASSIC").unwrap();
@@ -7045,8 +7047,8 @@ fn gruvbox_baby_uses_the_upstream_tree_sitter_palette() {
 }
 
 #[test]
-fn gruvbox_dark_default_distinguishes_code_tokens_keys_and_diff_sides() {
-    let theme = theme::Theme::default();
+fn gruvbox_dark_distinguishes_code_tokens_keys_and_diff_sides() {
+    let theme = theme::Theme::named("gruvbox-dark").unwrap();
     let directory = fixture();
     let rust = "// note\nfn one() {\n\tlet answer = \"text\";\n\tlet number = 1;\n\tone();\n}\n";
     std::fs::write(directory.path().join("one.rs"), rust).unwrap();
@@ -7124,7 +7126,8 @@ fn gruvbox_dark_default_distinguishes_code_tokens_keys_and_diff_sides() {
     }));
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
-    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(app.theme.name, "gruvbox-baby");
+    app.set_theme(theme);
     let rendered = screen(&mut app, 100, 24);
     assert!(
         rendered
@@ -7167,8 +7170,8 @@ fn command_line_sets_queries_and_aliases_the_colorscheme() {
     assert!(app.status.contains("review-classic"), "{}", app.status);
     run_command(&mut app, "set appearance.colorscheme");
     assert!(app.status.contains("review-classic"), "{}", app.status);
-    run_command(&mut app, "  colorscheme   gruvbox-dark  ");
-    assert_eq!(app.theme.name, "gruvbox-dark");
+    run_command(&mut app, "  colorscheme   gruvbox-baby  ");
+    assert_eq!(app.theme.name, "gruvbox-baby");
     assert_eq!(colors(app.preview.as_ref().unwrap()), default);
 }
 
@@ -7187,7 +7190,7 @@ fn command_line_errors_cancel_empty_and_quit_leave_theme_unchanged() {
         ("set appearance.colorscheme=nope", "\"nope\""),
     ] {
         run_command(&mut app, command);
-        assert_eq!(app.theme.name, "gruvbox-dark", "{command}");
+        assert_eq!(app.theme.name, "gruvbox-baby", "{command}");
         assert!(app.status.contains(token), "{command}: {}", app.status);
         assert_eq!(app.preview.as_ref().unwrap().lines, before);
     }
@@ -7196,7 +7199,7 @@ fn command_line_errors_cancel_empty_and_quit_leave_theme_unchanged() {
     type_text(&mut app, "colorscheme review-classic");
     app.key(KeyCode::Esc);
     assert!(app.command.is_none());
-    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(app.theme.name, "gruvbox-baby");
     assert_eq!(app.status, "kept");
     // Escape closed only the command line, not the diff.
     assert!(app.preview.is_some());
@@ -7482,7 +7485,7 @@ fn command_line_renders_in_status_row_with_cursor_and_rebinds() {
 fn appearance_config_selects_and_validates_the_startup_theme() {
     assert_eq!(
         config::Config::parse("").unwrap().theme().unwrap().name,
-        "gruvbox-dark"
+        "gruvbox-baby"
     );
     let classic = config::Config::parse("[appearance]\ncolorscheme = \"review-classic\"\n")
         .unwrap()
@@ -7502,12 +7505,12 @@ fn appearance_config_selects_and_validates_the_startup_theme() {
     let text = help(None, None).unwrap();
     assert!(text.contains(":colorscheme"), "{text}");
     assert!(text.contains("appearance.colorscheme"), "{text}");
-    assert!(text.contains("gruvbox-dark"), "{text}");
+    assert!(text.contains("gruvbox-baby"), "{text}");
 }
 
 #[test]
-fn gruvbox_dark_default_colors_captured_source_views_for_rust_yaml_and_toml() {
-    let theme = theme::Theme::default();
+fn gruvbox_dark_colors_captured_source_views_for_rust_yaml_and_toml() {
+    let theme = theme::Theme::named("gruvbox-dark").unwrap();
     assert_eq!(theme.name, "gruvbox-dark");
     let comment = Color::Rgb(146, 131, 116);
     let string = Color::Rgb(184, 187, 38);
@@ -8350,4 +8353,217 @@ mod review_comments {
         assert!(app.bindings.help().contains("delete_comment: dc\n"));
         assert!(app.bindings.legend().contains("c comment"));
     }
+}
+
+fn row_text(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, row)].symbol().to_string())
+        .collect()
+}
+
+#[test]
+fn file_list_totals_sum_text_statistics_in_the_bottom_row() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.set_theme(theme::Theme::classic());
+    let rendered = screen(&mut app, 100, 24);
+    // Rows: 0 top border, 1..=20 inner, 21 bottom border, 22-23 status.
+    let totals = row_text(&rendered, 20);
+    assert!(totals.starts_with("│Σ +2 −2 "), "{totals}");
+    assert_eq!(app.file_area.height, 19);
+    assert_eq!(rendered[(3, 20)].fg, Color::Green);
+    assert_eq!(rendered[(6, 20)].fg, Color::Red);
+    assert_eq!(rendered[(1, 20)].fg, app.theme.metrics);
+    // Tiny panes clip the totals line and never panic.
+    let rendered = screen(&mut app, 6, 8);
+    assert!(row_text(&rendered, 4).starts_with("│Σ +2"));
+    for width in 0..12 {
+        for height in 0..6 {
+            screen(&mut app, width, height);
+        }
+    }
+}
+
+#[test]
+fn file_list_totals_count_binary_and_unavailable_items() {
+    let directory = fixture();
+    let root = directory.path();
+    std::fs::write(root.join("binary.dat"), b"old\0binary").unwrap();
+    git_run(root, &["add", "."]);
+    git_run(root, &["commit", "-qm", "binary"]);
+    std::fs::write(root.join("binary.dat"), b"new\0binary").unwrap();
+    std::fs::write(
+        root.join("one.rs"),
+        "fn one() {\n\tlet answer = 1;\n}\na\nb\nc\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(root, state.path());
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(text.contains("Σ +3 −0 · 1 binary "), "{text}");
+    assert!(!text.contains("unavailable"), "{text}");
+    // A whitespace-suppressed mode change has no provable statistics.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(root.join("two.rs"), "fn two() {\n    let answer = 2;\n}\n").unwrap();
+    std::fs::set_permissions(root.join("two.rs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(
+        capture(root, &["-w", "HEAD"]),
+        state::Store::at(state.path(), root, &["-w".into(), "HEAD".into()]),
+    );
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(
+        text.contains("Σ +3 −0 · 1 binary · 1 unavailable"),
+        "{text}"
+    );
+}
+
+#[test]
+fn open_diff_hides_statistics_and_totals_until_closed() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('m'));
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Enter);
+    assert!(app.preview.is_some());
+    let rendered = screen(&mut app, 100, 24);
+    let text = screen_text(&rendered);
+    assert!(!text.contains('Σ'), "{text}");
+    // Rows hold only the mark and the name; the list keeps the full height.
+    let files: String = (1..29).map(|x| rendered[(x, 2)].symbol()).collect();
+    assert!(files.trim_end().ends_with("- two.rs"), "{files}");
+    assert_eq!(app.file_area.height, 19);
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_none());
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(text.contains("Σ +2 −2") && text.contains("2 +-"), "{text}");
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.marks, [true, false]);
+}
+
+#[test]
+fn file_list_height_is_constant_and_double_click_opens_the_bottom_row_with_a_diff_open() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use std::time::{Duration, Instant};
+    let directory = fixture();
+    for index in 0..30 {
+        std::fs::write(directory.path().join(format!("f{index:02}.txt")), "x\n").unwrap();
+    }
+    git_run(directory.path(), &["add", "-N", "."]);
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    assert_eq!(app.capture.items.len(), 30);
+    let rendered = screen(&mut app, 100, 13);
+    let rows = |app: &App| (app.file_area.y, app.file_area.height, app.file_offset);
+    let closed = rows(&app);
+    assert_eq!(app.file_area.height, 8);
+    assert!(row_text(&rendered, app.file_area.y + 8).contains('Σ'));
+    app.key(KeyCode::Enter);
+    let rendered = screen(&mut app, 100, 13);
+    assert!(app.preview.is_some());
+    assert_eq!(rows(&app), closed);
+    // The reserved row stays blank while the diff is open.
+    assert!(!row_text(&rendered, app.file_area.y + 8).contains('Σ'));
+    // Double-clicking the bottom visible file row selects and opens it.
+    let bottom = app.file_area.y + app.file_area.height - 1;
+    let click = mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        app.file_area.x,
+        bottom,
+    );
+    let now = Instant::now();
+    app.mouse(click, now);
+    assert_eq!(app.selected, 7);
+    screen(&mut app, 100, 13);
+    assert_eq!(rows(&app), closed);
+    app.mouse(click, now + Duration::from_millis(100));
+    assert_eq!(app.selected, 7);
+    assert!(app.preview.is_some());
+    assert_eq!(app.focus, Focus::Preview);
+    screen(&mut app, 100, 13);
+    assert_eq!(rows(&app), closed);
+    app.key(KeyCode::Esc);
+    screen(&mut app, 100, 13);
+    assert_eq!(rows(&app), closed);
+}
+
+#[test]
+fn empty_capture_shows_no_totals_line() {
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let text = screen_text(&screen(&mut app, 60, 12));
+    assert!(text.contains("Files — no changes"), "{text}");
+    assert!(!text.contains('Σ'), "{text}");
+}
+
+#[test]
+fn gruvbox_baby_is_the_default_with_orange_black_search_matches() {
+    assert_eq!(theme::DEFAULT, "gruvbox-baby");
+    let baby = theme::Theme::default();
+    assert_eq!(baby.name, "gruvbox-baby");
+    assert_eq!(baby.search_bg, Color::Rgb(0xd6, 0x5d, 0x0e));
+    assert_eq!(baby.search_fg, Some(Color::Rgb(0, 0, 0)));
+    let comment = theme::capture("comment").unwrap();
+    let style = baby.style(theme::Role {
+        capture: Some(comment),
+        ..Default::default()
+    });
+    assert!(!style.add_modifier.contains(Modifier::ITALIC));
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    assert_eq!(app.theme.name, "gruvbox-baby");
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let preview = app.preview.as_ref().unwrap();
+    let row = preview
+        .lines
+        .iter()
+        .position(|line| line.to_string().contains("answer"))
+        .unwrap();
+    let column = preview.lines[row].to_string().find("answer").unwrap();
+    app.cursor = (row, column);
+    app.key(KeyCode::Char('*'));
+    assert!(app.preview.as_ref().unwrap().search.is_some());
+    // Styles of every displayed cell inside a search match.
+    let matched = |app: &App| -> Vec<ratatui::style::Style> {
+        let preview = app.preview.as_ref().unwrap();
+        let lines = preview.visible(0, 0, preview.lines.len(), 200);
+        let mut styles = Vec::new();
+        for m in &preview.search.as_ref().unwrap().matches {
+            let mut column = 0;
+            for span in &lines[m.row].spans {
+                let end = column + span.width();
+                if column < m.end && end > m.start {
+                    styles.push(span.style);
+                }
+                column = end;
+            }
+        }
+        styles
+    };
+    let styles = matched(&app);
+    assert!(!styles.is_empty());
+    for style in styles {
+        assert_eq!(style.bg, Some(Color::Rgb(0xd6, 0x5d, 0x0e)));
+        assert_eq!(style.fg, Some(Color::Rgb(0, 0, 0)));
+    }
+    // Other themes keep their own match foreground.
+    run_command(&mut app, "colorscheme gruvbox-dark");
+    let dark = theme::Theme::named("gruvbox-dark").unwrap();
+    assert_eq!(dark.search_fg, None);
+    assert!(theme::Theme::classic().search_fg.is_none());
+    let styles = matched(&app);
+    assert!(!styles.is_empty());
+    assert!(styles.iter().any(|style| style.bg == Some(dark.search_bg)));
+    assert!(
+        styles
+            .iter()
+            .all(|style| style.fg != Some(Color::Rgb(0, 0, 0)))
+    );
 }

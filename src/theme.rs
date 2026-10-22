@@ -12,7 +12,7 @@ use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 pub const CLASSIC: &str = "review-classic";
 pub const GRUVBOX_BABY: &str = "gruvbox-baby";
-pub const DEFAULT: &str = "gruvbox-dark";
+pub const DEFAULT: &str = GRUVBOX_BABY;
 
 /// Tree-sitter capture names that previews may request, with the TextMate
 /// scopes consulted in order and the `review-classic` color.
@@ -128,6 +128,8 @@ pub struct Theme {
     pub removed_bg: Color,
     pub hunk: Color,
     pub search_bg: Color,
+    /// Foreground of search matches; `None` keeps the matched text color.
+    pub search_fg: Option<Color>,
     pub reviewed_mark: Color,
     pub pending_mark: Color,
     pub reviewed_name: Color,
@@ -167,6 +169,7 @@ impl Theme {
             removed_bg: Color::Rgb(35, 10, 10),
             hunk: Color::Cyan,
             search_bg: Color::Rgb(80, 65, 0),
+            search_fg: None,
             reviewed_mark: Color::Gray,
             pending_mark: Color::Yellow,
             reviewed_name: Color::DarkGray,
@@ -204,7 +207,9 @@ impl Theme {
             removed_fg: removed,
             removed_bg: Color::Rgb(0x57, 0x2e, 0x33),
             hunk: dark_gray,
-            search_bg: medium_gray,
+            // The Neovim search style: orange background, black text.
+            search_bg: Color::Rgb(0xd6, 0x5d, 0x0e),
+            search_fg: Some(Color::Rgb(0, 0, 0)),
             reviewed_mark: comment,
             pending_mark: soft_yellow,
             reviewed_name: comment,
@@ -360,6 +365,7 @@ impl Theme {
                 accent,
             ),
             search_bg,
+            search_fg: None,
             reviewed_mark: reviewed,
             pending_mark: pending,
             reviewed_name,

@@ -56,6 +56,7 @@ fn file_row(
     item: &crate::git::Item,
     reviewed: bool,
     width: usize,
+    show_stats: bool,
     theme: &crate::theme::Theme,
 ) -> Line<'static> {
     use crate::git::Statistics;
@@ -73,7 +74,7 @@ fn file_row(
     // Names retain at least twelve cells (or the entire tiny pane). Statistics
     // yield first; the graph is optional and bounded to twelve cells.
     let name_minimum = name.width().min(12);
-    let show_stats = available >= name_minimum + 2 + label.width();
+    let show_stats = show_stats && available >= name_minimum + 2 + label.width();
     let graph_width = if show_stats {
         available
             .saturating_sub(name_minimum + 3 + label.width())
@@ -162,6 +163,48 @@ fn file_row(
     Line::from(spans)
 }
 
+/// One-line sum of every captured item's statistics, e.g. `Σ +3 −0 · 1 binary`.
+fn totals_line(items: &[crate::git::Item], theme: &crate::theme::Theme) -> Line<'static> {
+    use crate::git::Statistics;
+    let (mut additions, mut deletions, mut binary, mut unavailable) = (0usize, 0usize, 0, 0);
+    for item in items {
+        match item.statistics() {
+            Statistics::Text {
+                additions: added,
+                deletions: removed,
+            } => {
+                additions = additions.saturating_add(added);
+                deletions = deletions.saturating_add(removed);
+            }
+            Statistics::Binary => binary += 1,
+            Statistics::Unavailable => unavailable += 1,
+        }
+    }
+    let neutral = Style::default().fg(theme.metrics);
+    let mut spans = vec![
+        Span::styled("Σ ", neutral),
+        Span::styled(
+            format!("+{additions}"),
+            Style::default().fg(theme.stat_plus),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("−{deletions}"),
+            Style::default().fg(theme.stat_minus),
+        ),
+    ];
+    if binary > 0 {
+        spans.push(Span::styled(format!(" · {binary} binary"), neutral));
+    }
+    if unavailable > 0 {
+        spans.push(Span::styled(
+            format!(" · {unavailable} unavailable"),
+            neutral,
+        ));
+    }
+    Line::from(spans)
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -183,6 +226,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         })
         .split(areas[0]);
     if !original {
+        // Statistics and the totals line appear only while no diff is open.
+        let show_stats = app.preview.is_none();
         let items: Vec<_> = app
             .capture
             .items
@@ -194,6 +239,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     item,
                     *reviewed,
                     panels[0].width.saturating_sub(4) as usize,
+                    show_stats,
                     &app.theme,
                 ))
                 .style(if index == app.selected {
@@ -203,27 +249,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 })
             })
             .collect();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(if app.capture.items.is_empty() {
+                "Files — no changes"
+            } else {
+                "Files"
+            })
+            .border_style(Style::default().fg(if app.focus == Focus::Files {
+                app.theme.border_focused
+            } else {
+                app.theme.border_unfocused
+            }));
+        let inner = block.inner(panels[0]);
+        frame.render_widget(block, panels[0]);
+        // The bottom inner row is reserved for the totals line whether or not
+        // a diff is open, so the list height (and hit-testing) never changes
+        // on open/close; the row stays blank while a diff is open.
+        let mut list_area = inner;
+        if !app.capture.items.is_empty() && inner.height >= 2 {
+            list_area.height -= 1;
+            if show_stats {
+                frame.render_widget(
+                    Paragraph::new(totals_line(&app.capture.items, &app.theme)),
+                    Rect::new(inner.x, inner.y + list_area.height, inner.width, 1),
+                );
+            }
+        }
         let files = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if app.capture.items.is_empty() {
-                        "Files — no changes"
-                    } else {
-                        "Files"
-                    })
-                    .border_style(Style::default().fg(if app.focus == Focus::Files {
-                        app.theme.border_focused
-                    } else {
-                        app.theme.border_unfocused
-                    })),
-            )
             .highlight_style(app.theme.selection)
             .highlight_symbol("› ");
         let mut selection = ListState::default();
-        app.file_area = Block::default().borders(Borders::ALL).inner(panels[0]);
+        app.file_area = list_area;
         *selection.offset_mut() = app.file_offset;
-        frame.render_stateful_widget(files, panels[0], &mut selection);
+        frame.render_stateful_widget(files, list_area, &mut selection);
         app.file_offset = selection.offset();
     }
     if app.preview.is_some() {
