@@ -114,10 +114,19 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
     let (tags, note, _) = extract_functions(selector, source);
     (tags, note)
 }
+#[cfg(test)]
 pub fn extract_functions(
     selector: &str,
     source: &str,
 ) -> (Vec<riptags::Tag>, String, Vec<Function>) {
+    let (tags, note, functions, _) = extract_inventory(selector, source);
+    (tags, note, functions)
+}
+
+pub fn extract_inventory(
+    selector: &str,
+    source: &str,
+) -> (Vec<riptags::Tag>, String, Vec<Function>, Vec<riptags::Tag>) {
     use std::{
         collections::BTreeMap,
         ops::ControlFlow,
@@ -125,7 +134,12 @@ pub fn extract_functions(
     };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language(selector)).is_err() {
-        return (Vec::new(), "parser unavailable".into(), Vec::new());
+        return (
+            Vec::new(),
+            "parser unavailable".into(),
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let started = Instant::now();
     let mut progress = |_: &tree_sitter::ParseState| {
@@ -144,6 +158,7 @@ pub fn extract_functions(
             Vec::new(),
             "parser failed or parsing time limit, skipped".into(),
             Vec::new(),
+            Vec::new(),
         );
     };
     let mut note = if tree.root_node().has_error() {
@@ -154,6 +169,7 @@ pub fn extract_functions(
     let columns = scalar_columns(source);
     let mut tags = BTreeMap::new();
     let mut functions = Vec::new();
+    let mut types = Vec::new();
     let mut documentation_bytes = 0usize;
     if riptags_preflight(&tree, source.len()) {
         for tag in riptags::tag_source(selector, source) {
@@ -233,6 +249,22 @@ pub fn extract_functions(
                 documentation: None,
             });
         }
+        if types.len() < FILE_TAGS
+            && let Some(name) = type_name(&cursor, selector)
+        {
+            let tag = riptags::Tag {
+                line: name.start_position().row as u32 + 1,
+                col: columns[name.start_byte()],
+                len: source[name.byte_range()].chars().count() as u32,
+                name: source[name.byte_range()].into(),
+                kind: riptags::OccKind::Definition,
+                sym_kind: riptags::SymKind::Variable,
+                owners: Vec::new(),
+                context: None,
+            };
+            tags.insert((tag.line, tag.col, tag.len), tag.clone());
+            types.push(tag);
+        }
         // Plain literal text never has identifier nodes; interpolation expressions
         // do, and remain useful references (including quoted shell expansions).
         let skip = kind.contains("comment");
@@ -283,11 +315,11 @@ pub fn extract_functions(
                 break;
             }
             if !cursor.goto_parent() {
-                return (tags.into_values().collect(), note, functions);
+                return (tags.into_values().collect(), note, functions, types);
             }
         }
     }
-    (tags.into_values().collect(), note, functions)
+    (tags.into_values().collect(), note, functions, types)
 }
 fn identifier(kind: &str) -> bool {
     matches!(
@@ -314,6 +346,16 @@ fn declaration(cursor: &tree_sitter::TreeCursor<'_>, selector: &str) -> bool {
         }
         let parent = cursor.node();
         let kind = parent.kind();
+        if selector == "buffer.cpp" {
+            match kind {
+                "type_parameter_declaration" | "variadic_type_parameter_declaration" => {
+                    return child.kind() == "type_identifier"
+                        && parent.named_child(0) == Some(child);
+                }
+                "optional_type_parameter_declaration" => return field == Some("name"),
+                _ => {}
+            }
+        }
         if matches!(
             kind,
             "function_item"
@@ -691,6 +733,87 @@ fn call_name<'a>(node: tree_sitter::Node<'a>, selector: &str) -> Option<tree_sit
                     None
                 }
             })?;
+    }
+    None
+}
+
+/// Named type declarations only: modules, fields, parameters and ordinary
+/// variable declarations never establish a previewable type identity.
+fn type_name<'a>(
+    cursor: &tree_sitter::TreeCursor<'a>,
+    selector: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let node = cursor.node();
+    let named = match selector {
+        "buffer.rs" => matches!(
+            node.kind(),
+            "struct_item" | "enum_item" | "trait_item" | "type_item"
+        ),
+        "buffer.py" => node.kind() == "class_definition",
+        "buffer.go" => matches!(node.kind(), "type_spec" | "type_alias"),
+        "buffer.c" | "buffer.cpp" => matches!(
+            node.kind(),
+            "struct_specifier"
+                | "union_specifier"
+                | "enum_specifier"
+                | "class_specifier"
+                | "alias_declaration"
+        ),
+        _ => false,
+    };
+    if named {
+        // A C/C++ tag reference without a body is not a new declaration.
+        if matches!(
+            node.kind(),
+            "struct_specifier" | "union_specifier" | "enum_specifier" | "class_specifier"
+        ) && node.child_by_field_name("body").is_none()
+        {
+            return None;
+        }
+        return node.child_by_field_name("name");
+    }
+    if matches!(selector, "buffer.c" | "buffer.cpp")
+        && cursor.field_name() == Some("declarator")
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "type_definition")
+    {
+        let mut name = node;
+        for _ in 0..128 {
+            if matches!(name.kind(), "type_identifier" | "identifier") {
+                return Some(name);
+            }
+            name = name.child_by_field_name("declarator").or_else(|| {
+                if name.kind() == "parenthesized_declarator" {
+                    name.named_child(0)
+                } else {
+                    None
+                }
+            })?;
+        }
+    }
+    if selector == "buffer.zig" && node.kind() == "variable_declaration" {
+        let name = node
+            .named_child(0)
+            .filter(|name| name.kind() == "identifier")?;
+        let mut walk = node.walk();
+        // Zig wraps a directly assigned container in an expression node.
+        let mut value = node.named_children(&mut walk).last()?;
+        for _ in 0..8 {
+            if matches!(
+                value.kind(),
+                "struct_declaration"
+                    | "union_declaration"
+                    | "enum_declaration"
+                    | "opaque_declaration"
+            ) {
+                return Some(name);
+            }
+            if value.named_child_count() != 1 {
+                return None;
+            }
+            value = value.named_child(0)?;
+        }
     }
     None
 }

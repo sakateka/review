@@ -41,6 +41,7 @@ actions! {
     SwitchPane => "switch_pane", CloseOrQuit => "close_or_quit", Quit => "quit", SearchSymbols => "search_symbols", GoToDefinition => "go_to_definition",
     GoToReferences => "go_to_references", GoBack => "go_back", OldSide => "old_side", NewSide => "new_side",
     ShowDocumentation => "show_documentation",
+    PreviewDefinition => "preview_definition",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
 }
 #[derive(Clone)]
@@ -92,6 +93,7 @@ impl Bindings {
             (NewSide, &["]"]),
             (AnalysisDetails, &["?"]),
             (ShowDocumentation, &["K"]),
+            (PreviewDefinition, &["P"]),
             (ToggleMark, &["space"]),
             (SearchWord, &["*"]),
             (SearchWordBackward, &["#"]),

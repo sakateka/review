@@ -33,6 +33,7 @@ pub struct App {
     pub side: ComparedSide,
     source: Option<usize>,
     pub documentation: bool,
+    pub definition_preview: bool,
     pub cursor: (usize, usize),
     history: Vec<View>,
     pub file_area: Rect,
@@ -63,6 +64,7 @@ struct View {
     cursor: (usize, usize),
     navigation: Option<Navigation>,
     documentation: bool,
+    definition_preview: bool,
     focus: Focus,
     status: String,
 }
@@ -106,6 +108,7 @@ impl App {
             side: ComparedSide::New,
             source: None,
             documentation: false,
+            definition_preview: false,
             cursor: (0, 0),
             file_area: Rect::default(),
             preview_area: Rect::default(),
@@ -363,19 +366,25 @@ impl App {
             Quit => return true,
             CloseOrQuit
                 if self.documentation
-                    || self
-                        .navigation
-                        .as_ref()
-                        .is_some_and(|nav| nav.operation == Operation::Documentation) =>
+                    || self.definition_preview
+                    || self.navigation.as_ref().is_some_and(|nav| {
+                        matches!(
+                            nav.operation,
+                            Operation::Documentation | Operation::PreviewDefinition
+                        )
+                    }) =>
             {
                 self.back()
             }
             CloseDiffView
                 if self.documentation
-                    || self
-                        .navigation
-                        .as_ref()
-                        .is_some_and(|nav| nav.operation == Operation::Documentation) =>
+                    || self.definition_preview
+                    || self.navigation.as_ref().is_some_and(|nav| {
+                        matches!(
+                            nav.operation,
+                            Operation::Documentation | Operation::PreviewDefinition
+                        )
+                    }) =>
             {
                 self.back()
             }
@@ -390,6 +399,7 @@ impl App {
             ShowDocumentation if !self.documentation => {
                 self.begin_navigation(Operation::Documentation)
             }
+            PreviewDefinition => self.begin_navigation(Operation::PreviewDefinition),
             SearchSymbols => self.begin_navigation(Operation::Search),
             GoToDefinition => self.begin_navigation(Operation::Definitions),
             GoToReferences => self.begin_navigation(Operation::References),
@@ -647,6 +657,7 @@ impl App {
             cursor: self.cursor,
             navigation: self.navigation.clone(),
             documentation: self.documentation,
+            definition_preview: self.definition_preview,
             focus: self.focus,
             status: self.status.clone(),
         });
@@ -659,6 +670,7 @@ impl App {
         self.invalidate_analysis();
         self.navigation = None;
         self.documentation = false;
+        self.definition_preview = false;
         self.source = None;
         self.history.clear();
     }
@@ -673,6 +685,7 @@ impl App {
             self.cursor = view.cursor;
             self.navigation = view.navigation;
             self.documentation = view.documentation;
+            self.definition_preview = view.definition_preview;
             self.focus = view.focus;
             self.status = view.status;
         } else {
@@ -709,7 +722,11 @@ impl App {
                     candidate.tag.col as usize,
                 )
             });
-        let position = if operation == Operation::Documentation && selected_definition.is_some() {
+        let position = if matches!(
+            operation,
+            Operation::Documentation | Operation::PreviewDefinition
+        ) && selected_definition.is_some()
+        {
             selected_definition
         } else if operation == Operation::Search {
             None
@@ -766,6 +783,26 @@ impl App {
         while let Some(results) = self.worker.poll() {
             if results.generation != self.generation {
                 continue;
+            }
+            if self
+                .navigation
+                .as_ref()
+                .is_some_and(|nav| nav.operation == Operation::PreviewDefinition)
+            {
+                if results.candidates.is_empty() {
+                    self.back();
+                    self.status = results.coverage;
+                    continue;
+                }
+                if results.candidates.len() == 1 {
+                    if let Some(nav) = &mut self.navigation {
+                        nav.candidates = results.candidates;
+                        nav.coverage = results.coverage;
+                        nav.selected = 0;
+                    }
+                    self.open_candidate();
+                    continue;
+                }
             }
             if self
                 .navigation
@@ -856,7 +893,11 @@ impl App {
                 "Analysis failed; {} for details",
                 self.bindings.label(Action::AnalysisDetails)
             )
-        } else if nav.operation == Operation::Documentation && nav.coverage.contains("truncated") {
+        } else if matches!(
+            nav.operation,
+            Operation::Documentation | Operation::PreviewDefinition
+        ) && nav.coverage.contains("truncated")
+        {
             format!("{} results (truncated)", nav.candidates.len())
         } else if nav.coverage.contains("no tagged symbol") {
             "No symbol at cursor".into()
@@ -883,8 +924,17 @@ impl App {
                 "No candidate selected; empty results never prove complete analysis".into();
             return;
         };
+        let is_definition_preview = self
+            .navigation
+            .as_ref()
+            .is_some_and(|nav| nav.operation == Operation::PreviewDefinition);
+        let preview_limited = self.navigation.as_ref().is_some_and(|nav| {
+            nav.coverage.contains("limit")
+                || nav.coverage.contains("truncated")
+                || nav.coverage.contains("recovered")
+        });
         let source = &self.capture.catalog.sources[candidate.source];
-        let (preview, left) = match Preview::target(
+        let (mut preview, left) = match Preview::target(
             source,
             candidate.tag.line as usize,
             candidate.tag.col as usize,
@@ -892,12 +942,31 @@ impl App {
         ) {
             Ok(target) => target,
             Err(error) => {
-                self.status = error.to_string();
+                if is_definition_preview {
+                    self.back();
+                }
+                self.status = format!("Preview unavailable: {error}");
                 return;
             }
         };
         let side = source.side;
-        self.save_view();
+        if is_definition_preview {
+            preview.title = Some(format!(
+                "Definition preview — {}",
+                preview.title.as_deref().unwrap_or("Captured source")
+            ));
+        }
+        // A unique preview returns straight to its origin. Ambiguous previews
+        // retain the chosen candidate list as the immediate return view.
+        if !is_definition_preview
+            || self
+                .navigation
+                .as_ref()
+                .is_some_and(|nav| nav.candidates.len() > 1)
+        {
+            self.save_view();
+        }
+        self.definition_preview = is_definition_preview || self.definition_preview;
         self.navigation = None;
         self.preview = Some(preview);
         self.side = side;
@@ -908,7 +977,19 @@ impl App {
         // expansion have separate screen coordinates.
         self.left = left;
         self.focus = Focus::Preview;
-        self.status.clear();
+        self.status = if is_definition_preview {
+            format!(
+                "Captured function/type preview; partial syntax analysis{}; {} returns",
+                if preview_limited {
+                    " (resource limits or recovered syntax)"
+                } else {
+                    ""
+                },
+                self.bindings.label(Action::GoBack)
+            )
+        } else {
+            String::new()
+        };
     }
     fn change_side(&mut self, side: ComparedSide) {
         if self.documentation {

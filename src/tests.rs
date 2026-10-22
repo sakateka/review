@@ -5268,3 +5268,440 @@ fn documentation_review_fix_candidate_truncation_is_visible() {
     assert_eq!(app.status, "1000 results (truncated)");
     assert!(screen_text(&screen(&mut app, 100, 20)).contains("1000 results (truncated)"));
 }
+
+#[test]
+fn preview_definitions_cover_verified_function_and_type_forms() {
+    let cases = [
+        (
+            "types.rs",
+            "struct Struct; enum Enum {} trait Trait {} type Alias = Struct; fn function() {}",
+            &["Struct", "Enum", "Trait", "Alias", "function"][..],
+        ),
+        (
+            "types.py",
+            "class Class:\n    pass\ndef function():\n    pass\n",
+            &["Class", "function"][..],
+        ),
+        (
+            "types.go",
+            "package p\ntype Struct struct {}\ntype Alias = Struct\nfunc function() {}",
+            &["Struct", "Alias", "function"][..],
+        ),
+        (
+            "types.c",
+            "struct Struct {}; union Union {}; enum Enum { Value }; typedef int Alias; int function(void) {}",
+            &["Struct", "Union", "Enum", "Alias", "function"][..],
+        ),
+        (
+            "types.cpp",
+            "class Class {}; struct Struct {}; union Union {}; enum Enum {}; typedef int Alias; using Using = Alias; void function() {}",
+            &[
+                "Class", "Struct", "Union", "Enum", "Alias", "Using", "function",
+            ][..],
+        ),
+        (
+            "types.zig",
+            "const Struct = struct {}; const Union = union { value: i32 }; const Enum = enum { value }; const Opaque = opaque {}; fn function() void {}",
+            &["Struct", "Union", "Enum", "Opaque", "function"][..],
+        ),
+        ("types.sh", "function function() { :; }", &["function"][..]),
+    ];
+    for (path, text, names) in cases {
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::New,
+            path.as_bytes().to_vec(),
+            text.as_bytes().to_vec(),
+        );
+        let index = navigation::Analysis::build(&catalog);
+        for name in names {
+            let result = index.query(
+                &catalog,
+                navigation::Request {
+                    generation: 0,
+                    position: None,
+                    operation: navigation::Operation::PreviewDefinition,
+                    query: (*name).into(),
+                    side: Some(source::ComparedSide::New),
+                },
+            );
+            assert_eq!(result.candidates.len(), 1, "{path} {name}: {result:?}");
+            assert!(result.candidates[0].tag.kind.is_definition());
+        }
+    }
+}
+
+#[test]
+fn preview_exact_identity_side_ambiguity_and_ineligible_definitions() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(source::ComparedSide::New, b"a.rs".to_vec(), b"struct Target;\nfn function() {}\nfn caller() { function(); }\nfn variable() { let Target = 1; }\n".to_vec());
+    catalog.insert(
+        source::ComparedSide::New,
+        b"b.rs".to_vec(),
+        b"fn function() {}\n".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::Old,
+        b"a.rs".to_vec(),
+        b"struct Target;\nfn function() {}\n".to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    let exact = navigation_at(
+        &catalog,
+        &index,
+        0,
+        2,
+        3,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert_eq!(exact.candidates.len(), 1);
+    assert_eq!(exact.candidates[0].source, 0);
+    let ambiguous = navigation_at(
+        &catalog,
+        &index,
+        0,
+        3,
+        14,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert_eq!(ambiguous.candidates.len(), 2);
+    let old = navigation_at(
+        &catalog,
+        &index,
+        2,
+        2,
+        3,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert_eq!(old.candidates.len(), 1);
+    assert_eq!(old.candidates[0].source, 2);
+    let variable = navigation_at(
+        &catalog,
+        &index,
+        0,
+        4,
+        20,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert!(variable.candidates.is_empty(), "{variable:?}");
+    let unmapped = navigation_at(
+        &catalog,
+        &index,
+        0,
+        1,
+        0,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert!(unmapped.candidates.is_empty());
+    for (path, text, name) in [
+        ("x.rs", "mod Module {}", "Module"),
+        ("x.py", "Variable = 1", "Variable"),
+        ("x.zig", "const Variable = 1;", "Variable"),
+        ("x.json", "{\"Target\": 1}", "Target"),
+        ("x.yaml", "Target: 1", "Target"),
+    ] {
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::New,
+            path.as_bytes().to_vec(),
+            text.as_bytes().to_vec(),
+        );
+        let result = navigation::Analysis::build(&catalog).query(
+            &catalog,
+            navigation::Request {
+                generation: 0,
+                position: None,
+                operation: navigation::Operation::PreviewDefinition,
+                query: name.into(),
+                side: None,
+            },
+        );
+        assert!(result.candidates.is_empty(), "{path}: {result:?}");
+    }
+}
+
+#[test]
+fn preview_returns_snapshot_origin_and_respects_configured_keys() {
+    let directory = fixture();
+    let text =
+        "struct CapturedType;\nfn captured_function() {}\nfn caller() { captured_function(); }\n";
+    std::fs::write(directory.path().join("one.rs"), text).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    for style in ["vim", "emacs"] {
+        let mut app = application(directory.path(), state.path());
+        app.bindings = config::Config::parse(&format!("[features]\nkeymap='{style}'"))
+            .unwrap()
+            .bindings(None)
+            .unwrap();
+        app.key(KeyCode::Char('/'));
+        for c in "captured_function".chars() {
+            app.key(KeyCode::Char(c));
+        }
+        app.key(KeyCode::Enter);
+        await_navigation(&mut app);
+        let origin = app.preview.as_ref().unwrap().clone();
+        let cursor = app.cursor;
+        let status = app.status.clone();
+        let selected = app.navigation.as_ref().unwrap().selected;
+        std::fs::write(
+            directory.path().join("one.rs"),
+            "fn live_replacement() {}\n",
+        )
+        .unwrap();
+        app.key(KeyCode::Char('P'));
+        await_navigation(&mut app);
+        assert!(
+            app.definition_preview,
+            "{} {:?}",
+            app.status,
+            app.navigation
+                .as_ref()
+                .map(|nav| (&nav.query, &nav.coverage, nav.candidates.len()))
+        );
+        assert!(
+            app.preview
+                .as_ref()
+                .unwrap()
+                .title
+                .as_ref()
+                .unwrap()
+                .contains("Definition preview")
+        );
+        assert!(
+            app.preview
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("captured_function"))
+        );
+        assert!(
+            !app.preview
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("live_replacement"))
+        );
+        app.key(KeyCode::Char(' '));
+        assert!(app.marks.iter().all(|mark| !mark));
+        app.key(KeyCode::Char('q'));
+        assert!(!app.definition_preview);
+        assert_eq!(app.preview.as_ref().unwrap().lines, origin.lines);
+        assert_eq!(app.cursor, cursor);
+        assert_eq!(app.status, status);
+        assert_eq!(app.navigation.as_ref().unwrap().selected, selected);
+        app.key(KeyCode::Char('P'));
+        app.key(KeyCode::Esc);
+        for _ in 0..20 {
+            app.poll_analysis();
+        }
+        assert!(!app.definition_preview);
+        app.key(KeyCode::Char('P'));
+        await_navigation(&mut app);
+        app.key(KeyCode::Char(','));
+        assert!(app.key(KeyCode::Char('q')));
+        std::fs::write(directory.path().join("one.rs"), text).unwrap();
+    }
+    let mut app = application(directory.path(), state.path());
+    app.bindings = config::Config::parse("[keybindings]\npreview_definition='D'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('P'));
+    assert!(app.navigation.is_none());
+    app.key(KeyCode::Char('D'));
+    assert!(app.status.contains("unavailable"));
+    app.key(KeyCode::Char('/'));
+    app.key(KeyCode::Char('P'));
+    assert_eq!(app.navigation.as_ref().unwrap().query, "P");
+    assert!(state.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn preview_limits_unicode_recovery_and_unrenderable_target_retain_origin() {
+    let mut catalog = source::Catalog::default();
+    let unicode = "\tstruct Café;\nfn broken( {\n";
+    catalog.insert(
+        source::ComparedSide::New,
+        b"unicode.rs".to_vec(),
+        unicode.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    let result = navigation_at(
+        &catalog,
+        &index,
+        0,
+        1,
+        10,
+        navigation::Operation::PreviewDefinition,
+    );
+    assert_eq!(result.candidates.len(), 1, "{result:?}");
+    assert_eq!(result.candidates[0].tag.col, 8);
+    assert!(result.coverage.contains("recovered"));
+    let (_, left) = preview::Preview::target(&catalog.sources[0], 1, 8, 4).unwrap();
+    assert!(left > 8);
+    for id in (0..1100).rev() {
+        catalog.insert(
+            source::ComparedSide::New,
+            format!("{id:04}.rs").into_bytes(),
+            b"struct Target;".to_vec(),
+        );
+    }
+    let result = navigation::Analysis::build(&catalog).query(
+        &catalog,
+        navigation::Request {
+            generation: 0,
+            position: None,
+            operation: navigation::Operation::PreviewDefinition,
+            query: "Target".into(),
+            side: Some(source::ComparedSide::New),
+        },
+    );
+    assert_eq!(result.candidates.len(), 1000);
+    assert_eq!(
+        catalog.sources[result.candidates[0].source].path,
+        b"0000.rs"
+    );
+    assert!(result.coverage.contains("truncated"));
+
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("{}struct TooFar;", "\n".repeat(21000)),
+    )
+    .unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "TooFar".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
+    let origin = app.preview.as_ref().unwrap().lines.clone();
+    let cursor = app.cursor;
+    app.key(KeyCode::Char('P'));
+    await_navigation(&mut app);
+    assert!(!app.definition_preview);
+    assert_eq!(app.preview.as_ref().unwrap().lines, origin);
+    assert_eq!(app.cursor, cursor);
+    assert!(app.status.contains("unavailable"), "{}", app.status);
+}
+
+#[test]
+fn preview_opaque_nested_navigation_and_file_selection_preserve_lifecycle() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "/// Captured help\nfn target() {}\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('P'));
+    assert!(app.status.contains("no mapped"));
+    assert!(app.preview.is_none());
+    app.capture.unavailable = Some("opaque".into());
+    app.key(KeyCode::Char('P'));
+    assert!(app.status.contains("opaque"));
+    assert!(app.preview.is_none());
+    app.capture.unavailable = None;
+    app.key(KeyCode::Char('/'));
+    for c in "target".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let origin = app.preview.as_ref().unwrap().lines.clone();
+    app.key(KeyCode::Char('P'));
+    await_navigation(&mut app);
+    assert!(app.definition_preview);
+    let definition = app.preview.as_ref().unwrap().lines.clone();
+    let cursor = app.cursor;
+    for nested in ["P", "K", "gd"] {
+        for c in nested.chars() {
+            app.key(KeyCode::Char(c));
+        }
+        await_navigation(&mut app);
+        if nested == "gd" {
+            app.key(KeyCode::Enter);
+            app.key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        }
+        app.key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.definition_preview, "{nested}");
+        assert_eq!(app.preview.as_ref().unwrap().lines, definition, "{nested}");
+        assert_eq!(app.cursor, cursor);
+    }
+    app.key(KeyCode::Char('q'));
+    assert!(!app.definition_preview);
+    assert_eq!(app.preview.as_ref().unwrap().lines, origin);
+    app.key(KeyCode::Char('P'));
+    // A file click must invalidate even a reply already queued by the worker.
+    app.file_area = ratatui::layout::Rect::new(0, 0, 10, 5);
+    app.mouse(
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+        std::time::Instant::now(),
+    );
+    for _ in 0..50 {
+        app.poll_analysis();
+        std::thread::yield_now();
+    }
+    assert!(!app.definition_preview);
+    assert!(app.navigation.is_none());
+    assert!(app.preview.is_none());
+}
+
+#[test]
+fn preview_cpp_template_type_parameter_names_are_ineligible_definitions() {
+    let text = "struct Target {};\ntemplate<class Target> void ordinary() {}\ntemplate<typename... Target> void variadic() {}\ntemplate<class Target = int> void defaulted() {}\ntemplate<class Other = Target> void default_reference() {}\n";
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"template.cpp".to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    for line in [2, 3, 4] {
+        let row = text.lines().nth(line - 1).unwrap();
+        let col = row.find("Target").unwrap();
+        let result = navigation_at(
+            &catalog,
+            &index,
+            0,
+            line,
+            col,
+            navigation::Operation::PreviewDefinition,
+        );
+        assert!(result.candidates.is_empty(), "line {line}: {result:?}");
+        assert!(result.coverage.contains("Preview unavailable"));
+    }
+    for (line, name) in [
+        (1, "Target"),
+        (2, "ordinary"),
+        (3, "variadic"),
+        (4, "defaulted"),
+        (5, "default_reference"),
+        (5, "Target"),
+    ] {
+        let row = text.lines().nth(line - 1).unwrap();
+        let col = row.find(name).unwrap();
+        let result = navigation_at(
+            &catalog,
+            &index,
+            0,
+            line,
+            col,
+            navigation::Operation::PreviewDefinition,
+        );
+        assert_eq!(result.candidates.len(), 1, "line {line} {name}: {result:?}");
+        assert_eq!(result.candidates[0].tag.name.as_ref(), name);
+    }
+}

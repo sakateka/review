@@ -18,6 +18,7 @@ pub enum Operation {
     Definitions,
     References,
     Documentation,
+    PreviewDefinition,
 }
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -92,6 +93,7 @@ pub struct Analysis {
     index: SymbolIndex,
     coverage: String,
     functions: Vec<(usize, crate::symbols::Function)>,
+    preview_definitions: Vec<Candidate>,
 }
 impl Analysis {
     pub fn build(catalog: &Catalog) -> Self {
@@ -105,6 +107,7 @@ impl Analysis {
     ) -> Self {
         let mut files = Vec::new();
         let mut functions = Vec::new();
+        let mut preview_definitions = Vec::new();
         let mut gaps = catalog.gaps.clone();
         let mut total = 0usize;
         let mut tags_total = 0;
@@ -132,12 +135,12 @@ impl Analysis {
             let extracted = std::panic::catch_unwind(|| {
                 if selector == "json" || selector == "yaml" {
                     let (tags, note) = structure(text, selector == "yaml");
-                    (tags, note, Vec::new())
+                    (tags, note, Vec::new(), Vec::new())
                 } else {
-                    crate::symbols::extract_functions(selector, text)
+                    crate::symbols::extract_inventory(selector, text)
                 }
             });
-            let (mut tags, note, extracted_functions) = match extracted {
+            let (mut tags, note, extracted_functions, types) = match extracted {
                 Ok(extracted) => extracted,
                 Err(_) => {
                     gaps.push(format!("{path}: extraction failed; skipped"));
@@ -152,6 +155,15 @@ impl Analysis {
                 tags.truncate(max_tags - tags_total);
                 gaps.push(format!("{path}: tag limit, truncated"));
             }
+            preview_definitions.extend(
+                extracted_functions
+                    .iter()
+                    .filter(|function| function.tag.kind.is_definition())
+                    .map(|function| function.tag.clone())
+                    .chain(types)
+                    .take(max_tags.saturating_sub(preview_definitions.len()))
+                    .map(|tag| Candidate { source: id, tag }),
+            );
             functions.extend(
                 extracted_functions
                     .into_iter()
@@ -167,6 +179,17 @@ impl Analysis {
                 tags,
             });
         }
+        preview_definitions.sort_by_key(|candidate| {
+            (
+                catalog.sources[candidate.source].side,
+                catalog.sources[candidate.source].path.clone(),
+                candidate.tag.line,
+                candidate.tag.col,
+            )
+        });
+        preview_definitions.dedup_by(|a, b| {
+            a.source == b.source && a.tag.line == b.tag.line && a.tag.col == b.tag.col
+        });
         let coverage = format!(
             "Partial name/syntax analysis, never binding or complete references. {}",
             gaps.join("; ")
@@ -175,6 +198,7 @@ impl Analysis {
             index: SymbolIndex::from_tags(files, 0, Duration::ZERO),
             coverage,
             functions,
+            preview_definitions,
         }
     }
     pub fn query(&self, catalog: &Catalog, mut request: Request) -> Results {
@@ -207,6 +231,76 @@ impl Analysis {
                 String::new()
             } else {
                 tag.name.to_string()
+            };
+        }
+        if request.operation == Operation::PreviewDefinition {
+            let at_position = |candidate: &&Candidate| {
+                request.position.is_some_and(|(source, line, col)| {
+                    candidate.source == source
+                        && candidate.tag.line as usize == line
+                        && candidate.tag.col as usize <= col
+                        && col < (candidate.tag.col + candidate.tag.len) as usize
+                })
+            };
+            let exact = self.preview_definitions.iter().find(at_position);
+            // An exact variable/field/key definition must never borrow an
+            // eligible same-name declaration elsewhere.
+            let ineligible_definition = exact.is_none()
+                && request.position.is_some_and(|(source, line, col)| {
+                    self.index
+                        .fresh_files()
+                        .iter()
+                        .find(|file| file.path == source.to_string())
+                        .is_some_and(|file| {
+                            file.tags.iter().any(|tag| {
+                                tag.kind.is_definition()
+                                    && tag.line as usize == line
+                                    && tag.col as usize <= col
+                                    && col < (tag.col + tag.len) as usize
+                            })
+                        })
+                });
+            let mut candidates: Vec<_> = if let Some(candidate) = exact {
+                vec![candidate.clone()]
+            } else if ineligible_definition || request.query.is_empty() {
+                Vec::new()
+            } else {
+                self.preview_definitions
+                    .iter()
+                    .filter(|candidate| {
+                        request
+                            .side
+                            .is_none_or(|side| catalog.sources[candidate.source].side == side)
+                            && candidate.tag.name.as_ref() == request.query
+                    })
+                    .take(MAX_RESULTS + 1)
+                    .cloned()
+                    .collect()
+            };
+            candidates.sort_by_key(|candidate| {
+                (
+                    catalog.sources[candidate.source].path.clone(),
+                    candidate.tag.line,
+                    candidate.tag.col,
+                )
+            });
+            candidates.dedup_by(|a, b| {
+                a.source == b.source && a.tag.line == b.tag.line && a.tag.col == b.tag.col
+            });
+            let prefix = if candidates.is_empty() {
+                "Preview unavailable: no captured function or type at this position. "
+            } else if candidates.len() > MAX_RESULTS {
+                "Preview candidates truncated at 1000. "
+            } else {
+                "Captured function/type preview. "
+            };
+            candidates.truncate(MAX_RESULTS);
+            return Results {
+                generation: request.generation,
+                query: request.query,
+                candidates,
+                coverage: format!("{prefix}{}", self.coverage),
+                documentation: None,
             };
         }
         if request.operation == Operation::Documentation {
@@ -297,7 +391,7 @@ impl Analysis {
                     Operation::Definitions => {
                         tag.kind.is_definition() && tag.name.as_ref() == request.query
                     }
-                    Operation::Documentation => unreachable!(),
+                    Operation::Documentation | Operation::PreviewDefinition => unreachable!(),
                     Operation::References => {
                         !tag.kind.is_definition() && tag.name.as_ref() == request.query
                     }

@@ -40,6 +40,14 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     git_run("config", "user.email", "pty@example.invalid")
     (repo / "docs.rs").write_text("/// Captured ambiguous documentation.\nfn doc_choice() {}\nmod other {\nfn doc_choice() {}\n}\nfn docs_caller() { doc_choice(); }\n")
     (repo / "target.rs").write_text("/// Captured terminal documentation.\nfn main_target() {}\n")
+    preview_caller = "fn preview_caller() { preview_unique(); let _: PreviewType; }"
+    preview_ambiguous_caller = "fn preview_ambiguous_caller() { preview_ambiguous(); }"
+    (repo / "preview.rs").write_text(
+        "struct PreviewType { value: usize }\nfn preview_unique() {}\n"
+        + preview_caller + "\nmod one { fn preview_ambiguous() {} }\n"
+        "mod two { fn preview_ambiguous() {} }\n" + preview_ambiguous_caller + "\n"
+        "fn variable_owner() { let preview_variable = 1; }\n"
+    )
     long_line = "\t// " + "界e\u0301🙂" * 150 + "\n"
     (repo / "caller.rs").write_text("fn caller() { main_target(); }\n" + long_line)
     fixture_root = pathlib.Path(__file__).resolve().parent / "fixtures" / "navigation"
@@ -460,6 +468,89 @@ go_to_definition = "gD"
     docs_config.unlink()
     assert docs_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     print("PTY passed: captured function documentation, custom/disabled keys in both styles, effective help, dismissal, tiny terminals and global quit", flush=True)
+
+    # Definition previews use captured function/type targets and reversible views.
+    preview_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    preview_marks = {str(p.relative_to(root / "state")): p.read_bytes() for p in (root / "state").rglob("*") if p.is_file()}
+    for symbol in ["preview_unique", "PreviewType"]:
+        for dismiss in [b"q", b"\x1b", b"\x0f"]:
+            session = Session()
+            session.wait_text("Files")
+            session.send(b"/preview_caller\r")
+            session.wait_text("Search candidates")
+            session.send(b"\r")
+            session.wait_text("Captured old preview.rs")
+            session.send(b"0" + str(preview_caller.index(symbol)).encode() + b"l")
+            origin = (session.text(), session.row, session.col)
+            session.send(b"P")
+            session.wait_text("Definition preview")
+            session.wait_text("Captured old preview.rs")
+            session.send(b" ")  # Viewing never toggles the selected file's mark.
+            session.resize(3, 8)
+            session.resize(30, 140)
+            session.send(dismiss)
+            session.wait_text("Captured old preview.rs")
+            assert (session.text(), session.row, session.col) == origin, "P dismissal lost source origin"
+            session.send(b",q")
+            session.finish()
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"/preview_ambiguous_caller\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old preview.rs")
+    session.send(b"0" + str(preview_ambiguous_caller.index("preview_ambiguous();")).encode() + b"lP")
+    session.wait_text("PreviewDefinition candidates")
+    session.wait_text("2 results")
+    session.send(b"j")
+    origin = (session.text(), session.row, session.col)
+    session.send(b"\r")
+    session.wait_text("Definition preview")
+    session.send(b"q")
+    session.wait_text("PreviewDefinition candidates")
+    assert (session.text(), session.row, session.col) == origin, "P lost ambiguous candidate selection"
+    session.send(b"q")
+    session.wait_text("Captured old preview.rs")
+    session.send(b",q")
+    session.finish()
+    preview_config = root / "preview.toml"
+    for style in ["vim", "emacs"]:
+        for binding in ["D", ""]:
+            preview_config.write_text(f'[features]\nkeymap="{style}"\n[keybindings]\npreview_definition="{binding}"\n')
+            command = [str(binary), "--config", str(preview_config)]
+            help_result = subprocess.run([*command, "--help"], env=env, capture_output=True, text=True, check=True)
+            assert f"preview_definition: {binding or '(disabled)'}\n" in help_result.stdout
+            session = Session([*command, "--", "HEAD"])
+            session.wait_text("Files")
+            session.send(b"/PreviewType\r")
+            session.wait_text("Search candidates")
+            origin = (session.text(), session.row, session.col)
+            session.send(b"P")
+            assert (session.text(), session.row, session.col) == origin, "replaced default P remained active"
+            session.send(b"D")
+            if binding:
+                session.wait_text("Definition preview")
+                session.wait_text("Captured old preview.rs")
+                session.send(b"q")
+                session.wait_text("Search candidates")
+                assert (session.text(), session.row, session.col) == origin, "P lost selected exact candidate"
+            else:
+                assert (session.text(), session.row, session.col) == origin, "disabled P action ran"
+            session.send(b",q")
+            session.finish()
+    preview_config.unlink()
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"/preview_variable\r")
+    session.wait_text("Search candidates")
+    session.send(b"P")
+    session.wait_text("Preview unavailable")
+    session.wait_text("Search candidates")
+    session.send(b",q")
+    session.finish()
+    assert preview_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    assert preview_marks == {str(p.relative_to(root / "state")): p.read_bytes() for p in (root / "state").rglob("*") if p.is_file()}
+    print("PTY passed: captured function/type previews, exact return, ambiguity, unavailable targets, custom/disabled keys, read-only marks, tiny terminals and global quit", flush=True)
 
     # q closes a view first; leader-q exits directly from every context.
     for source_view in [False, True]:
