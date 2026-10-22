@@ -155,6 +155,9 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
                 assert termios.tcgetattr(self.slave) == self.original, "PTY termios not restored"
                 assert b"\x1b[?1049l" in self.output, "alternate screen not restored"
                 assert b"\x1b[?25h" in self.output, "cursor not restored"
+                for mode in (1000, 1002, 1003, 1006, 1015):
+                    assert f"\x1b[?{mode}h".encode() in self.output, ("mouse capture not enabled", mode)
+                    assert f"\x1b[?{mode}l".encode() in self.output, ("mouse capture not restored", mode)
             finally:
                 self.cleanup()
         def cleanup(self):
@@ -169,7 +172,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     for name in fixture_names:
         symbol = "navtarget_" + name.split(".")[-1] + "_end"
-        session.send(b"hs" + symbol.encode() + b"\r")
+        session.send(b"\ths" + symbol.encode() + b"\r")
         session.wait_text("2 results")
         session.send(b"\r")
         session.wait_text("Captured old " + name)
@@ -181,7 +184,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.wait_text("1 results")
         session.send(b"h")
     for extension in ["yaml", "json"]:
-        session.send(b"hsnavport_" + extension.encode() + b"\r")
+        session.send(b"\thsnavport_" + extension.encode() + b"\r")
         session.wait_text("Search candidates")
         session.send(b"\r")
         session.wait_text("Captured old sample." + extension)
@@ -194,14 +197,14 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.send(b"\r")
     session.wait_text("界")
     session.send(b"\x1b[C"*20 + b"\x1b[D"*5)
-    session.send(b"hs")
+    session.send(b"\ths")
     session.send(b"main_target\r")
     session.wait_text("results")
     session.send(b"\r")
     session.wait_text("Captured old")
     session.send(b"]r")
     session.wait_text("References")
-    session.send(b"\rbbh")
+    session.send(b"\rbb\th")
     for shape in [(1, 1), (3, 8), (30, 140)]:
         session.resize(*shape)
     session.send(b" ")
@@ -288,6 +291,94 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.finish(expected)
         assert snapshot(cwd) == before, "installed review modified comparison inputs"
 
+    # R13: installed cursor/mouse behavior, independently captured immutable inputs.
+    mouse_repo = root / "cursor-mouse"
+    mouse_repo.mkdir()
+    def mouse_git(*words):
+        return subprocess.check_output([git, *words], cwd=mouse_repo, env=env, stderr=subprocess.STDOUT)
+    mouse_git("init", "-q")
+    mouse_git("config", "user.name", "Cursor acceptance")
+    mouse_git("config", "user.email", "cursor@example.invalid")
+    for index in range(15):
+        (mouse_repo / f"a{index:02}.rs").write_text(f"\tfn old_symbol_{index:02}() {{}}\n" + "\t// 界e\u0301\\ old\n" * 45)
+    mouse_git("add", ".")
+    mouse_git("commit", "-qm", "captured old sides")
+    for index in range(15):
+        (mouse_repo / f"a{index:02}.rs").write_text(f"\tfn new_symbol_{index:02}() {{}}\n" + "\t// 界e\u0301\\ new\n" * 45)
+    mouse_before = snapshot(mouse_repo)
+    state_before_mouse = snapshot(root / "state")
+    session = Session([str(binary), "--", "HEAD"], cwd=mouse_repo)
+    closed(session)
+    def pointer(code, column, row, release=False):
+        return f"\x1b[<{code};{column+1};{row+1}{'m' if release else 'M'}".encode()
+    def locate(text):
+        for row, line in enumerate(session.text().splitlines()):
+            if text in line:
+                return line.index(text), row
+        raise AssertionError((text, session.text()))
+    # File wheel scrolling does not select: Enter still opens the initial file.
+    session.resize(12, 140)
+    session.send(pointer(65, 2, 2))
+    closed(session)
+    session.send(b"\r")
+    session.wait_text("old_symbol_00")
+    session.resize(30, 140)
+    assert snapshot(root / "state") == state_before_mouse
+    # Select a visible file once: preview closes. Two same-file presses open it.
+    x, y = locate("a03.rs")
+    session.send(pointer(0, x, y) + pointer(0, x, y, True))
+    closed(session)
+    session.pump(0.5)
+    session.send(pointer(0, x, y) + pointer(0, x, y, True) + pointer(0, x, y) + pointer(0, x, y, True))
+    session.wait_text("old_symbol_03")
+    # Scroll to the added rows, then click the exact transformed/tabbed symbol.
+    # New rows follow 46 removed rows, so page down twice then wheel back as needed.
+    session.send(b"\x1b[6~" * 2)
+    session.wait_text("new_symbol_03")
+    x, y = locate("new_symbol_03")
+    session.send(pointer(0, x + 2, y) + pointer(0, x + 2, y, True) + b"d")
+    session.wait_text('Definitions candidates for "new_symbol_03"')
+    session.wait_text("1 results")
+    session.send(b"\r")
+    session.wait_text("Captured new a03.rs")
+    cursor = (session.row, session.col)
+    session.send(b"l")
+    assert (session.row, session.col) == (cursor[0], cursor[1] + 1), (cursor, session.row, session.col)
+    session.send(b"h")
+    assert (session.row, session.col) == cursor
+    session.send(b"d")
+    session.wait_text('Definitions candidates for "new_symbol_03"')
+    session.send(b"b")
+    session.wait_text("Captured new a03.rs")
+    assert (session.row, session.col) == cursor, "back did not restore the cursor"
+    session.send(b"[d")
+    session.wait_text('Definitions candidates for "old_symbol_03"')
+    session.send(b"b")
+    session.wait_text("Captured old a03.rs")
+    # Wheel the preview while files hold focus, then move files to prove focus stayed.
+    session.send(b"\t")
+    session.send(pointer(65, 80, 5))
+    session.send(b"j")
+    closed(session)
+    # Reviewed files have the same single/double click opening contract.
+    session.send(b" ")
+    session.wait_text("Review mark saved")
+    state_after_mark = snapshot(root / "state")
+    x, y = locate("a04.rs")
+    session.send(pointer(0, x, y) + pointer(0, x, y, True))
+    closed(session)
+    session.pump(0.5)
+    session.send(pointer(0, x, y) + pointer(0, x, y, True) + pointer(0, x, y) + pointer(0, x, y, True))
+    session.wait_text("Diff")
+    session.send(b"\x1b[6~\x1b[5~")
+    for shape in [(1, 1), (3, 8), (30, 140)]:
+        session.resize(*shape)
+    session.send(b"q")
+    session.finish()
+    assert snapshot(mouse_repo) == mouse_before, "cursor/mouse review changed repository bytes"
+    assert snapshot(root / "state") == state_after_mark, "cursor/mouse input changed marks"
+    print("PTY passed: R13 exact cursor navigation, file clicks, wheels, history, side switching, resize and read-only state", flush=True)
+
     # R2-R10: exact ticket invocation, explicit marks, closed previews and gray
     # names after restart, selective invalidation, ref movement and isolation.
     branch_args = [left, right]
@@ -302,7 +393,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     assert "+ one.rs" not in session.text(), "opening a diff implicitly marked it"
     assert snapshot(root / "state") == state_before, "viewing wrote review state"
-    session.send(b"h ")
+    session.send(b"\th ")
     session.wait_text("Review mark saved")
     session.send(b"j ")
     session.wait_text("+ two.rs")
@@ -432,4 +523,4 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     assert merge.returncode == 1, merge.stdout
     check_native(["--cc"], True)
 
-print("PTY passed: installed language navigation, terminal lifecycle, R1-R12 workflow, branch/ref/staged/worktree/no-index invalidation, Git compatibility and original-output fallback" + (", injected panic/I/O failure" if args.test_binary else ""))
+print("PTY passed: installed language navigation, terminal lifecycle, R1-R13 workflow, branch/ref/staged/worktree/no-index invalidation, Git compatibility and original-output fallback" + (", injected panic/I/O failure" if args.test_binary else ""))

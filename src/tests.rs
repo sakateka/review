@@ -418,7 +418,9 @@ fn unicode_tabs_clipping_and_scroll_bounds_use_screen_coordinates() {
     }
     let preview = app.preview.as_ref().unwrap();
     assert_eq!(app.top, preview.lines.len().saturating_sub(app.viewport.0));
-    assert_eq!(app.left, preview.width.saturating_sub(app.viewport.1));
+    assert_eq!(app.cursor.0, preview.lines.len() - 1);
+    assert_eq!(app.cursor.1, preview.lines.last().unwrap().width() - 1);
+    assert!(app.cursor.1 >= app.left && app.cursor.1 < app.left + app.viewport.1);
 }
 
 #[test]
@@ -3133,7 +3135,7 @@ fn navigation_new_search_editing_rejects_inflight_results() {
 }
 
 #[test]
-fn navigation_horizontal_movement_uses_scroll_point_after_target_opening() {
+fn navigation_horizontal_movement_uses_cursor_after_target_opening() {
     let directory = fixture();
     std::fs::write(
         directory.path().join("one.rs"),
@@ -3150,14 +3152,14 @@ fn navigation_horizontal_movement_uses_scroll_point_after_target_opening() {
     await_navigation(&mut app);
     app.key(KeyCode::Enter);
     app.viewport = (1, 1);
-    for _ in 0..3 {
+    for _ in 0..14 {
         app.key(KeyCode::Right);
     }
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "second");
     app.key(KeyCode::Enter);
-    for _ in 0..5 {
+    for _ in 0..14 {
         app.key(KeyCode::Left);
     }
     app.key(KeyCode::Char('d'));
@@ -3309,4 +3311,304 @@ fn review_fix_structural_tag_limit_is_explicit_at_exact_cap() {
             .contains("structural tag limit (100000), truncated")
     );
     assert!(results.candidates.is_empty());
+}
+
+fn mouse_event(
+    kind: crossterm::event::MouseEventKind,
+    x: u16,
+    y: u16,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn cursor_cell_maps_share_tabs_unicode_escapes_and_clipping() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"cells.rs".to_vec(),
+        "\t界e\u{301}\\\u{1b}a\n\n".as_bytes().to_vec(),
+    );
+    let preview = preview::Preview::source(&catalog.sources[0]);
+    assert_eq!(preview.lines[0].to_string(), "    界e\u{301}\\\\\\u{1b}a");
+    for (cell, scalar) in [
+        (0, 0),
+        (3, 0),
+        (4, 1),
+        (5, 1),
+        (6, 2),
+        (7, 4),
+        (8, 4),
+        (9, 5),
+        (14, 5),
+        (15, 6),
+    ] {
+        assert_eq!(preview.hit_test(0, cell), Some(scalar), "cell {cell}");
+    }
+    assert_eq!(preview.hit_test(0, 16), None);
+    assert_eq!(preview.hit_test(1, 0), None);
+    assert_eq!(preview.hit_test(2, 0), None);
+    assert_eq!(preview.visible_hit(0, 5, 5, 10), None);
+    assert_eq!(preview.visible_hit(0, 4, 4, 1), None);
+    assert_eq!(preview.visible_hit(0, 5, 4, 2), Some(1));
+    catalog.insert(
+        source::ComparedSide::New,
+        b"bad.rs".to_vec(),
+        vec![0xff, b'a', b'\n'],
+    );
+    let invalid = preview::Preview::source(&catalog.sources[1]);
+    assert!(
+        invalid
+            .locations
+            .iter()
+            .all(|position| *position == (None, None))
+    );
+    assert!(invalid.reason.unwrap().contains("invalid UTF-8"));
+    catalog.insert(
+        source::ComparedSide::New,
+        b"omitted.rs".to_vec(),
+        "界".repeat(4100).into_bytes(),
+    );
+    let omitted = preview::Preview::source(&catalog.sources[2]);
+    assert_eq!(omitted.hit_test(0, 8191), Some(4095));
+    assert_eq!(omitted.hit_test(0, 8192), None);
+    assert!(omitted.reason.unwrap().contains("omitted columns"));
+    catalog.insert(
+        source::ComparedSide::New,
+        b"combining.rs".to_vec(),
+        "\\\u{301}x".as_bytes().to_vec(),
+    );
+    let combining = preview::Preview::source(&catalog.sources[3]);
+    assert_eq!(combining.lines[0].to_string(), "\\\\\u{301}x");
+    assert_eq!(combining.hit_test(0, 2), Some(2));
+}
+
+#[test]
+fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let directory = fixture();
+    std::fs::write(directory.path().join("one.rs"), "\tfn old_symbol() {}\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "old"]);
+    std::fs::write(directory.path().join("one.rs"), "\tfn new_symbol() {}\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let old_row = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .locations
+        .iter()
+        .position(|row| *row == (Some(1), None))
+        .unwrap();
+    let new_row = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .locations
+        .iter()
+        .position(|row| *row == (None, Some(1)))
+        .unwrap();
+    app.cursor = (0, 0);
+    app.key(KeyCode::Char('d'));
+    assert!(app.navigation.is_none());
+    assert!(app.status.contains("no mapped"));
+    // The prefix is unmapped, including when a side is available.
+    app.cursor = (old_row, 0);
+    assert_eq!(app.side, source::ComparedSide::New);
+    app.key(KeyCode::Char('d'));
+    assert!(app.navigation.is_none());
+    assert!(app.status.contains("no mapped"));
+    // A tab starts after the diff prefix: 1 + 4 + "fn ".
+    let x = app.preview_area.x + 8;
+    let y = app.preview_area.y + old_row as u16;
+    app.mouse(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), x, y),
+        std::time::Instant::now(),
+    );
+    let saved = (app.cursor, app.top, app.left);
+    app.mouse(
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            app.preview_area.right() - 1,
+            y,
+        ),
+        std::time::Instant::now(),
+    );
+    assert_eq!((app.cursor, app.top, app.left), saved);
+    assert!(app.status.contains("No retained text"));
+    app.mouse(
+        mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            x,
+            app.preview_area.bottom() - 1,
+        ),
+        std::time::Instant::now(),
+    );
+    assert_eq!((app.cursor, app.top, app.left), saved);
+    // A live edit cannot replace the captured symbol.
+    std::fs::write(directory.path().join("one.rs"), "fn unrelated_live() {}\n").unwrap();
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().query, "old_symbol");
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
+    app.key(KeyCode::Char('b'));
+    assert_eq!((app.cursor, app.top, app.left), saved);
+    app.cursor = (new_row, 8);
+    app.key(KeyCode::Char(']'));
+    app.key(KeyCode::Char('r'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().query, "new_symbol");
+    app.key(KeyCode::Char('b'));
+    // A mapped whitespace cell cannot search forward to the next identifier.
+    app.cursor = (new_row, 5 + 2);
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert!(app.navigation.as_ref().unwrap().query.is_empty());
+    assert!(app.navigation.as_ref().unwrap().candidates.is_empty());
+    assert!(app.status.contains("exact cursor"));
+    assert!(app.marks.iter().all(|mark| !mark));
+    assert!(state.path().read_dir().unwrap().next().is_none());
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("one.rs")).unwrap(),
+        "fn unrelated_live() {}\n"
+    );
+}
+
+#[test]
+fn mouse_files_scroll_without_selecting_and_require_timed_same_file_opening() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use std::time::{Duration, Instant};
+    let directory = fixture();
+    for index in 0..15 {
+        std::fs::write(
+            directory.path().join(format!("extra{index:02}.rs")),
+            "fn old() {}\n",
+        )
+        .unwrap();
+    }
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "many files"]);
+    for index in 0..15 {
+        std::fs::write(
+            directory.path().join(format!("extra{index:02}.rs")),
+            "fn new() {}\n",
+        )
+        .unwrap();
+    }
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    screen(&mut app, 80, 12);
+    let (x, y) = (app.file_area.x, app.file_area.y);
+    let now = Instant::now();
+    app.mouse(mouse_event(MouseEventKind::ScrollDown, x, y), now);
+    assert_eq!(app.file_offset, 3);
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.focus, Focus::Files);
+    assert!(app.preview.is_none());
+    screen(&mut app, 80, 12);
+    let click = mouse_event(MouseEventKind::Down(MouseButton::Left), x, y);
+    app.mouse(click, now);
+    assert_eq!(app.selected, 3);
+    assert!(app.preview.is_none());
+    app.mouse(click, now + Duration::from_millis(401));
+    assert!(app.preview.is_none());
+    app.mouse(click, now + Duration::from_millis(700));
+    assert!(app.preview.is_some());
+    assert_eq!(app.focus, Focus::Preview);
+    screen(&mut app, 80, 12);
+    app.mouse(mouse_event(MouseEventKind::ScrollDown, x, y), now);
+    assert_eq!(app.focus, Focus::Preview);
+    assert_eq!(app.selected, 3);
+    assert!(app.preview.is_some());
+    app.mouse(click, now + Duration::from_secs(1));
+    assert!(app.preview.is_none());
+    assert_eq!(app.focus, Focus::Files);
+    assert!(app.marks.iter().all(|mark| !mark));
+}
+
+#[test]
+fn cursor_wheel_resize_and_focus_movement_preserve_viewport_bounds() {
+    use crossterm::event::MouseEventKind;
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn target() {}\n".repeat(50),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 80, 12);
+    let before = app.cursor;
+    app.key(KeyCode::Char('l'));
+    assert_eq!(app.cursor.1, before.1 + 1);
+    app.key(KeyCode::Char('h'));
+    assert_eq!(app.cursor, before);
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Tab);
+    let now = std::time::Instant::now();
+    app.mouse(
+        mouse_event(
+            MouseEventKind::ScrollDown,
+            app.preview_area.x,
+            app.preview_area.y,
+        ),
+        now,
+    );
+    assert_eq!(app.focus, Focus::Files);
+    assert_eq!(app.selected, 0);
+    assert_eq!(app.top, 3);
+    assert!(app.cursor.0 >= app.top && app.cursor.0 < app.top + app.viewport.0);
+    for (width, height) in [(1, 1), (3, 2), (10, 7), (100, 30)] {
+        screen(&mut app, width, height);
+        assert!(app.cursor.0 < app.preview.as_ref().unwrap().lines.len());
+        if app.viewport.0 > 0 {
+            assert!(app.cursor.0 >= app.top && app.cursor.0 < app.top + app.viewport.0);
+        }
+        if app.viewport.1 > 0 {
+            assert!(app.cursor.1 >= app.left && app.cursor.1 < app.left + app.viewport.1);
+        }
+    }
+    app.key(KeyCode::Char('h'));
+    assert!(app.preview.is_none());
+    assert!(app.marks.iter().all(|mark| !mark));
+}
+
+#[test]
+fn review_fix_target_retention_uses_expanded_tab_mapping() {
+    let mut catalog = source::Catalog::default();
+    for tabs in [1024, 1000] {
+        catalog.insert(
+            source::ComparedSide::New,
+            format!("tabs{tabs}.rs").into_bytes(),
+            format!("{}fn target() {{}}\n", "\t".repeat(tabs)).into_bytes(),
+        );
+    }
+    let excluded = &catalog.sources[0];
+    assert!(
+        !preview::Preview::source(excluded).lines[0]
+            .to_string()
+            .contains("target")
+    );
+    assert!(
+        preview::Preview::target(excluded, 1, 1027, 6)
+            .unwrap_err()
+            .to_string()
+            .contains("4096-grapheme")
+    );
+    let (preview, left) = preview::Preview::target(&catalog.sources[1], 1, 1003, 6).unwrap();
+    assert_eq!(left, 4003);
+    assert!(
+        preview.visible(0, left, 1, 20)[0]
+            .to_string()
+            .starts_with("target")
+    );
 }

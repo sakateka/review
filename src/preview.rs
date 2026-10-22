@@ -16,6 +16,8 @@ pub struct Preview {
     pub width: usize,
     /// One-based old/new source rows, independent of syntax enrichment.
     pub locations: Vec<(Option<usize>, Option<usize>)>,
+    /// Display cells to zero-based Unicode scalar columns; prefixes have no source.
+    pub cells: Vec<Vec<Option<usize>>>,
 }
 
 type MappedColors<'a> = (
@@ -114,7 +116,13 @@ fn offsets(text: &str) -> Vec<usize> {
 
 impl Preview {
     pub fn original(bytes: &[u8]) -> Self {
-        Self::compose(&crate::git::visible_bytes(bytes), None, None, false)
+        {
+            let mut preview =
+                Self::compose(&crate::git::visible_bytes(bytes), None, None, false, false);
+            preview.locations.fill((None, None));
+            preview.cells.clear();
+            preview
+        }
     }
 
     pub fn item(cwd: &Path, item: &Item) -> Self {
@@ -140,14 +148,19 @@ impl Preview {
         let escaped = text
             .is_err()
             .then(|| crate::git::visible_bytes(&item.patch));
-        Self::compose(
+        let mut preview = Self::compose(
             text.unwrap_or_else(|_| escaped.as_deref().expect("escaped invalid bytes")),
             mapped
                 .as_ref()
                 .map(|(sources, old, new)| (*sources, old.as_slice(), new.as_slice())),
             reason,
             text.is_ok(),
-        )
+            false,
+        );
+        if text.is_err() {
+            preview.locations.fill((None, None));
+        }
+        preview
     }
 
     fn compose(
@@ -155,6 +168,7 @@ impl Preview {
         mapped: Option<MappedColors<'_>>,
         reason: Option<String>,
         escape_backslashes: bool,
+        source_view: bool,
     ) -> Self {
         let mut rows = patch.split_terminator('\n');
         let raw: Vec<_> = rows.by_ref().take(20000).collect();
@@ -164,6 +178,9 @@ impl Preview {
         let source_lines: Vec<_> = raw
             .iter()
             .map(|line| {
+                if source_view {
+                    return false;
+                }
                 if let Some((_, old_count, _, new_count)) = source::hunk(line) {
                     remaining = (old_count, new_count);
                     return false;
@@ -217,6 +234,7 @@ impl Preview {
         let mut new_line = 0;
         let mut lines = Vec::new();
         let mut locations = Vec::new();
+        let mut cells = Vec::new();
         for (index, text) in raw.iter().enumerate() {
             if let Some((old, _, new, _)) = source::hunk(text) {
                 old_line = old.saturating_sub(1);
@@ -262,9 +280,24 @@ impl Preview {
                 (None, None)
             });
             let mut spans = Vec::new();
-            omitted_columns |= text.graphemes(true).nth(4096).is_some();
+            let graphemes: Vec<_> = if source_line {
+                std::iter::once((0, &text[..1]))
+                    .chain(
+                        text[1..]
+                            .grapheme_indices(true)
+                            .map(|(byte, grapheme)| (byte + 1, grapheme)),
+                    )
+                    .take(4097)
+                    .collect()
+            } else {
+                text.grapheme_indices(true).take(4097).collect()
+            };
+            omitted_columns |= graphemes.len() > 4096;
             let mut column: usize = 0;
-            for (byte, grapheme) in text.grapheme_indices(true).take(4096) {
+            let mut scalar: usize = 0;
+            let mut row_cells = Vec::new();
+            let mut retained_graphemes = 0;
+            for (byte, grapheme) in graphemes.into_iter().take(4096) {
                 let mut style = base;
                 if source_line && byte > 0 {
                     if let Some((colors, offset)) = map
@@ -278,15 +311,15 @@ impl Preview {
                         style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
                     }
                 }
-                let rendered = if grapheme == "\\" && escape_backslashes {
-                    "\\\\".into()
-                } else if grapheme == "\t" {
+                let rendered = if grapheme == "\t" {
                     " ".repeat(4 - column.saturating_sub(usize::from(source_line)) % 4)
                 } else {
                     grapheme
                         .chars()
                         .map(|character| {
-                            if character.is_control() {
+                            if character == '\\' && escape_backslashes {
+                                "\\\\".into()
+                            } else if character.is_control() {
                                 character.escape_default().to_string()
                             } else {
                                 character.to_string()
@@ -294,9 +327,26 @@ impl Preview {
                         })
                         .collect::<String>()
                 };
+                if source_view {
+                    retained_graphemes += rendered.graphemes(true).count();
+                    if retained_graphemes > 4096 {
+                        omitted_columns = true;
+                        break;
+                    }
+                }
+                let source_column = if source_line && byte == 0 {
+                    None
+                } else {
+                    Some(scalar)
+                };
+                row_cells.extend(std::iter::repeat_n(source_column, rendered.width()));
+                if !(source_line && byte == 0) {
+                    scalar += grapheme.chars().count();
+                }
                 column += rendered.width();
                 spans.push(Span::styled(rendered, style));
             }
+            cells.push(row_cells);
             lines.push(Line::from(spans));
             if source_line {
                 if prefix != Some(b'+') {
@@ -313,6 +363,7 @@ impl Preview {
             reason,
             width,
             locations,
+            cells,
         };
         if omitted_rows {
             preview.add_reason("Display omitted rows after 20000");
@@ -350,24 +401,42 @@ impl Preview {
             .nth(line - 1)
             .ok_or_else(|| anyhow::anyhow!("Target source row unavailable"))?;
         let target_end = col.saturating_add(len);
-        let through_target: String = row.chars().take(target_end).collect();
-        // Source views apply visible_bytes before compose truncates graphemes.
-        // Validate against that same escaped representation, including doubled
-        // backslashes and escaped control characters.
-        let escaped = crate::git::visible_bytes(through_target.as_bytes());
+        let preview = Self::source(source);
+        let cells = preview.cells.get(line - 1);
+        let mut scalar = 0;
+        let mut left = None;
+        let mut retained = len > 0 && row.chars().count() >= target_end;
+        // Validate the actual retained transform, including tab expansion and
+        // graphemes whose combining scalars share their first scalar's cells.
+        for grapheme in row.graphemes(true) {
+            let end = scalar + grapheme.chars().count();
+            if scalar < target_end && end > col {
+                let cell =
+                    cells.and_then(|cells| cells.iter().position(|cell| *cell == Some(scalar)));
+                retained &= cell.is_some();
+                if left.is_none() {
+                    left = cell;
+                }
+            }
+            scalar = end;
+        }
         anyhow::ensure!(
-            through_target.chars().count() == target_end
-                && escaped.graphemes(true).take(4097).count() <= 4096,
+            retained && left.is_some(),
             "Target unavailable: scalar column {} exceeds the retained 4096-grapheme row window",
             col + 1
         );
-        let prefix: String = row.chars().take(col).collect();
-        let rendered = Self::original(prefix.as_bytes());
-        Ok((Self::source(source), rendered.width))
+        Ok((preview, left.expect("validated retained target")))
     }
 
     pub fn source(source: &source::CapturedSource) -> Self {
-        let mut preview = Self::original(&source.bytes);
+        let mut preview = match std::str::from_utf8(&source.bytes) {
+            Ok(text) => Self::compose(text, None, None, true, true),
+            Err(_) => {
+                let mut preview = Self::original(&source.bytes);
+                preview.add_reason("Source positions unavailable: invalid UTF-8");
+                return preview;
+            }
+        };
         preview.locations = (1..=preview.lines.len())
             .map(|line| match source.side {
                 source::ComparedSide::Old => (Some(line), None),
@@ -381,6 +450,37 @@ impl Preview {
             &source.identity[..12]
         ));
         preview
+    }
+
+    /// Bounded hit testing uses the retained render transform, never a source guess.
+    pub fn hit_test(&self, row: usize, column: usize) -> Option<usize> {
+        self.cells.get(row)?.get(column).copied().flatten()
+    }
+
+    /// A clipped wide grapheme is rendered as padding and has no source target.
+    pub fn visible_hit(
+        &self,
+        row: usize,
+        column: usize,
+        left: usize,
+        width: usize,
+    ) -> Option<usize> {
+        if column < left || column >= left.saturating_add(width) {
+            return None;
+        }
+        let mut cell = 0;
+        for span in &self.lines.get(row)?.spans {
+            for grapheme in span.content.graphemes(true) {
+                let end = cell + grapheme.width();
+                if column >= cell && column < end {
+                    return (cell >= left && end <= left.saturating_add(width))
+                        .then(|| self.hit_test(row, column))
+                        .flatten();
+                }
+                cell = end;
+            }
+        }
+        None
     }
 
     pub fn visible(

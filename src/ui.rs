@@ -1,7 +1,7 @@
 use crate::app::{App, Focus};
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyEventKind, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -19,7 +19,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -32,6 +32,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(frame.area());
     let original = app.capture.unavailable.is_some();
+    app.file_area = ratatui::layout::Rect::default();
+    app.preview_area = ratatui::layout::Rect::default();
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if app.preview.is_some() && !original {
@@ -46,7 +48,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .items
             .iter()
             .zip(&app.marks)
-            .map(|(item, reviewed)| {
+            .enumerate()
+            .map(|(index, (item, reviewed))| {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         if *reviewed { "+ " } else { "- " },
@@ -65,6 +68,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         }),
                     ),
                 ]))
+                .style(if index == app.selected {
+                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                })
             })
             .collect();
         let files = List::new(items)
@@ -85,10 +93,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
             .highlight_symbol("› ");
         let mut selection = ListState::default();
-        if !app.capture.items.is_empty() {
-            selection.select(Some(app.selected));
-        }
+        app.file_area = Block::default().borders(Borders::ALL).inner(panels[0]);
+        *selection.offset_mut() = app.file_offset;
         frame.render_stateful_widget(files, panels[0], &mut selection);
+        app.file_offset = selection.offset();
     }
     if app.preview.is_some() {
         let area = if original { panels[0] } else { panels[1] };
@@ -96,7 +104,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             area.height.saturating_sub(2) as usize,
             area.width.saturating_sub(2) as usize,
         );
-        app.clamp_scroll();
+        app.preview_area = Block::default().borders(Borders::ALL).inner(area);
+        app.keep_cursor_visible();
         let preview = app.preview.as_ref().expect("preview exists");
         let lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
         frame.render_widget(
@@ -116,6 +125,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             area,
         );
+        if app.focus == Focus::Preview && app.viewport.0 > 0 && app.viewport.1 > 0 {
+            frame.set_cursor_position((
+                app.preview_area.x + (app.cursor.1 - app.left) as u16,
+                app.preview_area.y + (app.cursor.0 - app.top) as u16,
+            ));
+        }
     }
     let explanation = [
         app.preview
@@ -147,7 +162,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(
         Paragraph::new(
-            "Enter/l open · h close · s search · d defs · r refs · b back · [old ]new · Space mark · q quit",
+            "arrows/hjkl move · Tab focus · Enter open · files: h close/l open · PgUp/Dn scroll · s search · d defs/r refs · b back · [old ]new · Space mark · q quit",
         ),
         areas[2],
     );
@@ -155,7 +170,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
 }
 
 type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
@@ -183,7 +203,7 @@ pub fn run(app: &mut App) -> Result<()> {
         signals: Vec::new(),
     };
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == ui_thread {
@@ -225,6 +245,7 @@ pub fn run(app: &mut App) -> Result<()> {
                         break;
                     }
                 }
+                Event::Mouse(mouse) => app.mouse(mouse, Instant::now()),
                 _ => {}
             }
         }

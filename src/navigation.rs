@@ -153,8 +153,9 @@ impl Analysis {
                 .tags
                 .iter()
                 .filter(|tag| {
-                    tag.line as usize >= line
-                        && (tag.line as usize != line || (tag.col + tag.len) as usize > column)
+                    tag.line as usize == line
+                        && tag.col as usize <= column
+                        && (tag.col + tag.len) as usize > column
                 })
                 .min_by_key(|tag| (tag.line, (tag.col as usize).saturating_sub(column)))
         {
@@ -213,12 +214,18 @@ impl Analysis {
                 candidate.tag.col,
             )
         });
+        let unavailable = request.position.is_some() && request.query.is_empty();
         Results {
             generation: request.generation,
             query: request.query,
             candidates,
             coverage: format!(
-                "{}{}",
+                "{}{}{}",
+                if unavailable {
+                    "Navigation unavailable: no tagged symbol at the exact cursor position. "
+                } else {
+                    ""
+                },
                 if truncated {
                     "Results truncated at 1000. "
                 } else {

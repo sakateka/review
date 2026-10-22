@@ -3,7 +3,9 @@ use crate::{
     navigation::{Candidate, Operation, Request, Worker},
     source::ComparedSide,
 };
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
@@ -29,8 +31,12 @@ pub struct App {
     pub navigation: Option<Navigation>,
     pub side: ComparedSide,
     source: Option<usize>,
-    source_location: Option<(usize, usize)>,
+    pub cursor: (usize, usize),
     history: Vec<View>,
+    pub file_area: Rect,
+    pub preview_area: Rect,
+    pub file_offset: usize,
+    last_click: Option<(usize, Instant)>,
 }
 
 #[derive(Clone)]
@@ -50,7 +56,7 @@ struct View {
     left: usize,
     side: ComparedSide,
     source: Option<usize>,
-    source_location: Option<(usize, usize)>,
+    cursor: (usize, usize),
     navigation: Option<Navigation>,
 }
 impl App {
@@ -92,7 +98,11 @@ impl App {
             navigation: None,
             side: ComparedSide::New,
             source: None,
-            source_location: None,
+            cursor: (0, 0),
+            file_area: Rect::default(),
+            preview_area: Rect::default(),
+            file_offset: 0,
+            last_click: None,
             history: Vec::new(),
             capture,
             store,
@@ -121,8 +131,137 @@ impl App {
         }
     }
 
+    fn clamp_cursor(&mut self) {
+        if let Some(preview) = &self.preview {
+            self.cursor.0 = self.cursor.0.min(preview.lines.len().saturating_sub(1));
+            self.cursor.1 = self.cursor.1.min(
+                preview
+                    .lines
+                    .get(self.cursor.0)
+                    .map_or(0, |line| line.width().saturating_sub(1)),
+            );
+        } else {
+            self.cursor = (0, 0);
+        }
+    }
+
+    pub fn keep_cursor_visible(&mut self) {
+        self.clamp_cursor();
+        if self.cursor.0 < self.top {
+            self.top = self.cursor.0;
+        }
+        if self.cursor.1 < self.left {
+            self.left = self.cursor.1;
+        }
+        if self.cursor.0 >= self.top + self.viewport.0.max(1) {
+            self.top = self.cursor.0 + 1 - self.viewport.0.max(1);
+        }
+        if self.cursor.1 >= self.left + self.viewport.1.max(1) {
+            self.left = self.cursor.1 + 1 - self.viewport.1.max(1);
+        }
+        self.clamp_scroll();
+    }
+
+    fn move_cursor(&mut self, rows: isize, columns: isize) {
+        self.cursor.0 = self.cursor.0.saturating_add_signed(rows);
+        self.cursor.1 = self.cursor.1.saturating_add_signed(columns);
+        self.keep_cursor_visible();
+    }
+
+    pub fn scroll_preview(&mut self, rows: isize, columns: isize) {
+        self.top = self.top.saturating_add_signed(rows);
+        self.left = self.left.saturating_add_signed(columns);
+        self.clamp_scroll();
+        self.cursor.0 = self
+            .cursor
+            .0
+            .clamp(self.top, self.top + self.viewport.0.saturating_sub(1));
+        self.cursor.1 = self
+            .cursor
+            .1
+            .clamp(self.left, self.left + self.viewport.1.saturating_sub(1));
+        self.keep_cursor_visible();
+    }
+
+    pub fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
+        let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        let files = self.file_area.contains(point);
+        let preview = self.preview.is_some() && self.preview_area.contains(point);
+        match mouse.kind {
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                self.last_click = None;
+                let direction = if matches!(
+                    mouse.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft
+                ) {
+                    -3
+                } else {
+                    3
+                };
+                if files {
+                    self.file_offset = self.file_offset.saturating_add_signed(direction).min(
+                        self.capture
+                            .items
+                            .len()
+                            .saturating_sub(self.file_area.height as usize),
+                    );
+                } else if preview {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+                    ) {
+                        self.scroll_preview(0, direction);
+                    } else {
+                        self.scroll_preview(direction, 0);
+                    }
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if files => {
+                let index = self.file_offset + (mouse.row - self.file_area.y) as usize;
+                if index >= self.capture.items.len() {
+                    self.last_click = None;
+                    return;
+                }
+                let double = self.last_click.is_some_and(|(previous, time)| {
+                    previous == index
+                        && now.saturating_duration_since(time) <= Duration::from_millis(400)
+                });
+                self.selected = index;
+                self.select(0);
+                self.last_click = if double { None } else { Some((index, now)) };
+                if double {
+                    self.key(KeyCode::Enter);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) if preview => {
+                self.last_click = None;
+                self.focus = Focus::Preview;
+                let row = self.top + (mouse.row - self.preview_area.y) as usize;
+                let column = self.left + (mouse.column - self.preview_area.x) as usize;
+                if self
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.lines.get(row))
+                    .is_some_and(|line| column < line.width() || (column == 0 && line.width() == 0))
+                {
+                    self.cursor = (row, column);
+                } else {
+                    self.status = "No retained text at clicked position; cursor unchanged".into();
+                }
+            }
+            MouseEventKind::Down(_) => {
+                self.last_click = None;
+            }
+            _ => {}
+        }
+    }
+
     // Returns true only for an explicit quit. Drawing has no state/store effects.
     pub fn key(&mut self, key: KeyCode) -> bool {
+        self.last_click = None;
         if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
             match key {
                 KeyCode::Esc => {
@@ -177,6 +316,7 @@ impl App {
                 self.preview = Some(Preview::original(coverage.replace("; ", "\n").as_bytes()));
                 self.top = 0;
                 self.left = 0;
+                self.cursor = (0, 0);
                 self.focus = Focus::Preview;
                 self.status = "Analysis coverage and limits; b returns to candidates".into();
                 return false;
@@ -210,10 +350,20 @@ impl App {
                 return false;
             }
             KeyCode::Char('q') | KeyCode::Esc => return true,
+            KeyCode::Char('h') | KeyCode::Left
+                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            {
+                self.move_cursor(0, -1)
+            }
+            KeyCode::Char('l') | KeyCode::Right
+                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            {
+                self.move_cursor(0, 1)
+            }
             KeyCode::Enter | KeyCode::Char('l') => {
                 if let Some(item) = self.capture.items.get(self.selected) {
                     self.source = None;
-                    self.source_location = None;
+                    self.cursor = (0, 0);
                     self.navigation = None;
                     let mut preview = Preview::item(&self.capture.cwd, item);
                     if !self.capture.stderr.is_empty() {
@@ -247,33 +397,26 @@ impl App {
             }
             KeyCode::Char(' ') if self.navigation.is_some() || self.source.is_some() => {
                 self.status =
-                    "Return to the captured diff/file list with b or h before marking".into();
+                    "Return to the captured diff/file list with b or Tab then h before marking"
+                        .into();
             }
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.focus == Focus::Files {
                     self.select(1);
                 } else {
-                    self.top = self.top.saturating_add(1);
-                    self.source_location = None;
+                    self.move_cursor(1, 0);
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.focus == Focus::Files {
                     self.select(-1);
                 } else {
-                    self.top = self.top.saturating_sub(1);
-                    self.source_location = None;
+                    self.move_cursor(-1, 0);
                 }
             }
-            KeyCode::Left if self.focus == Focus::Preview => {
-                self.left = self.left.saturating_sub(4);
-                self.source_location = None;
-            }
-            KeyCode::Right if self.focus == Focus::Preview => {
-                self.left = self.left.saturating_add(4);
-                self.source_location = None;
-            }
+            KeyCode::PageDown => self.scroll_preview(self.viewport.0.max(1) as isize, 0),
+            KeyCode::PageUp => self.scroll_preview(-(self.viewport.0.max(1) as isize), 0),
             _ => {}
         }
         self.clamp_scroll();
@@ -287,8 +430,17 @@ impl App {
             .saturating_add_signed(direction)
             .min(self.capture.items.len().saturating_sub(1));
         self.preview = None;
+        self.focus = Focus::Files;
+        self.cursor = (0, 0);
         self.top = 0;
         self.left = 0;
+        let height = self.file_area.height as usize;
+        if self.selected < self.file_offset {
+            self.file_offset = self.selected;
+        }
+        if height > 0 && self.selected >= self.file_offset + height {
+            self.file_offset = self.selected + 1 - height;
+        }
     }
 
     fn save_view(&mut self) {
@@ -301,7 +453,7 @@ impl App {
             left: self.left,
             side: self.side,
             source: self.source,
-            source_location: self.source_location,
+            cursor: self.cursor,
             navigation: self.navigation.clone(),
         });
     }
@@ -323,7 +475,7 @@ impl App {
             self.left = view.left;
             self.side = view.side;
             self.source = view.source;
-            self.source_location = view.source_location;
+            self.cursor = view.cursor;
             self.navigation = view.navigation;
             self.focus = if self.preview.is_some() {
                 Focus::Preview
@@ -357,6 +509,14 @@ impl App {
         } else {
             self.position_at_view()
         };
+        if let Some((source, _, _)) = position {
+            self.side = self.capture.catalog.sources[source].side;
+        }
+        if operation != Operation::Search && self.navigation.is_none() && position.is_none() {
+            self.status =
+                "Navigation unavailable: cursor has no mapped captured source position".into();
+            return;
+        }
         self.save_view();
         self.invalidate_analysis();
         self.navigation = Some(Navigation {
@@ -439,6 +599,7 @@ impl App {
             .selected
             .saturating_sub(self.viewport.0.saturating_sub(3));
         self.left = 0;
+        self.cursor = (nav.selected + 2, 0);
         self.status = nav.coverage.clone();
     }
     fn open_candidate(&mut self) {
@@ -472,7 +633,7 @@ impl App {
         self.side = side;
         self.source = Some(candidate.source);
         self.top = candidate.tag.line.saturating_sub(1) as usize;
-        self.source_location = Some((candidate.tag.line as usize, candidate.tag.col as usize));
+        self.cursor = (candidate.tag.line.saturating_sub(1) as usize, left);
         // Source columns are Unicode scalars; rendered prefixes/backslash/tab
         // expansion have separate screen coordinates.
         self.left = left;
@@ -505,9 +666,8 @@ impl App {
             if let Some(other) = self.capture.catalog.find(side, &path) {
                 self.side = side;
                 self.source = Some(other);
-                self.source_location = None;
                 self.preview = Some(Preview::source(&self.capture.catalog.sources[other]));
-                self.clamp_scroll();
+                self.keep_cursor_visible();
             } else {
                 self.status = format!("{} captured side unavailable for this path", side.label());
             }
@@ -526,70 +686,47 @@ impl App {
         if self.navigation.is_some() {
             return None;
         }
-        let (id, line, prefix) = if let Some(id) = self.source {
-            if let Some((line, col)) = self.source_location {
-                return Some((id, line, col));
-            }
-            (id, self.top + 1, 0usize)
+        let preview = self.preview.as_ref()?;
+        let (old, new) = *preview.locations.get(self.cursor.0)?;
+        let (side, line) = match (old, new) {
+            (Some(line), None) => (ComparedSide::Old, line),
+            (None, Some(line)) => (ComparedSide::New, line),
+            (Some(old), Some(new)) => (
+                self.side,
+                if self.side == ComparedSide::Old {
+                    old
+                } else {
+                    new
+                },
+            ),
+            (None, None) => return None,
+        };
+        let col = preview.visible_hit(
+            self.cursor.0,
+            self.cursor.1,
+            self.left,
+            self.viewport.1.max(1),
+        )?;
+        let id = if let Some(id) = self.source {
+            id
         } else {
             let item = self.capture.items.get(self.selected)?;
-            let path = if self.side == ComparedSide::Old {
+            let path = if side == ComparedSide::Old {
                 &item.old_path
             } else {
                 &item.new_path
             };
-            let id = self.capture.catalog.find(self.side, path)?;
-            let line = self
-                .preview
-                .as_ref()
-                .and_then(|preview| {
-                    preview
-                        .locations
-                        .iter()
-                        .skip(self.top)
-                        .find_map(|(old, new)| {
-                            if self.side == ComparedSide::Old {
-                                *old
-                            } else {
-                                *new
-                            }
-                        })
-                })
-                .unwrap_or(1);
-            (id, line, 1)
+            self.capture.catalog.find(side, path)?
         };
-        let text = std::str::from_utf8(&self.capture.catalog.sources[id].bytes)
-            .ok()?
-            .lines()
-            .nth(line.saturating_sub(1))?;
-        let mut screen = prefix;
-        let mut column = 0;
-        use unicode_segmentation::UnicodeSegmentation;
-        use unicode_width::UnicodeWidthStr;
-        for grapheme in text.graphemes(true) {
-            if screen >= self.left {
-                break;
-            }
-            screen += if grapheme == "\t" {
-                4 - screen.saturating_sub(prefix) % 4
-            } else if grapheme == "\\" {
-                2
-            } else {
-                grapheme
-                    .chars()
-                    .map(|ch| {
-                        if ch.is_control() {
-                            ch.escape_default().to_string()
-                        } else {
-                            ch.to_string()
-                        }
-                    })
-                    .collect::<String>()
-                    .width()
-            };
-            column += grapheme.chars().count();
-        }
-        Some((id, line, column))
+        // The catalog is the only authority, including bounds and scalar columns.
+        let text = std::str::from_utf8(&self.capture.catalog.sources[id].bytes).ok()?;
+        (text
+            .split_terminator('\n')
+            .nth(line.checked_sub(1)?)?
+            .chars()
+            .nth(col)
+            .is_some())
+        .then_some((id, line, col))
     }
 
     fn toggle_mark(&mut self) {
