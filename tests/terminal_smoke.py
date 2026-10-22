@@ -83,6 +83,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             self.colors = {}
             self.foreground = None
             self.row = self.col = 0
+            self.cursor_visible = True
             self.columns = 140
             atexit.register(self.cleanup)
         def pump(self, seconds=0.2):
@@ -131,6 +132,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
                     elif command == "K":
                         self.cells = {position:ch for position,ch in self.cells.items() if position[0] != self.row or position[1] < self.col}
                     elif command == "h" and parameters == "?1049": self.cells.clear()
+                    elif command in "hl" and parameters == "?25": self.cursor_visible = command == "h"
                     self.pending = self.pending[match.end():]
                     continue
                 ch, self.pending = self.pending[0], self.pending[1:]
@@ -843,6 +845,63 @@ pub fn invoke(worker: Worker) -> u32 {
     assert snapshot(root / "state") == state_after_mark, "cursor/mouse input changed marks"
     print("PTY passed: R13 exact cursor navigation, file clicks, wheels, history, side switching, resize and read-only state", flush=True)
 
+    # Status uses the displayed captured buffer and the actual content viewport.
+    status_repo = root / "diff-status"
+    status_repo.mkdir()
+    def status_git(*words):
+        return subprocess.check_output([git, *words], cwd=status_repo, env=env, stderr=subprocess.STDOUT)
+    status_git("init", "-q")
+    status_git("config", "user.name", "Status acceptance")
+    status_git("config", "user.email", "status@example.invalid")
+    (status_repo / "status.rs").write_text("fn before() {}\n")
+    status_git("add", ".")
+    status_git("commit", "-qm", "initial")
+    (status_repo / "status.rs").write_text("".join(f"// row {index:03} captured\n" for index in range(100)))
+    total = len(status_git("diff", "HEAD", "--", "status.rs").splitlines())
+    status_before = snapshot(status_repo)
+    marks_before = snapshot(root / "state")
+    session = Session([str(binary), "--", "HEAD"], cwd=status_repo)
+    closed(session)
+    session.send(b"\r")
+    def status_line(rows=30, cols=140):
+        x = cols * 30 // 100 + 1
+        return "".join(session.cells.get((rows - 4, col), " ") for col in range(x, cols - 1)).rstrip()
+    assert status_line() == f"{total} lines  1:1  Top", session.text()
+    session.send(b"gg40j0")
+    assert status_line() == f"{total} lines  41:1  {16 * 100 // (total - 25)}%", session.text()
+    assert (session.row, session.col) == (25, 43)
+    session.send(pointer(65, 80, 5))
+    assert status_line() == f"{total} lines  41:1  {19 * 100 // (total - 25)}%", session.text()
+    assert (session.row, session.col) == (22, 43)
+    # Neither clicks nor wheels on status may move the source cursor/viewport.
+    saved_status, saved_cursor = status_line(), (session.row, session.col)
+    session.send(pointer(65, 80, 26) + pointer(0, 80, 26))
+    assert status_line() == saved_status
+    assert (session.row, session.col) == saved_cursor
+    session.send(b"\x1b[6~")
+    assert "%" in status_line(), session.text()
+    session.send(b"G0")
+    assert status_line() == f"{total} lines  {total}:1  Bot", session.text()
+    assert (session.row, session.col) == (25, 43)
+    session.resize(12, 140)
+    assert status_line(12) == f"{total} lines  {total}:1  Bot", session.text()
+    assert (session.row, session.col) == (7, 43)
+    session.resize(5, 8)
+    assert not session.cursor_visible, "zero-content-height pane retained hardware cursor"
+    assert str(total)[0] in session.text().splitlines()[1], session.text()
+    for shape in [(1, 1), (3, 8), (30, 140)]:
+        session.resize(*shape)
+    assert session.cursor_visible
+    assert status_line() == f"{total} lines  {total}:1  Bot", session.text()
+    session.send(b"gg")
+    session.resize(total + 5, 140)
+    assert status_line(total + 5) == f"{total} lines  1:1  All", session.text()
+    session.send(b",q")
+    session.finish()
+    assert snapshot(status_repo) == status_before, "status navigation changed captured repository"
+    assert snapshot(root / "state") == marks_before, "status navigation changed review marks"
+    print("PTY passed: diff status top/middle/bottom/fit, cursor cells, wheel/page, status mouse exclusion and tiny resize", flush=True)
+
     # R2-R10: exact ticket invocation, explicit marks, closed previews and gray
     # names after restart, selective invalidation, ref movement and isolation.
     branch_args = [left, right]
@@ -988,4 +1047,4 @@ pub fn invoke(worker: Worker) -> u32 {
     assert merge.returncode == 1, merge.stdout
     check_native(["--cc"], True)
 
-print("PTY passed: installed language navigation, terminal lifecycle, R1-R13 workflow, branch/ref/staged/worktree/no-index invalidation, Git compatibility and original-output fallback" + (", injected panic/I/O failure" if args.test_binary else ""))
+print("PTY passed: installed language navigation, terminal lifecycle, R1-R13 workflow, diff cursor/scroll status, branch/ref/staged/worktree/no-index invalidation, Git compatibility and original-output fallback" + (", injected panic/I/O failure" if args.test_binary else ""))

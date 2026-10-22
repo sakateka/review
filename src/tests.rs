@@ -5705,3 +5705,160 @@ fn preview_cpp_template_type_parameter_names_are_ineligible_definitions() {
         assert_eq!(result.candidates[0].tag.name.as_ref(), name);
     }
 }
+
+fn preview_status_row(app: &mut App, width: u16, height: u16) -> String {
+    let buffer = screen(app, width, height);
+    let area = app.preview_area;
+    (area.x..area.right())
+        .map(|x| buffer[(x, area.bottom())].symbol())
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+#[test]
+fn preview_status_tracks_actual_viewport_cursor_and_excludes_mouse_hits() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn target() {}\n".repeat(100),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    let total = app.preview.as_ref().unwrap().lines.len();
+    assert_eq!(
+        preview_status_row(&mut app, 100, 15),
+        format!("{total} lines  1:1  Top")
+    );
+    assert_eq!(app.viewport, (10, 68));
+    app.key(KeyCode::PageDown);
+    let range = total - app.viewport.0;
+    let expected = format!(
+        "{total} lines  {}:{}  {}%",
+        app.cursor.0 + 1,
+        app.cursor.1 + 1,
+        app.top * 100 / range
+    );
+    assert_eq!(preview_status_row(&mut app, 100, 15), expected);
+    app.mouse(
+        mouse_event(
+            MouseEventKind::ScrollDown,
+            app.preview_area.x,
+            app.preview_area.y,
+        ),
+        std::time::Instant::now(),
+    );
+    assert!(app.top > 0);
+    let saved = (app.cursor, app.top, app.left);
+    app.key(KeyCode::Tab);
+    for kind in [
+        MouseEventKind::ScrollDown,
+        MouseEventKind::Down(MouseButton::Left),
+    ] {
+        app.mouse(
+            mouse_event(kind, app.preview_area.x, app.preview_area.bottom()),
+            std::time::Instant::now(),
+        );
+        assert_eq!((app.cursor, app.top, app.left), saved);
+        assert_eq!(app.focus, Focus::Files);
+    }
+    app.key(KeyCode::Tab);
+    app.key(KeyCode::Char('G'));
+    let expected = format!(
+        "{total} lines  {}:{}  Bot",
+        app.cursor.0 + 1,
+        app.cursor.1 + 1
+    );
+    assert_eq!(preview_status_row(&mut app, 100, 15), expected);
+    assert_eq!(app.top, total - app.viewport.0);
+    assert!(app.marks.iter().all(|mark| !mark));
+    assert!(state.path().read_dir().unwrap().next().is_none());
+}
+
+#[test]
+fn preview_status_empty_fit_cells_fallback_and_tiny_resize() {
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.preview = Some(preview::Preview::original(b""));
+    app.focus = Focus::Preview;
+    app.cursor = (100, 100);
+    assert_eq!(preview_status_row(&mut app, 100, 15), "0 lines  0:0  All");
+    assert_eq!(app.cursor, (0, 0));
+    app.preview = Some(preview::Preview::original(
+        "a\t界e\u{301}🙂z\n\n".as_bytes(),
+    ));
+    app.cursor = (0, 7);
+    assert_eq!(preview_status_row(&mut app, 100, 7), "2 lines  1:8  All");
+    // A displayed column counts terminal cells after tab expansion, including wide glyphs.
+    app.cursor = (0, 9);
+    screen(&mut app, 12, 7);
+    assert!(app.left > 0);
+    assert_eq!(preview_status_row(&mut app, 100, 7), "2 lines  1:10  All");
+    app.cursor = (1, 99);
+    assert_eq!(preview_status_row(&mut app, 100, 7), "2 lines  2:1  All");
+    app.capture.unavailable = Some("Unstructured comparison".into());
+    app.status = "Unstructured comparison".into();
+    app.preview.as_mut().unwrap().reason = Some("Source enrichment unavailable".into());
+    let buffer = screen(&mut app, 100, 7);
+    assert!(screen_text(&buffer).contains("Original Git output"));
+    assert!(screen_text(&buffer).contains("Unstructured comparison"));
+    assert_eq!(preview_status_row(&mut app, 100, 7), "2 lines  2:1  All");
+    // One interior row is entirely status; smaller panes have no content or status.
+    assert_eq!(preview_status_row(&mut app, 8, 5), "2 line");
+    assert_eq!(app.viewport, (0, 6));
+    for (width, height) in [(1, 1), (3, 2), (2, 5), (100, 30)] {
+        screen(&mut app, width, height);
+    }
+    assert_eq!(preview_status_row(&mut app, 100, 30), "2 lines  2:1  All");
+}
+
+#[test]
+fn preview_status_source_documentation_and_definition_restore_drawn_origin() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "/// Captured help\nfn target() {}\nfn caller() { target(); }\n",
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "caller".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    app.key(KeyCode::Enter);
+    assert_eq!(preview_status_row(&mut app, 100, 15), "3 lines  3:4  All");
+    app.key(KeyCode::Char('0'));
+    for _ in 0..14 {
+        app.key(KeyCode::Char('l'));
+    }
+    let origin_status = preview_status_row(&mut app, 100, 15);
+    let origin = (app.cursor, app.top, app.left);
+    for key in ['P', 'K'] {
+        app.key(KeyCode::Char(key));
+        await_navigation(&mut app);
+        assert!(
+            app.definition_preview || app.documentation,
+            "{}",
+            app.status
+        );
+        let total = app.preview.as_ref().unwrap().lines.len();
+        let expected = format!(
+            "{total} lines  {}:{}  All",
+            app.cursor.0 + 1,
+            app.cursor.1 + 1
+        );
+        assert_eq!(preview_status_row(&mut app, 100, 15), expected);
+        app.key(KeyCode::Char('q'));
+        assert_eq!(preview_status_row(&mut app, 100, 15), origin_status);
+        assert_eq!((app.cursor, app.top, app.left), origin);
+    }
+    assert!(app.marks.iter().all(|mark| !mark));
+    assert!(state.path().read_dir().unwrap().next().is_none());
+}

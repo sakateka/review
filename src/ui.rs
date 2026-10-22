@@ -100,32 +100,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.preview.is_some() {
         let area = if original { panels[0] } else { panels[1] };
-        app.viewport = (
-            area.height.saturating_sub(2) as usize,
-            area.width.saturating_sub(2) as usize,
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let mut content = inner;
+        content.height = content.height.saturating_sub(1);
+        let status_area = ratatui::layout::Rect::new(
+            inner.x,
+            inner.y + content.height,
+            inner.width,
+            inner.height.min(1),
         );
-        app.preview_area = Block::default().borders(Borders::ALL).inner(area);
+        app.viewport = (content.height as usize, content.width as usize);
+        app.preview_area = content;
         app.keep_cursor_visible();
         let preview = app.preview.as_ref().expect("preview exists");
         let lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
         frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if original {
-                        "Original Git output — file actions disabled"
-                    } else {
-                        preview.title.as_deref().unwrap_or("Diff")
-                    })
-                    .border_style(Style::default().fg(if app.focus == Focus::Preview {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    })),
-            ),
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if original {
+                    "Original Git output — file actions disabled"
+                } else {
+                    preview.title.as_deref().unwrap_or("Diff")
+                })
+                .border_style(Style::default().fg(if app.focus == Focus::Preview {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })),
             area,
         );
-        if app.focus == Focus::Preview && app.viewport.0 > 0 && app.viewport.1 > 0 {
+        frame.render_widget(Paragraph::new(lines), content);
+        let total = preview.lines.len();
+        let (row, column) = if total == 0 {
+            (0, 0)
+        } else {
+            (app.cursor.0 + 1, app.cursor.1 + 1)
+        };
+        let scroll = if total <= app.viewport.0 {
+            "All".to_owned()
+        } else if app.top == 0 {
+            "Top".to_owned()
+        } else if app.top >= total.saturating_sub(app.viewport.0) {
+            "Bot".to_owned()
+        } else {
+            format!("{}%", app.top * 100 / (total - app.viewport.0))
+        };
+        frame.render_widget(
+            Paragraph::new(format!("{total} lines  {row}:{column}  {scroll}"))
+                .style(Style::default().fg(Color::Cyan)),
+            status_area,
+        );
+        if app.focus == Focus::Preview && total > 0 && app.viewport.0 > 0 && app.viewport.1 > 0 {
             frame.set_cursor_position((
                 app.preview_area.x + (app.cursor.1 - app.left) as u16,
                 app.preview_area.y + (app.cursor.0 - app.top) as u16,
