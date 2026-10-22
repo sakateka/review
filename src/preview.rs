@@ -14,6 +14,7 @@ pub struct Preview {
     pub lines: Vec<Line<'static>>,
     pub reason: Option<String>,
     pub title: Option<String>,
+    pub search: Option<crate::search::BufferSearch>,
     pub width: usize,
     /// One-based old/new source rows, independent of syntax enrichment.
     pub locations: Vec<(Option<usize>, Option<usize>)>,
@@ -399,6 +400,7 @@ impl Preview {
             lines,
             reason,
             title: None,
+            search: None,
             width,
             locations,
             cells,
@@ -584,6 +586,23 @@ impl Preview {
                     }
                 }
                 Line::from(spans)
+            })
+            .enumerate()
+            .map(|(row, mut line)| {
+                if let Some(search) = &self.search {
+                    let first = search.matches.partition_point(|m| m.row < top + row);
+                    let matches = &search.matches
+                        [first..search.matches.partition_point(|m| m.row <= top + row)];
+                    let mut column = left;
+                    for span in &mut line.spans {
+                        let end = column + span.width();
+                        if matches.iter().any(|m| column < m.end && end > m.start) {
+                            span.style = span.style.bg(Color::Rgb(80, 65, 0));
+                        }
+                        column = end;
+                    }
+                }
+                line
             })
             .collect()
     }

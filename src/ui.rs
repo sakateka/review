@@ -151,7 +151,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(status), areas[1]);
     frame.render_widget(
         Paragraph::new(
-            "hjkl move · w/b/e words · gg/G jump · gd/gr navigate · Ctrl-O back · / symbols · Esc close · q quit",
+            "hjkl move · */# search · n/N next · gd/gr jump · Ctrl-O back · Esc close · q quit",
         ),
         areas[2],
     );

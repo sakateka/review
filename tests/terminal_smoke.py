@@ -350,6 +350,17 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     assert (session.row, session.col) == (cursor[0], cursor[1] + 1), (cursor, session.row, session.col)
     session.send(b"h")
     assert (session.row, session.col) == cursor
+    # Vim * searches this captured buffer, highlights matches, wraps and repeats.
+    session.send(b"G$*")
+    session.wait_text("/new · 1/45")
+    first_match = (session.row, session.col)
+    session.send(b"n")
+    session.wait_text("/new · 2/45")
+    assert (session.row, session.col) == (first_match[0] + 1, first_match[1])
+    session.send(b"N")
+    assert (session.row, session.col) == first_match
+    session.send(b"gg0ww")
+    assert (session.row, session.col) == cursor
     session.send(b"d")
     session.wait_text('Definitions candidates for "new_symbol_03"')
     session.send(b"\x0f")

@@ -339,6 +339,11 @@ impl App {
                     last.saturating_sub(1)
                 });
             }
+            KeyCode::Char('*' | '#' | 'n' | 'N')
+                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            {
+                self.search_buffer(key, count);
+            }
             KeyCode::Char('w' | 'W' | 'b' | 'B' | 'e' | 'E')
                 if self.focus == Focus::Preview && self.navigation.is_none() =>
             {
@@ -381,6 +386,35 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    fn search_buffer(&mut self, key: KeyCode, count: usize) {
+        let Some(preview) = &mut self.preview else {
+            return;
+        };
+        let mut origin = self.cursor;
+        if matches!(key, KeyCode::Char('*' | '#')) {
+            let Some((search, start)) = crate::search::BufferSearch::at_cursor(
+                &preview.lines,
+                self.cursor,
+                key == KeyCode::Char('#'),
+            ) else {
+                self.status = "No word under cursor".into();
+                return;
+            };
+            preview.search = Some(search);
+            origin = start;
+        }
+        let Some(search) = &preview.search else {
+            self.status = "No previous buffer search".into();
+            return;
+        };
+        if let Some(found) = search.next(origin, key == KeyCode::Char('N'), count) {
+            self.cursor = (found.row, found.start);
+            let index = search.matches.iter().position(|m| *m == found).unwrap_or(0);
+            self.status = format!("/{} · {}/{}", search.word, index + 1, search.matches.len());
+            self.keep_cursor_visible();
+        }
     }
 
     fn go_to_row(&mut self, row: usize) {

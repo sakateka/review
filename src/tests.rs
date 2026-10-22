@@ -3790,3 +3790,123 @@ fn vim_definition_jump_is_highlighted_and_footer_keeps_analysis_details_on_deman
     assert!(!app.key(KeyCode::Esc));
     assert!(app.preview.is_none());
 }
+
+#[test]
+fn vim_star_search_wraps_whole_words_with_counts_and_keeps_source_styles() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"search.rs".to_vec(),
+        "界e\u{301} foo foo_bar foo\nfoo\nFOO\n".as_bytes().to_vec(),
+    );
+    app.preview = Some(preview::Preview::source(&catalog.sources[0]));
+    app.focus = Focus::Preview;
+    app.viewport = (2, 10);
+    app.cursor = (0, 5);
+    let original_foregrounds: Vec<_> = app.preview.as_ref().unwrap().visible(0, 0, 3, 30)[0]
+        .spans
+        .iter()
+        .map(|span| span.style.fg)
+        .collect();
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.cursor, (0, 16));
+    let preview = app.preview.as_ref().unwrap();
+    assert_eq!(preview.search.as_ref().unwrap().matches.len(), 3);
+    let displayed = preview.visible(0, 0, 3, 30);
+    assert!(
+        displayed[0]
+            .spans
+            .iter()
+            .any(|span| span.style.bg.is_some())
+    );
+    assert_eq!(
+        displayed[0]
+            .spans
+            .iter()
+            .map(|span| span.style.fg)
+            .collect::<Vec<_>>(),
+        original_foregrounds
+    );
+    assert_eq!(preview.hit_test(0, 16), Some(16));
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.cursor, (1, 0));
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.cursor, (0, 4));
+    app.key(KeyCode::Char('N'));
+    assert_eq!(app.cursor, (1, 0));
+    app.cursor = (0, 18);
+    app.key(KeyCode::Char('#'));
+    assert_eq!(app.cursor, (0, 4));
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.cursor, (1, 0));
+    app.key(KeyCode::Char('N'));
+    assert_eq!(app.cursor, (0, 4));
+    for c in "2*".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    assert_eq!(app.cursor, (1, 0));
+    assert!(app.marks.iter().all(|m| !m));
+    assert!(state.path().read_dir().unwrap().next().is_none());
+    assert!(app.navigation.is_none());
+}
+
+#[test]
+fn buffer_search_is_local_to_the_retained_view_and_restored_with_history() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.preview = Some(preview::Preview::original(b"foo foo\n"));
+    app.focus = Focus::Preview;
+    app.viewport = (10, 30);
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.cursor, (0, 4));
+    app.key(KeyCode::Char('/'));
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.cursor, (0, 0));
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.status, "No previous buffer search");
+    assert!(app.preview.as_ref().unwrap().search.is_none());
+    app.preview = Some(preview::Preview::original(b" \n"));
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.status, "No word under cursor");
+    assert!(app.preview.as_ref().unwrap().search.is_none());
+    app.preview = Some(preview::Preview::original(
+        b"\xce\xb1\xce\xb2 \xce\xb1\xce\xb2 \xce\xb1\xce\xb2_\xce\xb3\n",
+    ));
+    app.cursor = (0, 0);
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.cursor, (0, 3));
+    assert_eq!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .matches
+            .len(),
+        2
+    );
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.cursor, (0, 0));
+}
+
+#[test]
+fn star_search_uses_vim_keyword_boundaries_including_underscores() {
+    let lines = [ratatui::text::Line::from("foo'bar foo foo_bar _ _")];
+    let (search, origin) = crate::search::BufferSearch::at_cursor(&lines, (0, 1), false).unwrap();
+    assert_eq!(search.word, "foo");
+    assert_eq!(search.matches.len(), 2);
+    assert_eq!(search.next(origin, false, 1).unwrap().start, 8);
+    let (search, origin) = crate::search::BufferSearch::at_cursor(&lines, (0, 20), false).unwrap();
+    assert_eq!(search.word, "_");
+    assert_eq!(search.next(origin, false, 1).unwrap().start, 22);
+}
