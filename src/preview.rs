@@ -70,6 +70,15 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
             tree_sitter_yaml::LANGUAGE,
             tree_sitter_yaml::HIGHLIGHTS_QUERY.to_owned(),
         ),
+        "toml" => (
+            tree_sitter_toml_ng::LANGUAGE,
+            // Upstream captures an entire bare-key pair as a property and quoted
+            // keys as strings. Restrict key coloring to the key nodes themselves.
+            tree_sitter_toml_ng::HIGHLIGHTS_QUERY
+                .replace("(bare_key) @type", "(bare_key) @property")
+                .replace("(quoted_key) @string", "(quoted_key) @property")
+                .replace("(pair\n  (bare_key)) @property", ""),
+        ),
         "json" => (
             tree_sitter_json::LANGUAGE,
             tree_sitter_json::HIGHLIGHTS_QUERY.to_owned(),
@@ -104,6 +113,10 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
             Color::Magenta,
             Color::DarkGray,
         ]);
+    }
+    if extension == "toml" {
+        names.extend(["property", "boolean", "string.special", "punctuation"]);
+        colors.extend([Color::Cyan, Color::Magenta, Color::Blue, Color::DarkGray]);
     }
     let mut configuration =
         HighlightConfiguration::new(language.into(), extension, &query, "", "")?;

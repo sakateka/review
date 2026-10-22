@@ -6496,3 +6496,185 @@ fn yaml_colors_distinguish_tokens_in_captured_source_and_both_diff_sides() {
         assert_eq!(sources.new.content, text.replace("42", "43"));
     }
 }
+
+#[test]
+fn toml_colors_preserve_captured_sources_coordinates_and_diff_emphasis() {
+    let old = include_str!("../tests/fixtures/toml-colors.toml");
+    let _: toml::Value = toml::from_str(old).unwrap();
+    let new = old.replace("42", "43").replace("🙂 old", "🙂 new");
+    // Keep the entire construct matrix present on both changed sides.
+    let directory = fixture();
+    let path = directory.path().join("colors.toml");
+    std::fs::write(&path, old).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "toml"]);
+    std::fs::write(&path, &new).unwrap();
+    let captured = capture(
+        directory.path(),
+        &["HEAD", "--unified=100", "--", "colors.toml"],
+    );
+    let sources = source::load(directory.path(), &captured.items[0]).unwrap();
+    let mut catalog = source::Catalog::default();
+    for (side, content) in [
+        (source::ComparedSide::Old, old),
+        (source::ComparedSide::New, new.as_str()),
+    ] {
+        catalog.insert(side, b"colors.toml".to_vec(), content.as_bytes().to_vec());
+    }
+    let identities: Vec<_> = catalog.sources.iter().map(|s| s.identity.clone()).collect();
+    // Rendering must continue to use the captured patch and catalog after mutation.
+    std::fs::write(&path, "unrelated = 'checkout edit'\n").unwrap();
+    let checkout = std::fs::read(&path).unwrap();
+    let diff = preview::Preview::item(directory.path(), &captured.items[0]);
+    assert_eq!(diff.reason, None);
+    let style_at = |view: &preview::Preview, token: &str| {
+        let line = view
+            .lines
+            .iter()
+            .enumerate()
+            .find(|(row, line)| {
+                view.locations[*row] != (None, None) && line.to_string().contains(token)
+            })
+            .unwrap()
+            .1;
+        let start = line.to_string().find(token).unwrap();
+        let mut offset = 0;
+        line.spans
+            .iter()
+            .find_map(|span| {
+                let contains = offset <= start && start < offset + span.content.len();
+                offset += span.content.len();
+                contains.then_some(span.style)
+            })
+            .unwrap()
+    };
+    for (index, source) in catalog.sources.iter().enumerate() {
+        let view = preview::Preview::source(source);
+        for (token, color) in [
+            ("# review", Color::DarkGray),
+            ("title", Color::Cyan),
+            ("café", Color::Green),
+            ("enabled", Color::Cyan),
+            ("true", Color::Magenta),
+            ("false", Color::Magenta),
+            ("1979-05-27T07:32:00Z", Color::Blue),
+            ("1979-05-27T07:32:00", Color::Blue),
+            ("local_date", Color::Cyan),
+            ("07:32:00", Color::Blue),
+            ("array value", Color::Green),
+            ("inline value", Color::Green),
+            ("\"quoted key\"", Color::Cyan),
+            ("'literal key'", Color::Cyan),
+            ("dotted key", Color::Cyan),
+            ("owner", Color::Cyan),
+            ("literal value", Color::Green),
+            ("basic value", Color::Green),
+            ("0xDEAD_BEEF", Color::Yellow),
+            ("0o755", Color::Yellow),
+            ("0b1101", Color::Yellow),
+            ("-1.2e+3", Color::Yellow),
+            ("+inf", Color::Yellow),
+            ("nan", Color::Yellow),
+            ("basic café", Color::Green),
+            ("literal café", Color::Green),
+            ("server", Color::Cyan),
+            ("public host", Color::Cyan),
+            ("products", Color::Cyan),
+            ("[", Color::DarkGray),
+            ("{", Color::DarkGray),
+            (",", Color::DarkGray),
+            ("]]", Color::DarkGray),
+            ("=", Color::Cyan),
+        ] {
+            assert_eq!(style_at(&view, token).fg, Some(color), "{token}");
+            assert_eq!(style_at(&diff, token).fg, Some(color), "diff {token}");
+        }
+        for key in ["released", "local_date_time", "local_date", "local_time"] {
+            let line = view
+                .lines
+                .iter()
+                .find(|line| line.to_string().starts_with(&format!("{key} =")))
+                .unwrap();
+            assert_eq!(
+                line.spans.last().unwrap().style.fg,
+                Some(Color::Blue),
+                "{key}"
+            );
+        }
+        let row = old
+            .lines()
+            .position(|line| line.starts_with("tabbed"))
+            .unwrap();
+        let expected = vec![
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(8),
+            Some(8),
+            Some(8),
+            Some(9),
+            Some(10),
+            Some(10),
+            Some(11),
+            Some(13),
+            Some(13),
+            Some(14),
+            Some(15),
+            Some(16),
+            Some(17),
+            Some(18),
+        ];
+        assert_eq!(view.cells[row], expected);
+        let location = if index == 0 {
+            (Some(row + 1), None)
+        } else {
+            (None, Some(row + 1))
+        };
+        assert_eq!(view.locations[row], location);
+        let diff_row = diff
+            .locations
+            .iter()
+            .position(|&value| value == location)
+            .unwrap();
+        assert_eq!(diff.cells[diff_row], [vec![None], expected].concat());
+        assert_eq!(source.identity, identities[index]);
+        assert_eq!(
+            source.bytes.as_ref(),
+            if index == 0 {
+                old.as_bytes()
+            } else {
+                new.as_bytes()
+            }
+        );
+        for (row, cells) in view.cells.iter().enumerate() {
+            assert_eq!(cells.len(), view.lines[row].width());
+        }
+    }
+    for (token, digit) in [("42", '2'), ("43", '3')] {
+        assert_eq!(style_at(&diff, token).fg, Some(Color::Yellow));
+        assert!(style_at(&diff, token).bg.is_some());
+        assert!(diff.lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content.contains(digit)
+                && span
+                    .style
+                    .add_modifier
+                    .contains(Modifier::UNDERLINED | Modifier::BOLD)
+        }));
+    }
+    assert_eq!(sources.old.content, old);
+    assert_eq!(sources.new.content, new);
+    assert_eq!(std::fs::read(&path).unwrap(), checkout);
+    assert_eq!(
+        source::load(directory.path(), &captured.items[0])
+            .unwrap()
+            .new
+            .content,
+        new
+    );
+}

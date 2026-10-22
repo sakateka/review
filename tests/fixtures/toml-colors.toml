@@ -1,0 +1,30 @@
+# review configuration
+title = "café 界é🙂"
+count = 42
+enabled = true
+released = 1979-05-27T07:32:00Z
+values = [1, false, "array value"]
+inline = { nested = "inline value", port = 8080 }
+"quoted key" = 'literal value'
+'literal key' = "basic value"
+owner."dotted key".name = "dotted value"
+hex = 0xDEAD_BEEF
+octal = 0o755
+binary = 0b1101
+float = -1.2e+3
+infinity = +inf
+not_a_number = nan
+local_date_time = 1979-05-27T07:32:00
+local_date = 1979-05-27
+local_time = 07:32:00
+multiline = """
+basic café 界
+continued"""
+literal_multiline = '''
+literal café 界
+continued'''
+tabbed =	"界é🙂 old"
+[server."public host"]
+address = "localhost"
+[[products]]
+name = "Hammer"

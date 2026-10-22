@@ -212,6 +212,41 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     git_run("commit", "-qm", "remove yaml fixture")
     before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
 
+    # TOML has renderer support without navigation indexing. Open its actual diff.
+    toml_text = (pathlib.Path(__file__).parent / "fixtures/toml-colors.toml").read_text()
+    (repo / "colors.toml").write_text(toml_text)
+    git_run("add", "colors.toml")
+    git_run("commit", "-qm", "toml colors")
+    (repo / "colors.toml").write_text(toml_text.replace("42", "43"))
+    toml_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    session = Session([str(binary), "--", "HEAD", "--", "colors.toml"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("+count = 43")
+    def toml_color(token, expected):
+        row, line = next((row, line) for row, line in enumerate(session.text().splitlines()) if token in line)
+        assert session.colors[(row, line.index(token))] == expected, (token, session.text())
+    for token, color in [("count", 6), ("42", 3), ("43", 3), ("café", 2), ("true", 5), ("1979-05-27", 4), ("# review", 8)]:
+        toml_color(token, color)
+    session.send(b"a")
+    session.wait_text("After changes")
+    assert "-count = 42" not in session.text()
+    for token, color in [("count", 6), ("43", 3), ("true", 5), ("1979-05-27", 4)]:
+        toml_color(token, color)
+    session.send(b"a")
+    session.wait_text("-count = 42")
+    assert "After changes" not in session.text()
+    session.send(b"q")
+    session.wait_text("Files")
+    session.send(b",q")
+    session.finish()
+    assert not (root / "state").exists(), "TOML viewing changed marks"
+    assert toml_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    (repo / "colors.toml").unlink()
+    git_run("rm", "--cached", "colors.toml")
+    git_run("commit", "-qm", "remove toml fixture")
+    before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+
     # Installed captured-context toggle: reversible, explicit marks unchanged,
     # source bytes immutable, and ordinary mode restored on reopen/restart.
     session = Session()

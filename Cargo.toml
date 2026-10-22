@@ -15,6 +15,7 @@ riptags = { version = "=0.1.0", default-features = false, features = ["rust", "c
 tree-sitter = "=0.27.1"
 tree-sitter-json = "=0.24.8"
 tree-sitter-yaml = "=0.7.2"
+tree-sitter-toml-ng = "=0.7.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 sha2 = "=0.10.9"
