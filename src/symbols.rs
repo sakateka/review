@@ -103,7 +103,21 @@ fn language(selector: &str) -> tree_sitter::Language {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Function {
+    pub tag: riptags::Tag,
+    pub documentation: Option<String>,
+}
+
+#[cfg(test)]
 pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
+    let (tags, note, _) = extract_functions(selector, source);
+    (tags, note)
+}
+pub fn extract_functions(
+    selector: &str,
+    source: &str,
+) -> (Vec<riptags::Tag>, String, Vec<Function>) {
     use std::{
         collections::BTreeMap,
         ops::ControlFlow,
@@ -111,7 +125,7 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
     };
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(&language(selector)).is_err() {
-        return (Vec::new(), "parser unavailable".into());
+        return (Vec::new(), "parser unavailable".into(), Vec::new());
     }
     let started = Instant::now();
     let mut progress = |_: &tree_sitter::ParseState| {
@@ -129,6 +143,7 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
         return (
             Vec::new(),
             "parser failed or parsing time limit, skipped".into(),
+            Vec::new(),
         );
     };
     let mut note = if tree.root_node().has_error() {
@@ -138,6 +153,8 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
     };
     let columns = scalar_columns(source);
     let mut tags = BTreeMap::new();
+    let mut functions = Vec::new();
+    let mut documentation_bytes = 0usize;
     if riptags_preflight(&tree, source.len()) {
         for tag in riptags::tag_source(selector, source) {
             let key = (tag.line, tag.col, tag.len);
@@ -162,6 +179,60 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
         }
         let node = cursor.node();
         let kind = node.kind();
+        let function = if matches!(selector, "buffer.c" | "buffer.cpp") {
+            if cursor.field_name() == Some("declarator") {
+                node.parent()
+                    .and_then(|parent| function_node(parent, selector, Some(node)))
+            } else {
+                None
+            }
+        } else {
+            function_node(node, selector, None)
+        };
+        if functions.len() < FILE_TAGS
+            && let Some((name, wrapper)) = function
+        {
+            let mut documentation = function_documentation(node, wrapper, selector, source);
+            if let Some(text) = &mut documentation {
+                let available = (8 * 1024 * 1024usize).saturating_sub(documentation_bytes);
+                let limit = available.min(64 * 1024);
+                if text.len() > limit {
+                    text.truncate(text.floor_char_boundary(limit));
+                    text.push_str("\n[Documentation truncated by resource limit]");
+                }
+                documentation_bytes += text.len();
+            }
+            functions.push(Function {
+                tag: riptags::Tag {
+                    line: name.start_position().row as u32 + 1,
+                    col: columns[name.start_byte()],
+                    len: source[name.byte_range()].chars().count() as u32,
+                    name: source[name.byte_range()].into(),
+                    kind: riptags::OccKind::Definition,
+                    sym_kind: riptags::SymKind::Variable,
+                    owners: Vec::new(),
+                    context: None,
+                },
+                documentation,
+            });
+        }
+        if functions.len() < FILE_TAGS
+            && let Some(name) = call_name(node, selector)
+        {
+            functions.push(Function {
+                tag: riptags::Tag {
+                    line: name.start_position().row as u32 + 1,
+                    col: columns[name.start_byte()],
+                    len: source[name.byte_range()].chars().count() as u32,
+                    name: source[name.byte_range()].into(),
+                    kind: riptags::OccKind::Path,
+                    sym_kind: riptags::SymKind::Variable,
+                    owners: Vec::new(),
+                    context: None,
+                },
+                documentation: None,
+            });
+        }
         // Plain literal text never has identifier nodes; interpolation expressions
         // do, and remain useful references (including quoted shell expansions).
         let skip = kind.contains("comment");
@@ -212,11 +283,11 @@ pub fn extract(selector: &str, source: &str) -> (Vec<riptags::Tag>, String) {
                 break;
             }
             if !cursor.goto_parent() {
-                return (tags.into_values().collect(), note);
+                return (tags.into_values().collect(), note, functions);
             }
         }
     }
-    (tags.into_values().collect(), note)
+    (tags.into_values().collect(), note, functions)
 }
 fn identifier(kind: &str) -> bool {
     matches!(
@@ -402,4 +473,224 @@ pub fn scalar_columns(source: &str) -> Vec<u32> {
     }
     columns[source.len()] = column;
     columns
+}
+
+/// Only declaration nodes establish function identities; spelling is never evidence.
+fn function_node<'a>(
+    node: tree_sitter::Node<'a>,
+    selector: &str,
+    declarator: Option<tree_sitter::Node<'a>>,
+) -> Option<(tree_sitter::Node<'a>, tree_sitter::Node<'a>)> {
+    let supported = match selector {
+        "buffer.rs" => matches!(node.kind(), "function_item" | "function_signature_item"),
+        "buffer.py" | "buffer.sh" => node.kind() == "function_definition",
+        "buffer.go" => matches!(node.kind(), "function_declaration" | "method_declaration"),
+        "buffer.zig" => node.kind() == "function_declaration",
+        "buffer.c" | "buffer.cpp" => matches!(
+            node.kind(),
+            "function_definition" | "declaration" | "field_declaration"
+        ),
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    let name = if matches!(selector, "buffer.c" | "buffer.cpp") {
+        let mut child = declarator?;
+        let mut function = false;
+        let mut found = None;
+        for _ in 0..128 {
+            if child.kind() == "function_declarator" {
+                function = true;
+            } else if matches!(child.kind(), "pointer_declarator" | "reference_declarator") {
+                function = false;
+            }
+            if matches!(
+                child.kind(),
+                "identifier" | "field_identifier" | "operator_name" | "destructor_name"
+            ) {
+                found = Some(child);
+                break;
+            }
+            child = child
+                .child_by_field_name("declarator")
+                .or_else(|| child.child_by_field_name("name"))
+                .or_else(|| {
+                    if child.kind() == "parenthesized_declarator" {
+                        child.named_child(0)
+                    } else {
+                        None
+                    }
+                })?;
+        }
+        if !function {
+            return None;
+        }
+        found?
+    } else {
+        node.child_by_field_name("name")?
+    };
+    let wrapper = node
+        .parent()
+        .filter(|parent| {
+            matches!(
+                parent.kind(),
+                "decorated_definition" | "template_declaration"
+            )
+        })
+        .unwrap_or(node);
+    Some((name, wrapper))
+}
+
+fn function_documentation(
+    node: tree_sitter::Node<'_>,
+    mut wrapper: tree_sitter::Node<'_>,
+    selector: &str,
+    source: &str,
+) -> Option<String> {
+    if selector == "buffer.py" {
+        let body = node.child_by_field_name("body")?;
+        let mut cursor = body.walk();
+        let first = body
+            .named_children(&mut cursor)
+            .find(|n| n.kind() != "comment")?;
+        if first.kind() != "expression_statement" || first.named_child_count() != 1 {
+            return None;
+        }
+        let string = first.named_child(0)?;
+        if string.kind() != "string" {
+            return None;
+        }
+        let raw = &source[string.byte_range()];
+        let quote = raw.find(['\'', '"'])?;
+        if !raw[..quote]
+            .chars()
+            .all(|c| matches!(c, 'r' | 'R' | 'u' | 'U'))
+        {
+            return None;
+        }
+        let mut walk = string.walk();
+        if string
+            .named_children(&mut walk)
+            .any(|n| n.kind() == "interpolation")
+        {
+            return None;
+        }
+        let raw = &raw[quote..];
+        let delimiter = if raw.starts_with("\"\"\"") || raw.starts_with("'''") {
+            3
+        } else {
+            1
+        };
+        return raw
+            .get(delimiter..raw.len().checked_sub(delimiter)?)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+    let mut comments = Vec::new();
+    let mut boundary = wrapper.start_byte();
+    let mut scan_truncated = false;
+    for scanned in 0..=1024 {
+        let Some(previous) = wrapper.prev_named_sibling() else {
+            break;
+        };
+        let gap = &source[previous.end_byte()..boundary];
+        if !gap.chars().all(char::is_whitespace) || gap.bytes().filter(|b| *b == b'\n').count() > 1
+        {
+            break;
+        }
+        let raw = &source[previous.byte_range()];
+        let line_start = source[..previous.start_byte()]
+            .rfind('\n')
+            .map_or(0, |byte| byte + 1);
+        if !source[line_start..previous.start_byte()]
+            .chars()
+            .all(char::is_whitespace)
+        {
+            break;
+        }
+
+        if selector == "buffer.rs" && previous.kind() == "attribute_item" {
+            wrapper = previous;
+            boundary = previous.start_byte();
+            continue;
+        }
+        if !previous.kind().contains("comment") {
+            break;
+        }
+        let valid = match selector {
+            "buffer.rs" => {
+                (raw.starts_with("///") && !raw.starts_with("////"))
+                    || (raw.starts_with("/**") && !raw.starts_with("/***"))
+            }
+            "buffer.zig" => raw.starts_with("///") && !raw.starts_with("////"),
+            "buffer.sh" => raw.starts_with('#') && !raw.starts_with("#!"),
+            _ => raw.starts_with("//") || raw.starts_with("/*"),
+        };
+        if !valid {
+            break;
+        }
+        if scanned == 1024 {
+            scan_truncated = true;
+            break;
+        }
+        comments.push(raw);
+        wrapper = previous;
+        boundary = previous.start_byte();
+    }
+    comments.reverse();
+    let mut text = comments
+        .into_iter()
+        .map(|raw| {
+            if let Some(body) = raw.strip_prefix("/*").and_then(|s| s.strip_suffix("*/")) {
+                body.trim_start_matches('*')
+                    .lines()
+                    .map(|line| line.trim().trim_start_matches('*').trim_start())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                raw.lines()
+                    .map(|line| {
+                        line.trim_start()
+                            .trim_start_matches(if selector == "buffer.sh" { '#' } else { '/' })
+                            .trim_start()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if scan_truncated {
+        text.push_str("\n[Documentation truncated by comment scan limit]");
+    }
+    (!text.trim().is_empty()).then(|| text.trim().to_string())
+}
+
+fn call_name<'a>(node: tree_sitter::Node<'a>, selector: &str) -> Option<tree_sitter::Node<'a>> {
+    let mut name = if selector == "buffer.sh" && node.kind() == "command" {
+        node.child_by_field_name("name")?
+    } else if matches!(node.kind(), "call_expression" | "call") {
+        node.child_by_field_name("function")?
+    } else {
+        return None;
+    };
+    for _ in 0..8 {
+        if matches!(name.kind(), "identifier" | "field_identifier" | "word") {
+            return Some(name);
+        }
+        name = name
+            .child_by_field_name("field")
+            .or_else(|| name.child_by_field_name("attribute"))
+            .or_else(|| name.child_by_field_name("function"))
+            .or_else(|| name.child_by_field_name("name"))
+            .or_else(|| {
+                if name.kind() == "command_name" {
+                    name.named_child(0)
+                } else {
+                    None
+                }
+            })?;
+    }
+    None
 }

@@ -17,6 +17,7 @@ pub enum Operation {
     Search,
     Definitions,
     References,
+    Documentation,
 }
 #[derive(Debug, Clone)]
 pub struct Candidate {
@@ -29,6 +30,7 @@ pub struct Results {
     pub query: String,
     pub candidates: Vec<Candidate>,
     pub coverage: String,
+    pub documentation: Option<String>,
 }
 pub struct Request {
     pub generation: u64,
@@ -63,6 +65,7 @@ impl Worker {
                         generation: request.generation,
                         query: request.query,
                         candidates: Vec::new(),
+                        documentation: None,
                         coverage: "Analysis failed (worker panic); basic diff remains available"
                             .into(),
                     },
@@ -88,6 +91,7 @@ impl Worker {
 pub struct Analysis {
     index: SymbolIndex,
     coverage: String,
+    functions: Vec<(usize, crate::symbols::Function)>,
 }
 impl Analysis {
     pub fn build(catalog: &Catalog) -> Self {
@@ -100,6 +104,7 @@ impl Analysis {
         max_tags: usize,
     ) -> Self {
         let mut files = Vec::new();
+        let mut functions = Vec::new();
         let mut gaps = catalog.gaps.clone();
         let mut total = 0usize;
         let mut tags_total = 0;
@@ -126,12 +131,13 @@ impl Analysis {
             total += source.bytes.len();
             let extracted = std::panic::catch_unwind(|| {
                 if selector == "json" || selector == "yaml" {
-                    structure(text, selector == "yaml")
+                    let (tags, note) = structure(text, selector == "yaml");
+                    (tags, note, Vec::new())
                 } else {
-                    crate::symbols::extract(selector, text)
+                    crate::symbols::extract_functions(selector, text)
                 }
             });
-            let (mut tags, note) = match extracted {
+            let (mut tags, note, extracted_functions) = match extracted {
                 Ok(extracted) => extracted,
                 Err(_) => {
                     gaps.push(format!("{path}: extraction failed; skipped"));
@@ -146,6 +152,12 @@ impl Analysis {
                 tags.truncate(max_tags - tags_total);
                 gaps.push(format!("{path}: tag limit, truncated"));
             }
+            functions.extend(
+                extracted_functions
+                    .into_iter()
+                    .take(max_tags.saturating_sub(functions.len()))
+                    .map(|function| (id, function)),
+            );
             tags_total += tags.len();
             gaps.push(format!("{} {path}: {note}", source.side.label()));
             files.push(FileTags {
@@ -162,6 +174,7 @@ impl Analysis {
         Self {
             index: SymbolIndex::from_tags(files, 0, Duration::ZERO),
             coverage,
+            functions,
         }
     }
     pub fn query(&self, catalog: &Catalog, mut request: Request) -> Results {
@@ -184,7 +197,72 @@ impl Analysis {
                 })
                 .min_by_key(|tag| (tag.line, (tag.col as usize).saturating_sub(column)))
         {
-            request.query = tag.name.to_string();
+            request.query = if request.operation == Operation::Documentation
+                && !self.functions.iter().any(|(id, function)| {
+                    *id == source
+                        && function.tag.line == tag.line
+                        && function.tag.col == tag.col
+                        && function.tag.kind.is_definition() == tag.kind.is_definition()
+                }) {
+                String::new()
+            } else {
+                tag.name.to_string()
+            };
+        }
+        if request.operation == Operation::Documentation {
+            let exact = request.position.and_then(|(source, line, col)| {
+                self.functions.iter().find(|(id, function)| {
+                    *id == source
+                        && function.tag.kind.is_definition()
+                        && function.tag.line as usize == line
+                        && function.tag.col as usize <= col
+                        && col < (function.tag.col + function.tag.len) as usize
+                })
+            });
+            let matches: Vec<_> = if let Some(function) = exact {
+                vec![function]
+            } else {
+                self.functions
+                    .iter()
+                    .filter(|(id, function)| {
+                        function.tag.kind.is_definition()
+                            && request
+                                .side
+                                .is_none_or(|side| catalog.sources[*id].side == side)
+                            && !request.query.is_empty()
+                            && function.tag.name.as_ref() == request.query
+                    })
+                    .take(MAX_RESULTS + 1)
+                    .collect()
+            };
+            let documentation = if matches.len() == 1 {
+                matches[0].1.documentation.clone()
+            } else {
+                None
+            };
+            let coverage = if matches.is_empty() {
+                "Documentation unavailable: no captured function at this position".into()
+            } else if matches.len() == 1 && documentation.is_none() {
+                "Documentation unavailable: function has no supported captured documentation".into()
+            } else if matches.len() > MAX_RESULTS {
+                "Documentation candidates truncated at 1000".into()
+            } else {
+                "Captured function documentation candidates".into()
+            };
+            return Results {
+                generation: request.generation,
+                query: request.query,
+                candidates: matches
+                    .into_iter()
+                    .take(MAX_RESULTS)
+                    .map(|(source, function)| Candidate {
+                        source: *source,
+                        tag: function.tag.clone(),
+                    })
+                    .collect(),
+                coverage,
+                documentation,
+            };
         }
         let mut candidates = Vec::new();
         // Public pre-tagged index owns the symbol inventory; native source keys
@@ -219,6 +297,7 @@ impl Analysis {
                     Operation::Definitions => {
                         tag.kind.is_definition() && tag.name.as_ref() == request.query
                     }
+                    Operation::Documentation => unreachable!(),
                     Operation::References => {
                         !tag.kind.is_definition() && tag.name.as_ref() == request.query
                     }
@@ -249,6 +328,7 @@ impl Analysis {
             generation: request.generation,
             query: request.query,
             candidates,
+            documentation: None,
             coverage: format!(
                 "{}{}{}",
                 if unavailable {

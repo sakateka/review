@@ -32,6 +32,7 @@ pub struct App {
     pub navigation: Option<Navigation>,
     pub side: ComparedSide,
     source: Option<usize>,
+    pub documentation: bool,
     pub cursor: (usize, usize),
     history: Vec<View>,
     pub file_area: Rect,
@@ -61,6 +62,9 @@ struct View {
     source: Option<usize>,
     cursor: (usize, usize),
     navigation: Option<Navigation>,
+    documentation: bool,
+    focus: Focus,
+    status: String,
 }
 impl App {
     pub fn new(capture: Capture, store: Store) -> Self {
@@ -101,6 +105,7 @@ impl App {
             navigation: None,
             side: ComparedSide::New,
             source: None,
+            documentation: false,
             cursor: (0, 0),
             file_area: Rect::default(),
             preview_area: Rect::default(),
@@ -356,6 +361,24 @@ impl App {
         let buffer = self.focus == Focus::Preview && self.navigation.is_none();
         match action {
             Quit => return true,
+            CloseOrQuit
+                if self.documentation
+                    || self
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|nav| nav.operation == Operation::Documentation) =>
+            {
+                self.back()
+            }
+            CloseDiffView
+                if self.documentation
+                    || self
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|nav| nav.operation == Operation::Documentation) =>
+            {
+                self.back()
+            }
             CloseOrQuit => {
                 if self.preview.is_none() {
                     return true;
@@ -364,6 +387,9 @@ impl App {
             }
             CloseDiffView if self.capture.unavailable.is_none() => self.close_preview(),
             GoBack => self.back(),
+            ShowDocumentation if !self.documentation => {
+                self.begin_navigation(Operation::Documentation)
+            }
             SearchSymbols => self.begin_navigation(Operation::Search),
             GoToDefinition => self.begin_navigation(Operation::Definitions),
             GoToReferences => self.begin_navigation(Operation::References),
@@ -395,7 +421,9 @@ impl App {
                     Focus::Files
                 };
             }
-            ToggleMark if self.navigation.is_some() || self.source.is_some() => {
+            ToggleMark
+                if self.documentation || self.navigation.is_some() || self.source.is_some() =>
+            {
                 self.status = format!(
                     "Close the source view with {} before marking",
                     self.bindings.label(CloseDiffView)
@@ -510,6 +538,9 @@ impl App {
     }
 
     fn open_diff(&mut self) {
+        if self.documentation {
+            return;
+        }
         if let Some(item) = self.capture.items.get(self.selected) {
             self.source = None;
             self.cursor = (0, 0);
@@ -615,6 +646,9 @@ impl App {
             source: self.source,
             cursor: self.cursor,
             navigation: self.navigation.clone(),
+            documentation: self.documentation,
+            focus: self.focus,
+            status: self.status.clone(),
         });
     }
     fn invalidate_analysis(&mut self) {
@@ -624,6 +658,7 @@ impl App {
     fn abandon_navigation(&mut self) {
         self.invalidate_analysis();
         self.navigation = None;
+        self.documentation = false;
         self.source = None;
         self.history.clear();
     }
@@ -637,17 +672,16 @@ impl App {
             self.source = view.source;
             self.cursor = view.cursor;
             self.navigation = view.navigation;
-            self.focus = if self.preview.is_some() {
-                Focus::Preview
-            } else {
-                Focus::Files
-            };
+            self.documentation = view.documentation;
+            self.focus = view.focus;
+            self.status = view.status;
         } else {
             self.navigation = None;
             self.status = "No earlier navigation target".into();
         }
     }
     fn begin_navigation(&mut self, operation: Operation) {
+        let origin_side = self.side;
         if self.capture.unavailable.is_some() {
             self.status = "Navigation unavailable: comparison provenance is opaque".into();
             return;
@@ -664,7 +698,20 @@ impl App {
         } else {
             self.symbol_at_view().unwrap_or_default()
         };
-        let position = if operation == Operation::Search {
+        let selected_definition = self
+            .navigation
+            .as_ref()
+            .and_then(|nav| nav.candidates.get(nav.selected))
+            .map(|candidate| {
+                (
+                    candidate.source,
+                    candidate.tag.line as usize,
+                    candidate.tag.col as usize,
+                )
+            });
+        let position = if operation == Operation::Documentation && selected_definition.is_some() {
+            selected_definition
+        } else if operation == Operation::Search {
             None
         } else {
             self.position_at_view()
@@ -677,7 +724,11 @@ impl App {
                 "Navigation unavailable: cursor has no mapped captured source position".into();
             return;
         }
+        let target_side = self.side;
+        self.side = origin_side;
         self.save_view();
+        self.side = target_side;
+        self.documentation = false;
         self.invalidate_analysis();
         self.navigation = Some(Navigation {
             position,
@@ -715,6 +766,44 @@ impl App {
         while let Some(results) = self.worker.poll() {
             if results.generation != self.generation {
                 continue;
+            }
+            if self
+                .navigation
+                .as_ref()
+                .is_some_and(|nav| nav.operation == Operation::Documentation)
+            {
+                if let Some(text) = results.documentation {
+                    let candidate = &results.candidates[0];
+                    let source = &self.capture.catalog.sources[candidate.source];
+                    let title = format!(
+                        "{} — {} {}:{}\n\n{}",
+                        candidate.tag.name,
+                        source.side.label(),
+                        crate::git::visible_bytes(&source.path),
+                        candidate.tag.line,
+                        text
+                    );
+                    self.navigation = None;
+                    self.documentation = true;
+                    self.source = None;
+                    let mut preview = Preview::original(title.as_bytes());
+                    preview.title = Some("Function documentation".into());
+                    self.preview = Some(preview);
+                    self.top = 0;
+                    self.left = 0;
+                    self.cursor = (0, 0);
+                    self.focus = Focus::Preview;
+                    self.status = String::new();
+                    continue;
+                } else if results.candidates.len() <= 1 {
+                    self.back();
+                    self.status = if results.coverage.is_empty() {
+                        "Documentation unavailable".into()
+                    } else {
+                        results.coverage
+                    };
+                    continue;
+                }
             }
             if let Some(nav) = &mut self.navigation {
                 nav.query = results.query;
@@ -767,6 +856,8 @@ impl App {
                 "Analysis failed; {} for details",
                 self.bindings.label(Action::AnalysisDetails)
             )
+        } else if nav.operation == Operation::Documentation && nav.coverage.contains("truncated") {
+            format!("{} results (truncated)", nav.candidates.len())
         } else if nav.coverage.contains("no tagged symbol") {
             "No symbol at cursor".into()
         } else {
@@ -774,6 +865,14 @@ impl App {
         };
     }
     fn open_candidate(&mut self) {
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|nav| nav.operation == Operation::Documentation)
+        {
+            self.begin_navigation(Operation::Documentation);
+            return;
+        }
         let Some(candidate) = self
             .navigation
             .as_ref()
@@ -812,6 +911,9 @@ impl App {
         self.status.clear();
     }
     fn change_side(&mut self, side: ComparedSide) {
+        if self.documentation {
+            return;
+        }
         if let Some(nav) = &mut self.navigation {
             self.side = side;
             if nav.operation == Operation::Search {

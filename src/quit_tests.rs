@@ -92,3 +92,23 @@ fn global_quit_prefix_preserves_query_text_and_obeys_remapping() {
     assert!(!app.key(KeyCode::Char('q')));
     assert_eq!(app.navigation.as_ref().unwrap().query, ",q");
 }
+
+#[test]
+fn documentation_disabled_binding_and_literal_query_leave_global_quit_available() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.bindings = config::Config::parse("[keybindings]\nshow_documentation=''")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('K'));
+    assert!(app.navigation.is_none());
+    app.key(KeyCode::Char('/'));
+    app.key(KeyCode::Char('K'));
+    assert_eq!(app.navigation.as_ref().unwrap().query, "K");
+    app.key(KeyCode::Char(','));
+    assert!(app.key(KeyCode::Char('q')));
+    assert!(app.marks.iter().all(|marked| !marked));
+}

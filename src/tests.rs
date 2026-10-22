@@ -4830,3 +4830,441 @@ fn navigation_rust_captured_patterns_declare_whole_and_nested_names() {
     assert_navigation_occurrences(&catalog, &index, "right", &[(2, 23)], &[(3, 25)]);
     assert_navigation_occurrences(&catalog, &index, "pair", &[(1, 11)], &[(2, 32)]);
 }
+
+#[test]
+fn documentation_grammar_forms_and_nonfunction_exclusions() {
+    for (selector, text, expected) in [
+        (
+            "buffer.rs",
+            "/// Captured help\n#[inline]\nfn target() {}",
+            true,
+        ),
+        ("buffer.rs", "/*! container */\nfn target() {}", false),
+        (
+            "buffer.py",
+            "@decorator\ndef target():\n    \"\"\"Captured help\"\"\"\n    pass\n",
+            true,
+        ),
+        (
+            "buffer.py",
+            "def target():\n    f\"Captured {help}\"\n",
+            false,
+        ),
+        (
+            "buffer.py",
+            "def target():\n    b\"Captured help\"\n",
+            false,
+        ),
+        ("buffer.go", "// Captured help\nfunc target() {}", true),
+        ("buffer.c", "/** Captured help */\nint target(void);", true),
+        (
+            "buffer.cpp",
+            "// Captured help\ntemplate<class T> void target(T value) {}",
+            true,
+        ),
+        (
+            "buffer.zig",
+            "/// Captured help\npub fn target() void {}",
+            true,
+        ),
+        ("buffer.sh", "# Captured help\ntarget() { :; }", true),
+        ("buffer.sh", "#!/bin/bash\ntarget() { :; }", false),
+        (
+            "buffer.rs",
+            "/// Unrelated\nconst X: u8 = 0;\nfn target() {}",
+            false,
+        ),
+    ] {
+        let (_, _, functions) = symbols::extract_functions(selector, text);
+        let target = functions
+            .iter()
+            .find(|f| f.tag.name.as_ref() == "target")
+            .unwrap_or_else(|| panic!("missing {selector}: {text}; {functions:?}"));
+        assert_eq!(
+            target
+                .documentation
+                .as_deref()
+                .is_some_and(|s| s.contains("Captured help")),
+            expected,
+            "{selector}: {target:?}"
+        );
+    }
+    for text in [
+        "// variable\nint (*target)(void);",
+        "// variable\nint target;",
+    ] {
+        assert!(symbols::extract_functions("buffer.c", text).2.is_empty());
+    }
+}
+
+#[test]
+fn documentation_exact_identity_ambiguity_and_captured_sides() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"a.rs".to_vec(),
+        b"/// New help\nfn target() {}\nfn caller() { target(); }\nlet target = 1;".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"b.rs".to_vec(),
+        b"fn target() {}".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::Old,
+        b"a.rs".to_vec(),
+        b"/// Old help\nfn target() {}".to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    let exact = navigation_at(
+        &catalog,
+        &index,
+        0,
+        2,
+        3,
+        navigation::Operation::Documentation,
+    );
+    assert_eq!(exact.documentation.as_deref(), Some("New help"));
+    let ambiguous = navigation_at(
+        &catalog,
+        &index,
+        0,
+        3,
+        14,
+        navigation::Operation::Documentation,
+    );
+    assert_eq!(ambiguous.candidates.len(), 2, "{ambiguous:?}");
+    assert!(ambiguous.documentation.is_none());
+    let old = navigation_at(
+        &catalog,
+        &index,
+        2,
+        2,
+        3,
+        navigation::Operation::Documentation,
+    );
+    assert_eq!(old.documentation.as_deref(), Some("Old help"));
+    let undocumented = navigation_at(
+        &catalog,
+        &index,
+        1,
+        1,
+        3,
+        navigation::Operation::Documentation,
+    );
+    assert!(undocumented.documentation.is_none());
+    assert!(undocumented.coverage.contains("no supported captured"));
+}
+
+#[test]
+fn documentation_view_returns_exact_origin_and_respects_keys_marks_and_stale_results() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        include_str!("../tests/fixtures/navigation/documentation.rs"),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    for style in ["vim", "emacs"] {
+        std::fs::write(
+            directory.path().join("one.rs"),
+            include_str!("../tests/fixtures/navigation/documentation.rs"),
+        )
+        .unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.bindings = config::Config::parse(&format!("[features]\nkeymap='{style}'"))
+            .unwrap()
+            .bindings(None)
+            .unwrap();
+        app.key(KeyCode::Char('/'));
+        for c in "documented".chars() {
+            app.key(KeyCode::Char(c));
+        }
+        app.key(KeyCode::Enter);
+        await_navigation(&mut app);
+        std::fs::write(
+            directory.path().join("one.rs"),
+            "/// Live replacement must not leak\nfn documented() {}\n",
+        )
+        .unwrap();
+        let selected = app.navigation.as_ref().unwrap().selected;
+        let origin = app.preview.as_ref().unwrap().lines.clone();
+        let origin_cursor = app.cursor;
+        let origin_status = app.status.clone();
+        app.key(KeyCode::Char('K'));
+        await_navigation(&mut app);
+        assert!(app.documentation);
+        assert!(
+            app.preview
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("Captured documentation for"))
+        );
+        app.key(KeyCode::Char(' '));
+        assert!(app.marks.iter().all(|mark| !mark));
+        app.key(KeyCode::Char(']'));
+        assert!(app.documentation);
+        screen(&mut app, 3, 1);
+        assert!(!app.key(KeyCode::Char('q')));
+        assert!(!app.documentation);
+        assert_eq!(app.preview.as_ref().unwrap().lines, origin);
+        assert_eq!(app.cursor, origin_cursor);
+        assert_eq!(app.status, origin_status);
+        assert_eq!(app.navigation.as_ref().unwrap().selected, selected);
+        app.key(KeyCode::Char('K'));
+        app.key(KeyCode::Esc);
+        for _ in 0..20 {
+            app.poll_analysis();
+        }
+        assert!(!app.documentation);
+        app.key(KeyCode::Char('K'));
+        await_navigation(&mut app);
+        app.key(KeyCode::Char(','));
+        assert!(app.key(KeyCode::Char('q')));
+        assert!(state.path().read_dir().unwrap().next().is_none());
+    }
+    let mut app = application(directory.path(), state.path());
+    app.bindings = config::Config::parse("[keybindings]\nshow_documentation='D'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('K'));
+    assert!(app.status.is_empty());
+    app.key(KeyCode::Char('D'));
+    assert!(app.status.contains("unavailable"));
+    app.key(KeyCode::Char('/'));
+    app.key(KeyCode::Char('K'));
+    assert_eq!(app.navigation.as_ref().unwrap().query, "K");
+}
+
+#[test]
+fn documentation_bounds_unicode_unavailable_and_source_return() {
+    let mut catalog = source::Catalog::default();
+    let text = format!(
+        "/// {}\nfn target() {{}}\nfn caller() {{ let target = 1; println!(\"{{}}\", target); }}\nfn broken(\n",
+        "界\t captured ".repeat(9000)
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"bounded.rs".to_vec(),
+        text.into_bytes(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    let documented = navigation_at(
+        &catalog,
+        &index,
+        0,
+        2,
+        3,
+        navigation::Operation::Documentation,
+    );
+    let documentation = documented.documentation.unwrap();
+    assert!(documentation.contains("Documentation truncated"));
+    assert!(documentation.len() < 66 * 1024);
+    let unavailable = navigation_at(
+        &catalog,
+        &index,
+        0,
+        3,
+        48,
+        navigation::Operation::Documentation,
+    );
+    assert!(unavailable.documentation.is_none());
+    assert!(unavailable.candidates.is_empty());
+
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        include_str!("../tests/fixtures/navigation/documentation.rs"),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "documented".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('*'));
+    let origin_cursor = app.cursor;
+    let origin_top = app.top;
+    let origin_left = app.left;
+    let origin_search = format!("{:?}", app.preview.as_ref().unwrap().search);
+    app.key(KeyCode::Char('K'));
+    await_navigation(&mut app);
+    assert!(app.documentation);
+    app.key(KeyCode::Esc);
+    assert_eq!(app.cursor, origin_cursor);
+    assert_eq!(app.top, origin_top);
+    assert_eq!(app.left, origin_left);
+    assert_eq!(
+        format!("{:?}", app.preview.as_ref().unwrap().search),
+        origin_search
+    );
+    app.capture.unavailable = Some("opaque".into());
+    let origin = app.preview.as_ref().unwrap().lines.clone();
+    app.key(KeyCode::Char('K'));
+    assert!(app.status.contains("opaque"));
+    assert_eq!(app.preview.as_ref().unwrap().lines, origin);
+    assert!(!app.documentation);
+}
+
+#[test]
+fn documentation_calls_are_syntax_verified_in_every_supported_language() {
+    for (path, text) in [
+        (
+            "a.rs",
+            "/// Call help\nfn target() {}\nfn caller() { target(); }",
+        ),
+        ("a.py", "def target():\n    \"Call help\"\n\ntarget()"),
+        (
+            "a.go",
+            "package a\n// Call help\nfunc target() {}\nfunc caller() { target() }",
+        ),
+        (
+            "a.c",
+            "// Call help\nvoid target(void);\nvoid caller(void) { target(); }",
+        ),
+        (
+            "a.cpp",
+            "// Call help\nvoid target();\nvoid caller() { target(); }",
+        ),
+        (
+            "a.zig",
+            "/// Call help\nfn target() void {}\nfn caller() void { target(); }",
+        ),
+        ("a.sh", "# Call help\ntarget() { :; }\ntarget"),
+    ] {
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::New,
+            path.as_bytes().to_vec(),
+            text.as_bytes().to_vec(),
+        );
+        let index = navigation::Analysis::build(&catalog);
+        let byte = text.rfind("target").unwrap();
+        let line = text[..byte].bytes().filter(|b| *b == b'\n').count() + 1;
+        let col = text[..byte].rsplit('\n').next().unwrap().chars().count();
+        let result = navigation_at(
+            &catalog,
+            &index,
+            0,
+            line,
+            col,
+            navigation::Operation::Documentation,
+        );
+        assert_eq!(
+            result.documentation.as_deref(),
+            Some("Call help"),
+            "{path}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn documentation_review_fix_c_repeated_declarators_keep_docs_and_exclude_pointer_variables() {
+    for extension in ["c", "cpp"] {
+        let text = "/** Shared help */\nint first(void), (*pointer)(void), target(void);\nvoid caller(void) { target(); }";
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::New,
+            format!("a.{extension}").into_bytes(),
+            text.as_bytes().to_vec(),
+        );
+        let index = navigation::Analysis::build(&catalog);
+        for name in ["first", "target"] {
+            let col = text.lines().nth(1).unwrap().find(name).unwrap();
+            let result = navigation_at(
+                &catalog,
+                &index,
+                0,
+                2,
+                col,
+                navigation::Operation::Documentation,
+            );
+            assert_eq!(
+                result.documentation.as_deref(),
+                Some("Shared help"),
+                "{extension} {name}: {result:?}"
+            );
+        }
+        let pointer = navigation_at(
+            &catalog,
+            &index,
+            0,
+            2,
+            19,
+            navigation::Operation::Documentation,
+        );
+        assert!(pointer.candidates.is_empty(), "{extension}: {pointer:?}");
+        let call = navigation_at(
+            &catalog,
+            &index,
+            0,
+            3,
+            20,
+            navigation::Operation::Documentation,
+        );
+        assert_eq!(
+            call.documentation.as_deref(),
+            Some("Shared help"),
+            "{extension}: {call:?}"
+        );
+    }
+}
+
+#[test]
+fn documentation_review_fix_comment_scan_limit_reports_omitted_prefix() {
+    let text = format!(
+        "/// omitted prefix\n{}fn target() {{}}",
+        "/// x\n".repeat(1024)
+    );
+    let (_, _, functions) = symbols::extract_functions("buffer.rs", &text);
+    let documentation = functions[0].documentation.as_deref().unwrap();
+    assert!(!documentation.contains("omitted prefix"));
+    assert!(documentation.contains("Documentation truncated by comment scan limit"));
+    assert!(documentation.len() < 64 * 1024);
+    let exact = format!("{}fn target() {{}}", "/// x\n".repeat(1024));
+    let (_, _, functions) = symbols::extract_functions("buffer.rs", &exact);
+    assert!(
+        !functions[0]
+            .documentation
+            .as_deref()
+            .unwrap()
+            .contains("truncated")
+    );
+}
+
+#[test]
+fn documentation_review_fix_candidate_truncation_is_visible() {
+    let directory = fixture();
+    let definitions = "fn target() {}\n".repeat(1001);
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("{definitions}fn caller() {{ target(); }}\n"),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('/'));
+    for c in "caller".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    assert_eq!(app.status, "1 results");
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('0'));
+    for _ in 0..14 {
+        app.key(KeyCode::Char('l'));
+    }
+    app.key(KeyCode::Char('K'));
+    await_navigation(&mut app);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1000);
+    assert_eq!(app.status, "1000 results (truncated)");
+    assert!(screen_text(&screen(&mut app, 100, 20)).contains("1000 results (truncated)"));
+}

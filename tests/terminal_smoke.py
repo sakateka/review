@@ -38,7 +38,8 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     git_run("init", "-q")
     git_run("config", "user.name", "PTY Test")
     git_run("config", "user.email", "pty@example.invalid")
-    (repo / "target.rs").write_text("fn main_target() {}\n")
+    (repo / "docs.rs").write_text("/// Captured ambiguous documentation.\nfn doc_choice() {}\nmod other {\nfn doc_choice() {}\n}\nfn docs_caller() { doc_choice(); }\n")
+    (repo / "target.rs").write_text("/// Captured terminal documentation.\nfn main_target() {}\n")
     long_line = "\t// " + "界e\u0301🙂" * 150 + "\n"
     (repo / "caller.rs").write_text("fn caller() { main_target(); }\n" + long_line)
     fixture_root = pathlib.Path(__file__).resolve().parent / "fixtures" / "navigation"
@@ -383,6 +384,82 @@ go_to_definition = "gD"
     config_file.unlink()
     assert config_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     print("PTY passed: discovered/explicit config, Vim/Emacs, overrides, readline, disabled/removed keys and invalid config", flush=True)
+
+    # Captured documentation preserves candidate origin and never writes marks.
+    docs_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    for dismiss in [b"q", b"\x1b", b"\x0f"]:
+        session = Session()
+        session.wait_text("Files")
+        session.send(b"/main_target\r")
+        session.wait_text("Search candidates")
+        session.send(b"K")
+        session.wait_text("Captured terminal documentation.")
+        session.send(b" ")
+        session.resize(3, 8)
+        session.resize(30, 140)
+        session.send(dismiss)
+        session.wait_text("Search candidates")
+        assert session.process.poll() is None
+        session.send(b"\r")
+        session.wait_text("Captured old target.rs")
+        session.send(b"K")
+        session.wait_text("Function documentation")
+        session.send(b"q")
+        session.wait_text("Captured old target.rs")
+        session.send(b"/caller\r")
+        session.wait_text("Search candidates")
+        session.send(b"\r")
+        session.wait_text("Captured old caller.rs")
+        session.send(b"014lK")
+        session.wait_text("Function documentation")
+        session.send(b"q")
+        session.wait_text("Captured old caller.rs")
+        session.send(b"K")
+        session.wait_text("Captured terminal documentation.")
+        session.send(b",q")
+        session.finish()
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"/docs_caller\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old docs.rs")
+    session.send(b"019lK")
+    session.wait_text("Documentation candidates")
+    session.wait_text("2 results")
+    session.send(b"j\r")
+    session.wait_text("Documentation unavailable")
+    session.send(b"k\r")
+    session.wait_text("Captured ambiguous documentation.")
+    session.send(b",q")
+    session.finish()
+    docs_config = root / "documentation.toml"
+    for style in ["vim", "emacs"]:
+        for binding in ["D", ""]:
+            docs_config.write_text(f'[features]\nkeymap="{style}"\n[keybindings]\nshow_documentation="{binding}"\n')
+            command = [str(binary), "--config", str(docs_config)]
+            help_result = subprocess.run([*command, "--help"], env=env, capture_output=True, text=True, check=True)
+            assert f"show_documentation: {binding or '(disabled)'}\n" in help_result.stdout
+            session = Session([*command, "--", "HEAD"])
+            session.wait_text("Files")
+            session.send(b"/main_target\r")
+            session.wait_text("Search candidates")
+            origin = session.text()
+            session.send(b"K")
+            assert session.text() == origin, f"replaced default K remained active: {style}, {binding!r}"
+            session.send(b"D")
+            if binding:
+                session.wait_text("Function documentation")
+                session.wait_text("Captured terminal documentation.")
+                session.send(b"q")
+                session.wait_text("Search candidates")
+            else:
+                assert session.text() == origin, f"disabled documentation action ran: {style}"
+            session.send(b",q")
+            session.finish()
+    docs_config.unlink()
+    assert docs_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    print("PTY passed: captured function documentation, custom/disabled keys in both styles, effective help, dismissal, tiny terminals and global quit", flush=True)
 
     # q closes a view first; leader-q exits directly from every context.
     for source_view in [False, True]:

@@ -40,6 +40,7 @@ actions! {
     SearchNext => "search_next", SearchPrevious => "search_previous", OpenDiffView => "open_diff_view", CloseDiffView => "close_diff_view",
     SwitchPane => "switch_pane", CloseOrQuit => "close_or_quit", Quit => "quit", SearchSymbols => "search_symbols", GoToDefinition => "go_to_definition",
     GoToReferences => "go_to_references", GoBack => "go_back", OldSide => "old_side", NewSide => "new_side",
+    ShowDocumentation => "show_documentation",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
 }
 #[derive(Clone)]
@@ -90,6 +91,7 @@ impl Bindings {
             (OldSide, &["["]),
             (NewSide, &["]"]),
             (AnalysisDetails, &["?"]),
+            (ShowDocumentation, &["K"]),
             (ToggleMark, &["space"]),
             (SearchWord, &["*"]),
             (SearchWordBackward, &["#"]),
