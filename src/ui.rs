@@ -9,7 +9,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
@@ -49,7 +49,12 @@ fn clip_name(name: &str, width: usize) -> String {
     format!("{left}…{}", right.concat())
 }
 
-fn file_row(item: &crate::git::Item, reviewed: bool, width: usize) -> Line<'static> {
+fn file_row(
+    item: &crate::git::Item,
+    reviewed: bool,
+    width: usize,
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
     use crate::git::Statistics;
     let name = item.name();
     let available = width.saturating_sub(2);
@@ -122,14 +127,18 @@ fn file_row(item: &crate::git::Item, reviewed: bool, width: usize) -> Line<'stat
     let mut spans = vec![
         Span::styled(
             if reviewed { "+ " } else { "- " },
-            Style::default().fg(if reviewed { Color::Gray } else { Color::Yellow }),
+            Style::default().fg(if reviewed {
+                theme.reviewed_mark
+            } else {
+                theme.pending_mark
+            }),
         ),
         Span::styled(
             displayed_name,
             Style::default().fg(if reviewed {
-                Color::DarkGray
+                theme.reviewed_name
             } else {
-                Color::White
+                theme.pending_name
             }),
         ),
     ];
@@ -139,11 +148,11 @@ fn file_row(item: &crate::git::Item, reviewed: bool, width: usize) -> Line<'stat
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 "+".repeat(plus),
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.stat_plus),
             ));
             spans.push(Span::styled(
                 "-".repeat(minus),
-                Style::default().fg(Color::Red),
+                Style::default().fg(theme.stat_minus),
             ));
         }
     }
@@ -182,9 +191,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     item,
                     *reviewed,
                     panels[0].width.saturating_sub(4) as usize,
+                    &app.theme,
                 ))
                 .style(if index == app.selected {
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    app.theme.selection
                 } else {
                     Style::default()
                 })
@@ -200,12 +210,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         "Files"
                     })
                     .border_style(Style::default().fg(if app.focus == Focus::Files {
-                        Color::Cyan
+                        app.theme.border_focused
                     } else {
-                        Color::DarkGray
+                        app.theme.border_unfocused
                     })),
             )
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED))
+            .highlight_style(app.theme.selection)
             .highlight_symbol("› ");
         let mut selection = ListState::default();
         app.file_area = Block::default().borders(Borders::ALL).inner(panels[0]);
@@ -237,9 +247,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     preview.title.as_deref().unwrap_or("Diff")
                 })
                 .border_style(Style::default().fg(if app.focus == Focus::Preview {
-                    Color::Cyan
+                    app.theme.border_focused
                 } else {
-                    Color::DarkGray
+                    app.theme.border_unfocused
                 })),
             area,
         );
@@ -261,7 +271,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         frame.render_widget(
             Paragraph::new(format!("{total} lines  {row}:{column}  {scroll}"))
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default().fg(app.theme.metrics)),
             status_area,
         );
         if app.focus == Focus::Preview && total > 0 && app.viewport.0 > 0 && app.viewport.1 > 0 {
@@ -286,8 +296,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .split("; ")
                 .find(|note| note.starts_with("Display omitted"))
         });
-    let status = prompt.as_deref().or(omission).unwrap_or(app.status.trim());
-    frame.render_widget(Paragraph::new(status), areas[1]);
+    if let Some(command) = &app.command {
+        // The command line owns the status row and the terminal cursor.
+        let text = format!(":{}", command.text);
+        let width = text.width();
+        let available = areas[1].width as usize;
+        let skip = width.saturating_sub(available.saturating_sub(1));
+        let mut shown = String::new();
+        let mut cells = 0;
+        for grapheme in text.graphemes(true) {
+            if cells >= skip {
+                shown.push_str(grapheme);
+            }
+            cells += grapheme.width();
+        }
+        let column = shown.width().min(available.saturating_sub(1));
+        frame.render_widget(Paragraph::new(shown), areas[1]);
+        if areas[1].width > 0 {
+            frame.set_cursor_position((areas[1].x + column as u16, areas[1].y));
+        }
+    } else {
+        let status = prompt.as_deref().or(omission).unwrap_or(app.status.trim());
+        frame.render_widget(Paragraph::new(status), areas[1]);
+    }
     frame.render_widget(Paragraph::new(app.bindings.legend()), areas[2]);
 }
 

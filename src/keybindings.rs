@@ -44,6 +44,7 @@ actions! {
     PreviewDefinition => "preview_definition",
     ToggleAfterChanges => "toggle_after_changes",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
+    CommandLine => "command_line",
 }
 #[derive(Clone)]
 struct Binding {
@@ -125,6 +126,7 @@ impl Bindings {
             (HalfPageDown, &["ctrl-d"]),
             (PageUp, &["ctrl-b"]),
             (PageDown, &["ctrl-f"]),
+            (CommandLine, &[":"]),
         ];
         let emacs: &[(Action, &[&str])] = &[
             (GoToDefinition, &["alt-."]),
@@ -142,6 +144,7 @@ impl Bindings {
             (LastLine, &["alt->"]),
             (PageDown, &["ctrl-v"]),
             (PageUp, &["alt-v"]),
+            (CommandLine, &["alt-x"]),
         ];
         for (action, labels) in
             defaults
@@ -317,6 +320,7 @@ impl Bindings {
             (CloseDiffView, "close"),
             (CloseOrQuit, "close/quit"),
             (Quit, "quit"),
+            (CommandLine, "command"),
         ]
         .into_iter()
         .filter_map(|(action, text)| {

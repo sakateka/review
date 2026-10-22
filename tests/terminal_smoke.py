@@ -185,6 +185,14 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             os.close(self.master)
             os.close(self.slave)
 
+    # The palette assertions below pin the discovered config to review-classic;
+    # the theme block checks the gruvbox-dark default without any config.
+    config_dir = root / "config" / "review"
+    config_dir.mkdir(parents=True)
+    config_file = config_dir / "config.toml"
+    classic_config = '[appearance]\ncolorscheme = "review-classic"\n'
+    config_file.write_text(classic_config)
+
     # Installed YAML colors in the actual diff and captured source panes.
     yaml_text = (pathlib.Path(__file__).parent / "fixtures/yaml-colors.yaml").read_text()
     (repo / "colors.yaml").write_text(yaml_text)
@@ -252,6 +260,117 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     git_run("rm", "--cached", "colors.toml")
     git_run("commit", "-qm", "remove toml fixture")
     before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+
+    # Installed themes and command line: gruvbox-dark without config, runtime-only
+    # switching, completion, cancel, errors, Emacs alt-x and invalid startup names.
+    config_file.unlink()
+    def token_color(session, row_text, token):
+        row, line = next((row, line) for row, line in enumerate(session.text().splitlines()) if row_text in line)
+        return session.colors[(row, line.index(row_text) + row_text.index(token))]
+    def status_row(session):
+        return session.text().splitlines()[28]
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("+fn caller()")
+    assert token_color(session, "+fn caller()", "fn") == (251, 73, 52), session.colors
+    assert token_color(session, "+fn caller()", "caller") == (142, 192, 124)
+    session.send(b":")
+    assert status_row(session).startswith(":"), session.text()
+    assert session.cursor_visible and (session.row, session.col) == (28, 1), (session.row, session.col)
+    session.send(b"colo\t")
+    session.wait_text(":colorscheme ")
+    session.send(b" gru\t")
+    session.wait_text(":colorscheme gruvbox-dark")
+    session.send(b"\t")
+    session.wait_text(":colorscheme gruvbox-light")
+    assert (session.row, session.col) == (28, len(":colorscheme gruvbox-light"))
+    session.send(b"\x1b")
+    assert ":colorscheme" not in session.text(), session.text()
+    assert "┌Diff" in session.text(), "Escape in the command line closed the diff"
+    assert token_color(session, "+fn caller()", "fn") == (251, 73, 52)
+    session.send(b":colorscheme nope\r")
+    session.wait_text('Unknown colorscheme "nope"')
+    assert token_color(session, "+fn caller()", "fn") == (251, 73, 52)
+    session.send(b":colorscheme review-classic\r")
+    session.wait_text("appearance.colorscheme=review-classic")
+    assert token_color(session, "+fn caller()", "fn") == 5, session.text()
+    assert token_color(session, "+fn caller()", "caller") == 4
+    session.send(b":set appearance.colorscheme=gruvbox-dark\r")
+    session.wait_text("appearance.colorscheme=gruvbox-dark")
+    assert token_color(session, "+fn caller()", "fn") == (251, 73, 52)
+    quit_session = session
+    quit_session.send(b",q")
+    quit_session.finish()
+    session = Session([str(binary), "--keymap", "emacs", "--", "HEAD"])
+    session.wait_text("Files")
+    session.send(b"\x1bx")
+    assert status_row(session).startswith(":"), session.text()
+    session.send(b"colorscheme\r")
+    session.wait_text("appearance.colorscheme=gruvbox-dark")
+    session.send(b",q")
+    session.finish()
+    # Default-theme Rust captured source view and YAML/TOML diffs and source.
+    assert before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"/caller\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured ")
+    assert "caller.rs" in session.text(), session.text()
+    # The view opens scrolled to the symbol column, so "fn" is off-screen.
+    assert token_color(session, "caller() {", "caller") == (142, 192, 124), session.text()
+    assert token_color(session, "// ", "//") == (146, 131, 116), session.text()
+    session.send(b",q")
+    session.finish()
+    (repo / "colors.yaml").write_text(yaml_text)
+    (repo / "colors.toml").write_text(toml_text)
+    git_run("add", "colors.yaml", "colors.toml")
+    git_run("commit", "-qm", "theme fixtures")
+    (repo / "colors.yaml").write_text(yaml_text.replace("42", "43"))
+    (repo / "colors.toml").write_text(toml_text.replace("42", "43"))
+    theme_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    session = Session([str(binary), "--", "HEAD", "--", "colors.yaml"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("+  count: 43")
+    for row_text, token, color in [("+  count: 43", "count", (131, 165, 152)), ("+  count: 43", "43", (211, 134, 155))]:
+        assert token_color(session, row_text, token) == color, (token, session.text())
+    session.send(b"\x1b")
+    session.send(b"/service\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old colors.yaml")
+    for token, color in [("service:", (131, 165, 152)), ("café", (184, 187, 38)), ("42", (211, 134, 155)), ("# review", (146, 131, 116))]:
+        assert token_color(session, token, token) == color, (token, session.text())
+    session.send(b",q")
+    session.finish()
+    session = Session([str(binary), "--", "HEAD", "--", "colors.toml"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("+count = 43")
+    for row_text, token, color in [("+count = 43", "count", (131, 165, 152)), ("+count = 43", "43", (211, 134, 155))]:
+        assert token_color(session, row_text, token) == color, (token, session.text())
+    for token, color in [("café", (184, 187, 38)), ("# review", (146, 131, 116))]:
+        assert token_color(session, token, token) == color, (token, session.text())
+    session.send(b",q")
+    session.finish()
+    assert theme_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    for name in ["colors.yaml", "colors.toml"]:
+        (repo / name).unlink()
+        git_run("rm", "-q", "--cached", name)
+    git_run("commit", "-qm", "remove theme fixtures")
+    before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    assert not (root / "state").exists(), "theme commands changed marks"
+    assert not config_file.exists(), "theme commands wrote configuration"
+    bad_theme = root / "bad-theme.toml"
+    bad_theme.write_text('[appearance]\ncolorscheme = "nope"\n')
+    result = subprocess.run([str(binary), "--config", str(bad_theme), "--", "HEAD"], cwd=repo, env=env, capture_output=True)
+    assert result.returncode == 1 and result.stderr.startswith(b"review: ") and b'"nope"' in result.stderr, result.stderr
+    assert b"interactive terminal" not in result.stderr, "theme was not validated before terminal setup"
+    config_file.write_text(classic_config)
+    print("PTY passed: default theme, command line, completion, runtime theme switching and invalid themes", flush=True)
 
     # Installed captured-context toggle: reversible, explicit marks unchanged,
     # source bytes immutable, and ordinary mode restored on reopen/restart.
@@ -354,9 +473,6 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     # Config and keymap acceptance uses the installed executable and actual
     # terminal modifier events, independent of the in-process dispatch tests.
     config_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
-    config_dir = root / "config" / "review"
-    config_dir.mkdir(parents=True)
-    config_file = config_dir / "config.toml"
     config_file.write_text('[features]\nkeymap = "emacs"\nreadline = false\n')
     session = Session()
     session.wait_text("Files")
@@ -490,7 +606,7 @@ go_to_definition = "gD"
     help_result = subprocess.run([str(binary), "--help", "--config", str(explicit_config), "--keymap", "vim"], env=env, capture_output=True, text=True, check=True)
     assert "cursor_down: (disabled)\n" in help_result.stdout
     assert "Active bindings (Vim)" in help_result.stdout
-    config_file.unlink()
+    config_file.write_text(classic_config)
     assert config_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     print("PTY passed: discovered/explicit config, Vim/Emacs, overrides, readline, disabled/removed keys and invalid config", flush=True)
 

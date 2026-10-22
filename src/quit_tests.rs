@@ -25,7 +25,10 @@ fn q_closes_each_view_before_exiting_in_both_styles() {
         assert!(app.navigation.is_none() && app.preview.is_none());
         assert!(app.key(KeyCode::Char('q')));
         app.capture.unavailable = Some("original output".into());
-        app.preview = Some(preview::Preview::original(b"original output"));
+        app.preview = Some(preview::Preview::original(
+            b"original output",
+            &theme::Theme::default(),
+        ));
         assert!(!app.key(KeyCode::Char('q')));
         assert!(app.preview.is_none());
         assert!(app.key(KeyCode::Char('q')));

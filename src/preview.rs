@@ -1,8 +1,9 @@
-use crate::{git::Item, source};
-use ratatui::{
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
+use crate::{
+    git::Item,
+    source,
+    theme::{Base, Role, Theme},
 };
+use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
 use std::{ops::Range, path::Path};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
@@ -22,15 +23,16 @@ pub struct Preview {
     pub cells: Vec<Vec<Option<usize>>>,
     removed: Option<Vec<bool>>,
     ordinary: Option<Box<Preview>>,
+    /// Theme-independent meaning of every span, parallel to `lines`.
+    roles: Vec<Vec<Role>>,
+    theme: Theme,
 }
 
-type MappedColors<'a> = (
-    &'a source::Sources,
-    &'a [Option<Color>],
-    &'a [Option<Color>],
-);
+type Captures = Vec<Option<u8>>;
+type MappedCaptures<'a> = (&'a source::Sources, &'a [Option<u8>], &'a [Option<u8>]);
 
-fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
+/// Per-byte capture indices into the shared theme capture table.
+fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
     let path = std::path::Path::new(std::str::from_utf8(&side.path)?);
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let (language, query) = match extension {
@@ -93,31 +95,16 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
         "comment", "string", "keyword", "function", "type", "constant", "number", "operator",
         "variable",
     ];
-    let mut colors = vec![
-        Color::DarkGray,
-        Color::Green,
-        Color::Magenta,
-        Color::Blue,
-        Color::Cyan,
-        Color::Yellow,
-        Color::Yellow,
-        Color::Cyan,
-        Color::White,
-    ];
     if matches!(extension, "yaml" | "yml") {
         names.extend(["property", "boolean", "label", "attribute", "punctuation"]);
-        colors.extend([
-            Color::Cyan,
-            Color::Magenta,
-            Color::Blue,
-            Color::Magenta,
-            Color::DarkGray,
-        ]);
     }
     if extension == "toml" {
         names.extend(["property", "boolean", "string.special", "punctuation"]);
-        colors.extend([Color::Cyan, Color::Magenta, Color::Blue, Color::DarkGray]);
     }
+    let captures: Vec<_> = names
+        .iter()
+        .map(|name| crate::theme::capture(name))
+        .collect();
     let mut configuration =
         HighlightConfiguration::new(language.into(), extension, &query, "", "")?;
     configuration.configure(&names);
@@ -130,11 +117,13 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
     let mut bytes = vec![None; side.content.len()];
     for event in events {
         match event? {
-            HighlightEvent::HighlightStart(highlight) => stack.push(colors[highlight.0]),
+            HighlightEvent::HighlightStart(highlight) => stack.push(captures[highlight.0]),
             HighlightEvent::HighlightEnd => {
                 stack.pop();
             }
-            HighlightEvent::Source { start, end } => bytes[start..end].fill(stack.last().copied()),
+            HighlightEvent::Source { start, end } => {
+                bytes[start..end].fill(stack.last().copied().flatten())
+            }
         }
     }
     Ok(bytes)
@@ -178,18 +167,22 @@ fn offsets(text: &str) -> Vec<usize> {
 }
 
 impl Preview {
-    pub fn original(bytes: &[u8]) -> Self {
-        {
-            let mut preview =
-                Self::compose(&crate::git::visible_bytes(bytes), None, None, false, false);
-            preview.locations.fill((None, None));
-            preview.cells.clear();
-            preview.removed = None;
-            preview
-        }
+    pub fn original(bytes: &[u8], theme: &Theme) -> Self {
+        let mut preview = Self::compose(
+            &crate::git::visible_bytes(bytes),
+            None,
+            None,
+            false,
+            false,
+            theme,
+        );
+        preview.locations.fill((None, None));
+        preview.cells.clear();
+        preview.removed = None;
+        preview
     }
 
-    pub fn item(cwd: &Path, item: &Item) -> Self {
+    pub fn item(cwd: &Path, item: &Item, theme: &Theme) -> Self {
         if item.patch.len() > 256 * 1024 {
             let mut preview = Self::compose(
                 &crate::git::visible_bytes(&item.patch),
@@ -197,6 +190,7 @@ impl Preview {
                 None,
                 false,
                 false,
+                theme,
             );
             preview.locations.fill((None, None));
             preview.cells.clear();
@@ -228,6 +222,7 @@ impl Preview {
             reason,
             text.is_ok(),
             false,
+            theme,
         );
         if text.is_err() {
             preview.locations.fill((None, None));
@@ -237,10 +232,11 @@ impl Preview {
 
     fn compose(
         patch: &str,
-        mapped: Option<MappedColors<'_>>,
+        mapped: Option<MappedCaptures<'_>>,
         reason: Option<String>,
         escape_backslashes: bool,
         source_view: bool,
+        theme: &Theme,
     ) -> Self {
         let mut rows = patch.split_terminator('\n');
         let raw: Vec<_> = rows.by_ref().take(20000).collect();
@@ -305,6 +301,7 @@ impl Preview {
         let mut old_line = 0;
         let mut new_line = 0;
         let mut lines = Vec::new();
+        let mut roles = Vec::new();
         let mut locations = Vec::new();
         let mut cells = Vec::new();
         for (index, text) in raw.iter().enumerate() {
@@ -315,14 +312,10 @@ impl Preview {
             let prefix = text.as_bytes().first().copied();
             let source_line = source_lines[index];
             let base = match prefix {
-                Some(b'+') if source_line => {
-                    Style::default().fg(Color::Green).bg(Color::Rgb(10, 30, 10))
-                }
-                Some(b'-') if source_line => {
-                    Style::default().fg(Color::Red).bg(Color::Rgb(35, 10, 10))
-                }
-                _ if text.starts_with("@@") => Style::default().fg(Color::Cyan),
-                _ => Style::default(),
+                Some(b'+') if source_line => Base::Added,
+                Some(b'-') if source_line => Base::Removed,
+                _ if text.starts_with("@@") => Base::Hunk,
+                _ => Base::Plain,
             };
             let map = if source_line {
                 mapped.and_then(|(_, old, new)| {
@@ -352,6 +345,7 @@ impl Preview {
                 (None, None)
             });
             let mut spans = Vec::new();
+            let mut span_roles = Vec::new();
             let graphemes: Vec<_> = if source_line {
                 std::iter::once((0, &text[..1]))
                     .chain(
@@ -370,18 +364,17 @@ impl Preview {
             let mut row_cells = Vec::new();
             let mut retained_graphemes = 0;
             for (byte, grapheme) in graphemes.into_iter().take(4096) {
-                let mut style = base;
+                let mut role = Role {
+                    base,
+                    ..Role::default()
+                };
                 if source_line && byte > 0 {
-                    if let Some((colors, offset)) = map
-                        && let Some(Some(color)) = colors.get(offset + byte - 1)
-                    {
-                        style = style.fg(*color);
+                    if let Some((captures, offset)) = map {
+                        role.capture = captures.get(offset + byte - 1).copied().flatten();
                     }
-                    if emphasis[index].iter().any(|range| {
+                    role.emphasis = emphasis[index].iter().any(|range| {
                         range.start < byte - 1 + grapheme.len() && range.end > byte - 1
-                    }) {
-                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                    }
+                    });
                 }
                 let rendered = if grapheme == "\t" {
                     " ".repeat(4 - column.saturating_sub(usize::from(source_line)) % 4)
@@ -416,10 +409,12 @@ impl Preview {
                     scalar += grapheme.chars().count();
                 }
                 column += rendered.width();
-                spans.push(Span::styled(rendered, style));
+                spans.push(Span::raw(rendered));
+                span_roles.push(role);
             }
             cells.push(row_cells);
             lines.push(Line::from(spans));
+            roles.push(span_roles);
             if source_line {
                 if prefix != Some(b'+') {
                     old_line += 1;
@@ -445,7 +440,10 @@ impl Preview {
                     .collect()
             }),
             ordinary: None,
+            roles,
+            theme: *theme,
         };
+        preview.restyle(theme);
         if omitted_rows {
             preview.add_reason("Display omitted rows after 20000");
         }
@@ -483,20 +481,26 @@ impl Preview {
             };
             let mapped = (map(cursor), map(top));
             let ordinary = self.clone();
-            self.lines = retained
+            (self.lines, self.roles) = retained
                 .iter()
                 .map(|row| {
                     let mut line = ordinary.lines[*row].clone();
+                    let mut roles = ordinary.roles.get(*row).cloned().unwrap_or_default();
                     if row
                         .checked_sub(1)
                         .is_some_and(|previous| removed.get(previous) == Some(&true))
                         && line.to_string().trim_start_matches('\\') == " No newline at end of file"
                     {
-                        line.spans.push(Span::raw(" (removed old-side line)"));
+                        roles.resize(line.spans.len(), Role::default());
+                        line.spans.push(Span::styled(
+                            " (removed old-side line)",
+                            self.theme.style(Role::default()),
+                        ));
+                        roles.push(Role::default());
                     }
-                    line
+                    (line, roles)
                 })
-                .collect();
+                .unzip();
             self.locations = retained
                 .iter()
                 .map(|row| {
@@ -528,6 +532,28 @@ impl Preview {
         mapped
     }
 
+    /// Re-derive every span style, including the ordinary view kept behind
+    /// the after-changes projection, without touching content or positions.
+    pub fn restyle(&mut self, theme: &Theme) {
+        self.theme = *theme;
+        for (line, roles) in self.lines.iter_mut().zip(&self.roles) {
+            for (span, role) in line.spans.iter_mut().zip(roles) {
+                span.style = theme.style(*role);
+            }
+        }
+        if let Some(ordinary) = &mut self.ordinary {
+            ordinary.restyle(theme);
+        }
+    }
+
+    /// Append another rendering's rows below this one.
+    pub fn append(&mut self, other: Preview) {
+        self.width = self.width.max(other.width);
+        self.roles.resize(self.lines.len(), Vec::new());
+        self.lines.extend(other.lines);
+        self.roles.extend(other.roles);
+    }
+
     fn add_reason(&mut self, note: &str) {
         if let Some(reason) = &mut self.reason {
             reason.push_str("; ");
@@ -544,6 +570,7 @@ impl Preview {
         line: usize,
         col: usize,
         len: usize,
+        theme: &Theme,
     ) -> anyhow::Result<(Self, usize)> {
         anyhow::ensure!(
             line > 0 && line <= 20000,
@@ -555,7 +582,7 @@ impl Preview {
             .nth(line - 1)
             .ok_or_else(|| anyhow::anyhow!("Target source row unavailable"))?;
         let target_end = col.saturating_add(len);
-        let preview = Self::source(source);
+        let preview = Self::source(source, theme);
         let cells = preview.cells.get(line - 1);
         let mut scalar = 0;
         let mut left = None;
@@ -582,41 +609,43 @@ impl Preview {
         Ok((preview, left.expect("validated retained target")))
     }
 
-    pub fn source(source: &source::CapturedSource) -> Self {
+    pub fn source(source: &source::CapturedSource, theme: &Theme) -> Self {
         let mut preview = match std::str::from_utf8(&source.bytes) {
-            Ok(text) => Self::compose(text, None, None, true, true),
+            Ok(text) => Self::compose(text, None, None, true, true, theme),
             Err(_) => {
-                let mut preview = Self::original(&source.bytes);
+                let mut preview = Self::original(&source.bytes, theme);
                 preview.add_reason("Source positions unavailable: invalid UTF-8");
                 return preview;
             }
         };
         if let Ok(text) = std::str::from_utf8(&source.bytes)
-            && let Ok(colors) = syntax(&source::Side {
+            && let Ok(captures) = syntax(&source::Side {
                 path: source.path.clone(),
                 content: text.into(),
             })
         {
             let starts = offsets(text);
-            for (row, (line, raw)) in preview
+            for (row, ((line, roles), raw)) in preview
                 .lines
-                .iter_mut()
+                .iter()
+                .zip(&mut preview.roles)
                 .zip(text.split_terminator('\n'))
                 .enumerate()
             {
                 let bytes: Vec<_> = raw.char_indices().map(|(byte, _)| byte).collect();
                 let mut cell = 0;
-                for span in &mut line.spans {
+                for (span, role) in line.spans.iter().zip(roles) {
                     if let Some(Some(scalar)) =
                         preview.cells.get(row).and_then(|cells| cells.get(cell))
                         && let Some(byte) = bytes.get(*scalar)
-                        && let Some(Some(color)) = colors.get(starts[row] + byte)
+                        && let Some(Some(capture)) = captures.get(starts[row] + byte)
                     {
-                        span.style = span.style.fg(*color);
+                        role.capture = Some(*capture);
                     }
                     cell += span.width();
                 }
             }
+            preview.restyle(theme);
         }
         preview.title = Some(format!(
             "Captured {} {}",
@@ -711,7 +740,7 @@ impl Preview {
                     for span in &mut line.spans {
                         let end = column + span.width();
                         if matches.iter().any(|m| column < m.end && end > m.start) {
-                            span.style = span.style.bg(Color::Rgb(80, 65, 0));
+                            span.style = span.style.bg(self.theme.search_bg);
                         }
                         column = end;
                     }

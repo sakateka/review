@@ -157,6 +157,7 @@ fn navigation_preview_focus_mark_and_restart() {
     app.key(KeyCode::Char('m'));
     assert_eq!(app.marks, [false, true]);
     let mut restarted = application(directory.path(), state.path());
+    restarted.set_theme(theme::Theme::classic());
     assert_eq!(restarted.marks, [false, true]);
     assert!(restarted.preview.is_none());
     assert!(
@@ -186,7 +187,7 @@ fn mapped_source_and_styling_preserve_the_captured_lines() {
         source::load(directory.path(), item).unwrap().new.content,
         sources.new.content
     );
-    let preview = preview::Preview::item(directory.path(), item);
+    let preview = preview::Preview::item(directory.path(), item, &theme::Theme::classic());
     assert_eq!(preview.reason, None);
     let plain: Vec<_> = preview.lines.iter().map(ToString::to_string).collect();
     let expected: Vec<_> = std::str::from_utf8(&item.patch)
@@ -279,7 +280,11 @@ fn binary_unproven_structure_and_unsupported_source_stay_readable() {
     .unwrap();
     let captured = capture(directory.path(), &["HEAD"]);
     assert_eq!(captured.items.len(), 1);
-    let preview = preview::Preview::item(directory.path(), &captured.items[0]);
+    let preview = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::default(),
+    );
     assert!(preview.reason.unwrap().contains("final newlines"));
     assert!(!preview.lines.is_empty());
 }
@@ -415,7 +420,8 @@ fn pathname_bytes_and_nested_separator_select_exactly() {
 
 #[test]
 fn unicode_tabs_clipping_and_scroll_bounds_use_screen_coordinates() {
-    let preview = preview::Preview::original("a\t界é🙂z\nsecond\n".as_bytes());
+    let preview =
+        preview::Preview::original("a\t界é🙂z\nsecond\n".as_bytes(), &theme::Theme::default());
     assert_eq!(preview.lines[0].to_string(), "a   界é🙂z");
     let visible = preview.visible(0, 5, 1, 4);
     assert_eq!(visible[0].to_string(), " é🙂");
@@ -521,7 +527,7 @@ fn nominal_changed_patch_clears_only_its_mark_and_sessions_are_separate() {
 
 #[test]
 fn preview_preserves_carriage_returns_in_structured_and_original_output() {
-    let original = preview::Preview::original(b"plain\r\n");
+    let original = preview::Preview::original(b"plain\r\n", &theme::Theme::default());
     assert_eq!(original.lines[0].to_string(), "plain\\r");
 
     let directory = fixture();
@@ -529,7 +535,11 @@ fn preview_preserves_carriage_returns_in_structured_and_original_output() {
     let old = std::fs::read_to_string(&path).unwrap();
     std::fs::write(path, old.replace('\n', "\r\n")).unwrap();
     let captured = capture(directory.path(), &["HEAD"]);
-    let preview = preview::Preview::item(directory.path(), &captured.items[0]);
+    let preview = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::default(),
+    );
     assert_eq!(preview.reason, None);
     let removed = preview
         .lines
@@ -550,7 +560,7 @@ fn preview_preserves_carriage_returns_in_structured_and_original_output() {
 
 #[test]
 fn preview_graphemes_survive_composition_and_test_backend_clipping() {
-    let preview = preview::Preview::original("e\u{301}👩‍💻Z\n".as_bytes());
+    let preview = preview::Preview::original("e\u{301}👩‍💻Z\n".as_bytes(), &theme::Theme::default());
     assert_eq!(preview.width, 4);
     for (left, width, expected) in [
         (0, 4, vec!["e\u{301}", "👩‍💻", " ", "Z"]),
@@ -587,7 +597,11 @@ fn preview_intraline_emphasizes_source_starting_with_header_like_dashes() {
     git_run(directory.path(), &["commit", "-qm", "raw string"]);
     std::fs::write(path, old.replace("--old", "--new")).unwrap();
     let captured = capture(directory.path(), &["HEAD"]);
-    let preview = preview::Preview::item(directory.path(), &captured.items[0]);
+    let preview = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::default(),
+    );
     assert_eq!(preview.reason, None);
     for expected in ["---old", "+--new"] {
         let line = preview
@@ -1142,7 +1156,9 @@ fn invalid_native_bytes_have_distinct_visible_names_and_output() {
     assert_eq!(visible.len(), 3);
     let rendered: std::collections::BTreeSet<_> = [b"\xff".as_slice(), "�".as_bytes(), b"\\xff"]
         .into_iter()
-        .map(|bytes| preview::Preview::original(bytes).lines[0].to_string())
+        .map(|bytes| {
+            preview::Preview::original(bytes, &theme::Theme::default()).lines[0].to_string()
+        })
         .collect();
     assert_eq!(rendered.len(), 3);
 }
@@ -3079,7 +3095,7 @@ fn navigation_catalog_acquisition_limits_unchanged_blobs_before_retention() {
 #[test]
 fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
     let many_rows = "x\n".repeat(20001);
-    let original = preview::Preview::original(many_rows.as_bytes());
+    let original = preview::Preview::original(many_rows.as_bytes(), &theme::Theme::default());
     assert!(original.reason.unwrap().contains("omitted rows"));
     let directory = fixture();
     change(directory.path());
@@ -3090,13 +3106,21 @@ fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
         opaque,
         state::Store::at(state_dir.path(), directory.path(), &[]),
     );
-    opaque_app.preview = Some(preview::Preview::original(many_rows.as_bytes()));
+    opaque_app.preview = Some(preview::Preview::original(
+        many_rows.as_bytes(),
+        &theme::Theme::default(),
+    ));
     assert!(screen_text(&screen(&mut opaque_app, 120, 20)).contains("Display omitted rows"));
     let mut captured = capture(directory.path(), &["HEAD"]);
     captured.items[0].patch = format!("{}\n", "界".repeat(4100)).into_bytes();
-    let basic = preview::Preview::item(directory.path(), &captured.items[0]);
+    let basic = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::default(),
+    );
     assert!(basic.reason.unwrap().contains("omitted columns"));
-    let original_wide = preview::Preview::original("界".repeat(4100).as_bytes());
+    let original_wide =
+        preview::Preview::original("界".repeat(4100).as_bytes(), &theme::Theme::default());
     assert!(original_wide.reason.unwrap().contains("omitted columns"));
     std::fs::write(
         directory.path().join("one.rs"),
@@ -3104,12 +3128,20 @@ fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
     )
     .unwrap();
     let enriched_capture = capture(directory.path(), &["HEAD"]);
-    let enriched = preview::Preview::item(directory.path(), &enriched_capture.items[0]);
+    let enriched = preview::Preview::item(
+        directory.path(),
+        &enriched_capture.items[0],
+        &theme::Theme::default(),
+    );
     let reason = enriched.reason.unwrap();
     assert!(reason.contains("omitted columns"));
     assert!(!reason.contains("unavailable"));
     captured.items[0].patch = "x\n".repeat(140000).into_bytes();
-    let large_basic = preview::Preview::item(directory.path(), &captured.items[0]);
+    let large_basic = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::default(),
+    );
     let reason = large_basic.reason.unwrap();
     assert!(reason.contains("omitted rows") && reason.contains("Large patch"));
     let mut catalog = source::Catalog::default();
@@ -3119,7 +3151,7 @@ fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
         format!("{}fn late() {{}}\n", "\n".repeat(20000)).into_bytes(),
     );
     assert!(
-        preview::Preview::target(&catalog.sources[0], 20001, 3, 4)
+        preview::Preview::target(&catalog.sources[0], 20001, 3, 4, &theme::Theme::default())
             .unwrap_err()
             .to_string()
             .contains("20000-row")
@@ -3130,7 +3162,7 @@ fn every_preview_reports_omissions_and_excluded_targets_are_refused() {
         format!("{}fn late() {{}}\n", " ".repeat(4100)).into_bytes(),
     );
     assert!(
-        preview::Preview::target(&catalog.sources[1], 1, 4103, 4)
+        preview::Preview::target(&catalog.sources[1], 1, 4103, 4, &theme::Theme::default())
             .unwrap_err()
             .to_string()
             .contains("4096-grapheme")
@@ -3235,16 +3267,18 @@ fn review_fix_target_retention_counts_escaped_backslashes() {
         format!("{}fn target() {{}}\n", "\\".repeat(2500)).into_bytes(),
     );
     let source = &catalog.sources[0];
-    let preview = preview::Preview::source(source);
+    let preview = preview::Preview::source(source, &theme::Theme::default());
     assert!(!preview.lines[0].to_string().contains("target"));
-    let error = preview::Preview::target(source, 1, 2503, 6).unwrap_err();
+    let error = preview::Preview::target(source, 1, 2503, 6, &theme::Theme::default()).unwrap_err();
     assert!(error.to_string().contains("4096-grapheme"));
     catalog.insert(
         source::ComparedSide::New,
         b"retained.rs".to_vec(),
         format!("{}fn target() {{}}\n", "\\".repeat(2000)).into_bytes(),
     );
-    let (preview, left) = preview::Preview::target(&catalog.sources[1], 1, 2003, 6).unwrap();
+    let (preview, left) =
+        preview::Preview::target(&catalog.sources[1], 1, 2003, 6, &theme::Theme::default())
+            .unwrap();
     assert_eq!(left, 4003);
     assert!(
         preview.visible(0, left, 1, 20)[0]
@@ -3364,7 +3398,7 @@ fn cursor_cell_maps_share_tabs_unicode_escapes_and_clipping() {
         b"cells.rs".to_vec(),
         "\t界e\u{301}\\\u{1b}a\n\n".as_bytes().to_vec(),
     );
-    let preview = preview::Preview::source(&catalog.sources[0]);
+    let preview = preview::Preview::source(&catalog.sources[0], &theme::Theme::default());
     assert_eq!(preview.lines[0].to_string(), "    界e\u{301}\\\\\\u{1b}a");
     for (cell, scalar) in [
         (0, 0),
@@ -3391,7 +3425,7 @@ fn cursor_cell_maps_share_tabs_unicode_escapes_and_clipping() {
         b"bad.rs".to_vec(),
         vec![0xff, b'a', b'\n'],
     );
-    let invalid = preview::Preview::source(&catalog.sources[1]);
+    let invalid = preview::Preview::source(&catalog.sources[1], &theme::Theme::default());
     assert!(
         invalid
             .locations
@@ -3404,7 +3438,7 @@ fn cursor_cell_maps_share_tabs_unicode_escapes_and_clipping() {
         b"omitted.rs".to_vec(),
         "界".repeat(4100).into_bytes(),
     );
-    let omitted = preview::Preview::source(&catalog.sources[2]);
+    let omitted = preview::Preview::source(&catalog.sources[2], &theme::Theme::default());
     assert_eq!(omitted.hit_test(0, 8191), Some(4095));
     assert_eq!(omitted.hit_test(0, 8192), None);
     assert!(omitted.reason.unwrap().contains("omitted columns"));
@@ -3413,7 +3447,7 @@ fn cursor_cell_maps_share_tabs_unicode_escapes_and_clipping() {
         b"combining.rs".to_vec(),
         "\\\u{301}x".as_bytes().to_vec(),
     );
-    let combining = preview::Preview::source(&catalog.sources[3]);
+    let combining = preview::Preview::source(&catalog.sources[3], &theme::Theme::default());
     assert_eq!(combining.lines[0].to_string(), "\\\\\u{301}x");
     assert_eq!(combining.hit_test(0, 2), Some(2));
 }
@@ -3635,17 +3669,19 @@ fn review_fix_target_retention_uses_expanded_tab_mapping() {
     }
     let excluded = &catalog.sources[0];
     assert!(
-        !preview::Preview::source(excluded).lines[0]
+        !preview::Preview::source(excluded, &theme::Theme::default()).lines[0]
             .to_string()
             .contains("target")
     );
     assert!(
-        preview::Preview::target(excluded, 1, 1027, 6)
+        preview::Preview::target(excluded, 1, 1027, 6, &theme::Theme::default())
             .unwrap_err()
             .to_string()
             .contains("4096-grapheme")
     );
-    let (preview, left) = preview::Preview::target(&catalog.sources[1], 1, 1003, 6).unwrap();
+    let (preview, left) =
+        preview::Preview::target(&catalog.sources[1], 1, 1003, 6, &theme::Theme::default())
+            .unwrap();
     assert_eq!(left, 4003);
     assert!(
         preview.visible(0, left, 1, 20)[0]
@@ -3662,6 +3698,7 @@ fn vim_motions_counts_and_escape_preserve_read_only_state() {
     let mut app = application(directory.path(), state.path());
     app.preview = Some(preview::Preview::original(
         b"  alpha.beta  gamma\n  second line\nlast\n",
+        &theme::Theme::default(),
     ));
     app.focus = Focus::Preview;
     app.viewport = (2, 12);
@@ -3745,7 +3782,7 @@ fn source_targets_highlight_every_supported_language_without_changing_cell_maps(
             name.as_bytes().to_vec(),
             bytes.clone(),
         );
-        let rendered = preview::Preview::source(&catalog.sources[0]);
+        let rendered = preview::Preview::source(&catalog.sources[0], &theme::Theme::default());
         assert!(
             rendered
                 .lines
@@ -3829,7 +3866,10 @@ fn vim_star_search_wraps_whole_words_with_counts_and_keeps_source_styles() {
         b"search.rs".to_vec(),
         "界e\u{301} foo foo_bar foo\nfoo\nFOO\n".as_bytes().to_vec(),
     );
-    app.preview = Some(preview::Preview::source(&catalog.sources[0]));
+    app.preview = Some(preview::Preview::source(
+        &catalog.sources[0],
+        &theme::Theme::default(),
+    ));
     app.focus = Focus::Preview;
     app.viewport = (2, 10);
     app.cursor = (0, 5);
@@ -3886,7 +3926,10 @@ fn buffer_search_is_local_to_the_retained_view_and_restored_with_history() {
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
-    app.preview = Some(preview::Preview::original(b"foo foo\n"));
+    app.preview = Some(preview::Preview::original(
+        b"foo foo\n",
+        &theme::Theme::default(),
+    ));
     app.focus = Focus::Preview;
     app.viewport = (10, 30);
     app.key(KeyCode::Char('*'));
@@ -3900,12 +3943,13 @@ fn buffer_search_is_local_to_the_retained_view_and_restored_with_history() {
     app.key(KeyCode::Char('n'));
     assert_eq!(app.status, "No previous buffer search");
     assert!(app.preview.as_ref().unwrap().search.is_none());
-    app.preview = Some(preview::Preview::original(b" \n"));
+    app.preview = Some(preview::Preview::original(b" \n", &theme::Theme::default()));
     app.key(KeyCode::Char('*'));
     assert_eq!(app.status, "No word under cursor");
     assert!(app.preview.as_ref().unwrap().search.is_none());
     app.preview = Some(preview::Preview::original(
         b"\xce\xb1\xce\xb2 \xce\xb1\xce\xb2 \xce\xb1\xce\xb2_\xce\xb3\n",
+        &theme::Theme::default(),
     ));
     app.cursor = (0, 0);
     app.key(KeyCode::Char('*'));
@@ -5583,7 +5627,8 @@ fn preview_limits_unicode_recovery_and_unrenderable_target_retain_origin() {
     assert_eq!(result.candidates.len(), 1, "{result:?}");
     assert_eq!(result.candidates[0].tag.col, 8);
     assert!(result.coverage.contains("recovered"));
-    let (_, left) = preview::Preview::target(&catalog.sources[0], 1, 8, 4).unwrap();
+    let (_, left) =
+        preview::Preview::target(&catalog.sources[0], 1, 8, 4, &theme::Theme::default()).unwrap();
     assert!(left > 8);
     for id in (0..1100).rev() {
         catalog.insert(
@@ -5827,13 +5872,14 @@ fn preview_status_empty_fit_cells_fallback_and_tiny_resize() {
     let directory = fixture();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
-    app.preview = Some(preview::Preview::original(b""));
+    app.preview = Some(preview::Preview::original(b"", &theme::Theme::default()));
     app.focus = Focus::Preview;
     app.cursor = (100, 100);
     assert_eq!(preview_status_row(&mut app, 100, 15), "0 lines  0:0  All");
     assert_eq!(app.cursor, (0, 0));
     app.preview = Some(preview::Preview::original(
         "a\t界e\u{301}🙂z\n\n".as_bytes(),
+        &theme::Theme::default(),
     ));
     app.cursor = (0, 7);
     assert_eq!(preview_status_row(&mut app, 100, 7), "2 lines  1:8  All");
@@ -6009,6 +6055,7 @@ fn file_statistics_rows_keep_names_styles_marks_and_resize_safe() {
     let state = tempfile::tempdir().unwrap();
     change(directory.path());
     let mut app = application(directory.path(), state.path());
+    app.set_theme(theme::Theme::classic());
     let rendered = screen(&mut app, 100, 24);
     let text = screen_text(&rendered);
     assert!(text.contains("one.rs"));
@@ -6227,7 +6274,11 @@ fn after_changes_classifies_hunks_with_headers_annotations_invalid_and_bounded_o
     let patch = "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1,2 +1,2 @@\n--- header-like removed source\n+++ header-like added source\n \\t界\n@@ -20 +20 @@\n-deleted\n\\ No newline at end of file\n+retained\n\\ No newline at end of file\n-metadata outside hunk\n";
     for suffix in [Vec::new(), vec![b'\xff'], vec![b'x'; 270000]] {
         captured.items[0].patch = [patch.as_bytes(), &suffix].concat();
-        let mut preview = preview::Preview::item(directory.path(), &captured.items[0]);
+        let mut preview = preview::Preview::item(
+            directory.path(),
+            &captured.items[0],
+            &theme::Theme::default(),
+        );
         let original = preview.lines.clone();
         preview.toggle_after_changes(8, 0);
         let text = preview
@@ -6272,7 +6323,7 @@ fn after_changes_classifies_hunks_with_headers_annotations_invalid_and_bounded_o
         preview.toggle_after_changes(8, 0);
         assert_eq!(preview.lines, original);
     }
-    let mut opaque = preview::Preview::original(patch.as_bytes());
+    let mut opaque = preview::Preview::original(patch.as_bytes(), &theme::Theme::default());
     let original = opaque.lines.clone();
     opaque.toggle_after_changes(8, 0);
     assert_eq!(opaque.lines, original);
@@ -6323,7 +6374,7 @@ fn after_changes_deleted_binary_metadata_and_other_views_remain_truthful() {
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
     for item in &app.capture.items {
-        let mut preview = preview::Preview::item(directory.path(), item);
+        let mut preview = preview::Preview::item(directory.path(), item, &theme::Theme::default());
         let original = preview.lines.clone();
         preview.toggle_after_changes(0, 0);
         assert!(
@@ -6359,7 +6410,7 @@ fn after_changes_deleted_binary_metadata_and_other_views_remain_truthful() {
         assert_eq!(app.preview.as_ref().unwrap().title, before.title);
     }
     let captured = &app.capture.catalog.sources[0];
-    let mut source = preview::Preview::source(captured);
+    let mut source = preview::Preview::source(captured, &theme::Theme::default());
     let original = source.lines.clone();
     source.toggle_after_changes(0, 0);
     assert_eq!(source.lines, original);
@@ -6434,8 +6485,13 @@ fn yaml_colors_distinguish_tokens_in_captured_source_and_both_diff_sides() {
             name.as_bytes().to_vec(),
             text.as_bytes().to_vec(),
         );
-        let source_preview = preview::Preview::source(&catalog.sources[0]);
-        let diff = preview::Preview::item(directory.path(), &captured.items[0]);
+        let source_preview =
+            preview::Preview::source(&catalog.sources[0], &theme::Theme::classic());
+        let diff = preview::Preview::item(
+            directory.path(),
+            &captured.items[0],
+            &theme::Theme::classic(),
+        );
         assert_eq!(diff.reason, None);
         let style_at = |view: &preview::Preview, token: &str| {
             let line = view
@@ -6525,7 +6581,11 @@ fn toml_colors_preserve_captured_sources_coordinates_and_diff_emphasis() {
     // Rendering must continue to use the captured patch and catalog after mutation.
     std::fs::write(&path, "unrelated = 'checkout edit'\n").unwrap();
     let checkout = std::fs::read(&path).unwrap();
-    let diff = preview::Preview::item(directory.path(), &captured.items[0]);
+    let diff = preview::Preview::item(
+        directory.path(),
+        &captured.items[0],
+        &theme::Theme::classic(),
+    );
     assert_eq!(diff.reason, None);
     let style_at = |view: &preview::Preview, token: &str| {
         let line = view
@@ -6549,7 +6609,7 @@ fn toml_colors_preserve_captured_sources_coordinates_and_diff_emphasis() {
             .unwrap()
     };
     for (index, source) in catalog.sources.iter().enumerate() {
-        let view = preview::Preview::source(source);
+        let view = preview::Preview::source(source, &theme::Theme::classic());
         for (token, color) in [
             ("# review", Color::DarkGray),
             ("title", Color::Cyan),
@@ -6870,5 +6930,601 @@ fn definition_preview_movement_before_layout_consumes_centering() {
         assert!(app.cursor.0 >= app.top && app.cursor.0 - app.top < app.viewport.0);
         app.key(KeyCode::Char('q'));
         assert_eq!(screen(&mut app, 100, 24), origin);
+    }
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.key(KeyCode::Char(c));
+    }
+}
+
+fn run_command(app: &mut App, text: &str) {
+    app.key(KeyCode::Char(':'));
+    assert!(app.command.is_some(), "command line did not open");
+    type_text(app, text);
+    app.key(KeyCode::Enter);
+    assert!(app.command.is_none(), "command line stayed open");
+}
+
+fn colors(preview: &preview::Preview) -> Vec<(Option<Color>, Option<Color>)> {
+    preview
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| (span.style.fg, span.style.bg))
+        .collect()
+}
+
+#[test]
+fn theme_registry_lists_bundled_names_and_classic_matches_literals() {
+    let names = theme::Theme::names();
+    for name in [
+        "gruvbox-dark",
+        "gruvbox-light",
+        "Dracula",
+        "review-classic",
+        "ansi",
+    ] {
+        assert!(names.contains(&name), "{name}");
+    }
+    assert_eq!(theme::Theme::default().name, "gruvbox-dark");
+    assert_eq!(theme::Theme::named("dracula").unwrap().name, "Dracula");
+    assert!(theme::Theme::named("nope").is_none());
+    let classic = theme::Theme::named("REVIEW-CLASSIC").unwrap();
+    assert_eq!(classic, theme::Theme::classic());
+    assert_eq!(classic.added_bg, Color::Rgb(10, 30, 10));
+    assert_eq!(classic.removed_bg, Color::Rgb(35, 10, 10));
+    assert_eq!(classic.search_bg, Color::Rgb(80, 65, 0));
+    assert_eq!(classic.default_fg, None);
+    // Every theme keeps diffs, marks and borders distinguishable.
+    for name in names {
+        let theme = theme::Theme::named(name).unwrap();
+        assert_ne!(theme.added_bg, theme.removed_bg, "{name}");
+        assert_ne!(theme.added_fg, theme.removed_fg, "{name}");
+        assert_ne!(theme.reviewed_mark, theme.pending_mark, "{name}");
+        assert_ne!(theme.reviewed_name, theme.pending_name, "{name}");
+        assert_ne!(theme.border_focused, theme.border_unfocused, "{name}");
+        assert_ne!(theme.search_bg, theme.added_bg, "{name}");
+        assert_ne!(theme.search_bg, theme.removed_bg, "{name}");
+    }
+}
+
+#[test]
+fn gruvbox_dark_default_distinguishes_code_tokens_keys_and_diff_sides() {
+    let theme = theme::Theme::default();
+    let directory = fixture();
+    let rust = "// note\nfn one() {\n\tlet answer = \"text\";\n\tlet number = 1;\n\tone();\n}\n";
+    std::fs::write(directory.path().join("one.rs"), rust).unwrap();
+    std::fs::write(directory.path().join("keys.yaml"), "key: 1\n").unwrap();
+    std::fs::write(directory.path().join("keys.toml"), "key = 1\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "tokens"]);
+    std::fs::write(
+        directory.path().join("one.rs"),
+        rust.replace("= 1;", "= 2;"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("keys.yaml"), "key: 2\n").unwrap();
+    std::fs::write(directory.path().join("keys.toml"), "key = 2\n").unwrap();
+    let captured = capture(directory.path(), &["HEAD"]);
+    let item = |name: &str| {
+        captured
+            .items
+            .iter()
+            .find(|item| item.new_path == name.as_bytes())
+            .unwrap()
+    };
+    let fg_at = |view: &preview::Preview, row_text: &str, token: &str| {
+        let line = view
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(row_text))
+            .unwrap_or_else(|| panic!("{row_text}"));
+        let start = line.to_string().find(token).unwrap();
+        let mut offset = 0;
+        line.spans
+            .iter()
+            .find_map(|span| {
+                let contains = offset <= start && start < offset + span.content.len();
+                offset += span.content.len();
+                contains.then_some(span.style)
+            })
+            .unwrap()
+    };
+    let diff = preview::Preview::item(directory.path(), item("one.rs"), &theme);
+    assert_eq!(diff.reason, None);
+    let comment = fg_at(&diff, "// note", "//").fg;
+    let string = fg_at(&diff, "\"text\"", "\"text\"").fg;
+    let keyword = fg_at(&diff, "let answer", "let").fg;
+    let function = fg_at(&diff, "fn one", "one").fg;
+    let number = fg_at(&diff, "+    let number", "2").fg;
+    let yaml = preview::Preview::item(directory.path(), item("keys.yaml"), &theme);
+    let toml = preview::Preview::item(directory.path(), item("keys.toml"), &theme);
+    let yaml_key = fg_at(&yaml, "+key", "key").fg;
+    let toml_key = fg_at(&toml, "+key", "key").fg;
+    assert_eq!(yaml_key, toml_key);
+    let distinct = [comment, string, keyword, function, number, yaml_key];
+    for (index, color) in distinct.iter().enumerate() {
+        assert!(color.is_some());
+        assert!(
+            !distinct[..index].contains(color),
+            "{distinct:?} repeats {color:?}"
+        );
+    }
+    let added = fg_at(&diff, "+    let number", "2");
+    let removed = fg_at(&diff, "-    let number", "1");
+    assert!(added.bg.is_some() && removed.bg.is_some());
+    assert_ne!(added.bg, removed.bg);
+    assert_eq!(added.bg, Some(theme.added_bg));
+    assert!(
+        added
+            .add_modifier
+            .contains(Modifier::BOLD | Modifier::UNDERLINED)
+    );
+    // The background of ordinary text is never painted.
+    assert!(diff.lines.iter().flat_map(|line| &line.spans).all(|span| {
+        span.style.bg.is_none()
+            || span.style.bg == Some(theme.added_bg)
+            || span.style.bg == Some(theme.removed_bg)
+    }));
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    assert_eq!(app.theme.name, "gruvbox-dark");
+    let rendered = screen(&mut app, 100, 24);
+    assert!(
+        rendered
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "F" && cell.fg == theme.border_focused)
+    );
+}
+
+#[test]
+fn command_line_sets_queries_and_aliases_the_colorscheme() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let default = colors(app.preview.as_ref().unwrap());
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "set appearance.colorscheme=dracula");
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(
+        text.contains(":set appearance.colorscheme=dracula"),
+        "{text}"
+    );
+    app.key(KeyCode::Enter);
+    assert_eq!(app.theme.name, "Dracula");
+    assert!(app.status.contains("Dracula"), "{}", app.status);
+    let dracula = colors(app.preview.as_ref().unwrap());
+    assert_ne!(dracula, default);
+    run_command(&mut app, "colorscheme review-classic");
+    assert_eq!(app.theme.name, "review-classic");
+    let fresh = preview::Preview::item(
+        directory.path(),
+        &app.capture.items[0],
+        &theme::Theme::classic(),
+    );
+    assert_eq!(app.preview.as_ref().unwrap().lines, fresh.lines);
+    run_command(&mut app, "colorscheme");
+    assert!(app.status.contains("review-classic"), "{}", app.status);
+    run_command(&mut app, "set appearance.colorscheme");
+    assert!(app.status.contains("review-classic"), "{}", app.status);
+    run_command(&mut app, "  colorscheme   gruvbox-dark  ");
+    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(colors(app.preview.as_ref().unwrap()), default);
+}
+
+#[test]
+fn command_line_errors_cancel_empty_and_quit_leave_theme_unchanged() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    let before = app.preview.as_ref().unwrap().lines.clone();
+    for (command, token) in [
+        ("frob", "\"frob\""),
+        ("set foo=1", "\"foo\""),
+        ("colorscheme nope", "\"nope\""),
+        ("set appearance.colorscheme=nope", "\"nope\""),
+    ] {
+        run_command(&mut app, command);
+        assert_eq!(app.theme.name, "gruvbox-dark", "{command}");
+        assert!(app.status.contains(token), "{command}: {}", app.status);
+        assert_eq!(app.preview.as_ref().unwrap().lines, before);
+    }
+    app.status = "kept".into();
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "colorscheme review-classic");
+    app.key(KeyCode::Esc);
+    assert!(app.command.is_none());
+    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(app.status, "kept");
+    // Escape closed only the command line, not the diff.
+    assert!(app.preview.is_some());
+    run_command(&mut app, "");
+    assert_eq!(app.status, "kept");
+    assert!(app.preview.is_some());
+    // Backspace edits; the 256-byte cap holds.
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "ab");
+    app.key(KeyCode::Backspace);
+    assert_eq!(app.command.as_ref().unwrap().text, "a");
+    type_text(&mut app, &"x".repeat(300));
+    assert_eq!(app.command.as_ref().unwrap().text.len(), 256);
+    app.key(KeyCode::Esc);
+    // Command text never reaches other actions; the quit sequence still quits.
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "mq");
+    assert_eq!(app.marks, [false, false]);
+    assert!(app.preview.is_some());
+    assert!(!app.key(KeyCode::Char(',')));
+    assert!(app.key(KeyCode::Char('q')));
+    app.command = None;
+    app.key(KeyCode::Char(':'));
+    app.key(KeyCode::Char(','));
+    app.key(KeyCode::Char('x'));
+    assert_eq!(app.command.as_ref().unwrap().text, ",x");
+}
+
+#[test]
+fn command_line_tab_completion_cycles_in_place() {
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let text = |app: &App| app.command.as_ref().unwrap().text.clone();
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "colo");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme");
+    type_text(&mut app, " gru");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme gruvbox-dark");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme gruvbox-light");
+    app.key(KeyCode::BackTab);
+    assert_eq!(text(&app), "colorscheme gruvbox-dark");
+    app.key(KeyCode::Tab);
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme gruvbox-dark");
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "set appe");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "set appearance.colorscheme");
+    type_text(&mut app, "=REVIEW-c");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "set appearance.colorscheme=review-classic");
+    app.key(KeyCode::Enter);
+    assert_eq!(app.theme.name, "review-classic");
+    // Whitespace around '=' is accepted by execution and kept by completion.
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "set appearance.colorscheme = gru");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "set appearance.colorscheme = gruvbox-dark");
+    app.key(KeyCode::Enter);
+    assert_eq!(app.theme.name, "gruvbox-dark");
+    for unmatched in [
+        "zzz",
+        "colorscheme zzz",
+        "set zzz",
+        "set foo=gru",
+        "frob gru",
+    ] {
+        app.key(KeyCode::Char(':'));
+        type_text(&mut app, unmatched);
+        app.key(KeyCode::Tab);
+        assert_eq!(text(&app), unmatched);
+        app.key(KeyCode::BackTab);
+        assert_eq!(text(&app), unmatched);
+        app.key(KeyCode::Esc);
+    }
+    // Editing after a completion starts a new completion.
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "colorscheme Dra");
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme Dracula");
+    app.key(KeyCode::Backspace);
+    app.key(KeyCode::Tab);
+    assert_eq!(text(&app), "colorscheme Dracula");
+}
+
+#[test]
+fn theme_switch_restyles_history_and_preserves_view_state_and_marks() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Char('m'));
+    app.key(KeyCode::Up);
+    let marks = app.marks.clone();
+    let store = std::fs::read(&app.store.path).unwrap();
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 12);
+    app.key(KeyCode::Char('a'));
+    let added = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .locations
+        .iter()
+        .position(|row| row.1 == Some(2))
+        .unwrap();
+    app.cursor = (added, 6);
+    app.key(KeyCode::Char('*'));
+    let diff_cursor = app.cursor;
+    let diff_top = app.top;
+    let diff_lines = app.preview.as_ref().unwrap().lines.len();
+    let diff_title = app.preview.as_ref().unwrap().title.clone();
+    // Navigate deeper: symbol search, then its captured source.
+    app.key(KeyCode::Char('/'));
+    type_text(&mut app, "one");
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    let list_text: Vec<_> = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .lines
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    app.key(KeyCode::Enter);
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .title
+            .as_deref()
+            .unwrap()
+            .starts_with("Captured")
+    );
+    let source_cursor = app.cursor;
+    run_command(&mut app, "colorscheme review-classic");
+    assert_eq!(app.cursor, source_cursor);
+    let current = app.preview.as_ref().unwrap();
+    let source = app
+        .capture
+        .catalog
+        .sources
+        .iter()
+        .map(|source| preview::Preview::source(source, &theme::Theme::classic()))
+        .find(|source| source.title == current.title)
+        .unwrap();
+    assert_eq!(current.lines, source.lines);
+    let back = |app: &mut App| {
+        app.key_event(crossterm::event::KeyEvent::new(
+            KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ))
+    };
+    back(&mut app);
+    let list = app.preview.as_ref().unwrap();
+    assert_eq!(
+        list.lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        list_text
+    );
+    assert!(
+        list.lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.fg.is_none())
+    );
+    back(&mut app);
+    let preview = app.preview.as_ref().unwrap();
+    assert_eq!(preview.title, diff_title);
+    assert_eq!(preview.lines.len(), diff_lines);
+    assert_eq!((app.cursor, app.top), (diff_cursor, diff_top));
+    assert!(preview.search.is_some());
+    let classic = theme::Theme::classic();
+    let spans: Vec<_> = preview.lines.iter().flat_map(|line| &line.spans).collect();
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.style.bg == Some(classic.added_bg))
+    );
+    assert!(
+        spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Magenta))
+    );
+    let visible = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
+    assert!(
+        visible
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.bg == Some(classic.search_bg))
+    );
+    // Leaving after-changes reveals the ordinary view in the new theme too.
+    app.key(KeyCode::Char('a'));
+    let ordinary = app.preview.as_ref().unwrap();
+    assert!(ordinary.title.is_none());
+    let fresh = preview::Preview::item(directory.path(), &app.capture.items[0], &classic);
+    assert_eq!(ordinary.lines, fresh.lines);
+    assert!(
+        ordinary
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.style.bg == Some(classic.removed_bg))
+    );
+    assert_eq!(app.marks, marks);
+    assert_eq!(std::fs::read(&app.store.path).unwrap(), store);
+}
+
+#[test]
+fn command_line_renders_in_status_row_with_cursor_and_rebinds() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char(':'));
+    type_text(&mut app, "colo");
+    let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let status: String = (0..80)
+        .map(|x| buffer[(x, 18)].symbol().to_string())
+        .collect();
+    assert!(status.starts_with(":colo "), "{status}");
+    terminal.backend_mut().assert_cursor_position((5, 18));
+    // The command line also takes priority over an editing search prompt.
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('/'));
+    type_text(&mut app, "x");
+    app.command = Some(Default::default());
+    let text = screen_text(&screen(&mut app, 80, 20));
+    assert!(!text.contains("Search/outline"), "{text}");
+    app.command = None;
+    app.navigation = None;
+    // Emacs opens it with alt-x; ':' stays ordinary there.
+    app.bindings = config::Config::parse("[features]\nkeymap = 'emacs'\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char(':'));
+    assert!(app.command.is_none());
+    app.key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+    assert!(app.command.is_some());
+    assert!(app.bindings.legend().contains("alt-x command"));
+    app.key(KeyCode::Esc);
+    // Rebound and disabled like any other action.
+    app.bindings = config::Config::parse("[keybindings]\ncommand_line = 'ctrl-x'\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char(':'));
+    assert!(app.command.is_none());
+    app.key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+    assert!(app.command.is_some());
+    app.key(KeyCode::Esc);
+    app.bindings = config::Config::parse("[keybindings]\ncommand_line = ''\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    assert!(app.bindings.help().contains("command_line: (disabled)\n"));
+    app.key(KeyCode::Char(':'));
+    assert!(app.command.is_none());
+    assert!(
+        keybindings::Bindings::default()
+            .help()
+            .contains("command_line: :\n")
+    );
+}
+
+#[test]
+fn appearance_config_selects_and_validates_the_startup_theme() {
+    assert_eq!(
+        config::Config::parse("").unwrap().theme().unwrap().name,
+        "gruvbox-dark"
+    );
+    let classic = config::Config::parse("[appearance]\ncolorscheme = \"review-classic\"\n")
+        .unwrap()
+        .theme()
+        .unwrap();
+    assert_eq!(classic, theme::Theme::classic());
+    let error = config::Config::parse("[appearance]\ncolorscheme = \"nope\"\n")
+        .unwrap()
+        .theme()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("\"nope\""), "{error:#}");
+    assert!(config::Config::parse("[appearance]\nother = 1\n").is_err());
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bad.toml");
+    std::fs::write(&path, "[appearance]\ncolorscheme = \"nope\"\n").unwrap();
+    assert!(format!("{:#}", help(None, Some(&path)).unwrap_err()).contains("\"nope\""));
+    let text = help(None, None).unwrap();
+    assert!(text.contains(":colorscheme"), "{text}");
+    assert!(text.contains("appearance.colorscheme"), "{text}");
+    assert!(text.contains("gruvbox-dark"), "{text}");
+}
+
+#[test]
+fn gruvbox_dark_default_colors_captured_source_views_for_rust_yaml_and_toml() {
+    let theme = theme::Theme::default();
+    assert_eq!(theme.name, "gruvbox-dark");
+    let comment = Color::Rgb(146, 131, 116);
+    let string = Color::Rgb(184, 187, 38);
+    let keyword = Color::Rgb(251, 73, 52);
+    let function = Color::Rgb(142, 192, 124);
+    let number = Color::Rgb(211, 134, 155);
+    let key = Color::Rgb(131, 165, 152);
+    let rust = "// note\nfn one() {\n\tlet answer = \"text\";\n\tlet number = 1;\n}\n";
+    let yaml = include_str!("../tests/fixtures/yaml-colors.yaml");
+    let toml = include_str!("../tests/fixtures/toml-colors.toml");
+    let mut catalog = source::Catalog::default();
+    for (name, text) in [
+        ("one.rs", rust),
+        ("colors.yaml", yaml),
+        ("colors.toml", toml),
+    ] {
+        catalog.insert(
+            source::ComparedSide::New,
+            name.as_bytes().to_vec(),
+            text.as_bytes().to_vec(),
+        );
+    }
+    let fg_at = |view: &preview::Preview, token: &str| {
+        let line = view
+            .lines
+            .iter()
+            .find(|line| line.to_string().contains(token))
+            .unwrap_or_else(|| panic!("{token}"));
+        let start = line.to_string().find(token).unwrap();
+        let mut offset = 0;
+        line.spans
+            .iter()
+            .find_map(|span| {
+                let contains = offset <= start && start < offset + span.content.len();
+                offset += span.content.len();
+                contains.then_some(span.style.fg)
+            })
+            .unwrap()
+    };
+    let expected: [&[(&str, Color)]; 3] = [
+        &[
+            ("// note", comment),
+            ("fn", keyword),
+            ("one", function),
+            ("\"text\"", string),
+            ("1;", number),
+        ],
+        &[
+            ("service", key),
+            ("café", string),
+            ("42", number),
+            ("true", number),
+            ("# review", comment),
+        ],
+        &[
+            ("title", key),
+            ("café", string),
+            ("42", number),
+            ("true", number),
+            ("# review", comment),
+        ],
+    ];
+    for (source, tokens) in catalog.sources.iter().zip(expected) {
+        let view = preview::Preview::source(source, &theme);
+        assert!(view.title.as_deref().unwrap().starts_with("Captured"));
+        for (token, color) in tokens {
+            assert_eq!(fg_at(&view, token), Some(*color), "{token}");
+        }
+        assert!(
+            view.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.bg.is_none())
+        );
     }
 }

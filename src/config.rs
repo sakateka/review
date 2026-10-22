@@ -1,4 +1,5 @@
 use crate::keybindings::{Bindings, Keymap};
+use crate::theme::Theme;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
@@ -10,6 +11,7 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub features: Features,
+    pub appearance: Appearance,
     pub keybindings: BTreeMap<String, String>,
 }
 #[derive(Deserialize)]
@@ -17,6 +19,11 @@ pub struct Config {
 pub struct Features {
     pub keymap: Keymap,
     pub readline: bool,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Appearance {
+    pub colorscheme: Option<String>,
 }
 impl Default for Features {
     fn default() -> Self {
@@ -50,6 +57,18 @@ impl Config {
                 Err(error).with_context(|| format!("read configuration {}", path.display()))
             }
         }
+    }
+    /// The startup theme; an unknown name is a configuration error.
+    pub fn theme(&self) -> Result<Theme> {
+        let Some(name) = &self.appearance.colorscheme else {
+            return Ok(Theme::default());
+        };
+        Theme::named(name).with_context(|| {
+            format!(
+                "unknown [appearance] colorscheme {name:?}; expected one of: {}",
+                Theme::names().join(", ")
+            )
+        })
     }
     pub fn bindings(&self, cli: Option<Keymap>) -> Result<Bindings> {
         Bindings::new(

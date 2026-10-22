@@ -1,5 +1,5 @@
 use crate::keybindings::{Action, Bindings, Keymap, Resolution};
-use crate::{git::Capture, preview::Preview, state::Store};
+use crate::{commands::CommandLine, git::Capture, preview::Preview, state::Store, theme::Theme};
 use crate::{
     navigation::{Candidate, Operation, Request, Worker},
     source::ComparedSide,
@@ -43,6 +43,8 @@ pub struct App {
     last_click: Option<(usize, Instant)>,
     motion_count: usize,
     pub bindings: Bindings,
+    pub theme: Theme,
+    pub command: Option<CommandLine>,
 }
 
 #[derive(Clone)]
@@ -90,6 +92,7 @@ impl App {
             ),
         };
         let original = capture.unavailable.is_some();
+        let theme = Theme::default();
         let preview = original.then(|| {
             let mut output = capture.original.clone();
             if !capture.stderr.is_empty() {
@@ -99,7 +102,7 @@ impl App {
                 output.extend_from_slice(b"Git stderr:\n");
                 output.extend_from_slice(&capture.stderr);
             }
-            Preview::original(&output)
+            Preview::original(&output, &theme)
         });
         let worker = Worker::start(capture.catalog.clone());
         Self {
@@ -119,6 +122,8 @@ impl App {
             last_click: None,
             motion_count: 0,
             bindings: Bindings::default(),
+            theme,
+            command: None,
             history: Vec::new(),
             capture,
             store,
@@ -294,6 +299,9 @@ impl App {
 
     pub fn key_event(&mut self, key: KeyEvent) -> bool {
         self.last_click = None;
+        if self.command.is_some() {
+            return self.command_key(key);
+        }
         if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
             let held = self.bindings.pending_keys().to_vec();
             match self.bindings.resolve_quit(key) {
@@ -384,6 +392,10 @@ impl App {
         let buffer = self.focus == Focus::Preview && self.navigation.is_none();
         match action {
             Quit => return true,
+            CommandLine => {
+                self.bindings.clear();
+                self.command = Some(crate::commands::CommandLine::default());
+            }
             CloseOrQuit
                 if self.documentation
                     || self.definition_preview
@@ -433,7 +445,10 @@ impl App {
                 self.save_view();
                 self.navigation = None;
                 self.source = None;
-                self.preview = Some(Preview::original(coverage.replace("; ", "\n").as_bytes()));
+                self.preview = Some(Preview::original(
+                    coverage.replace("; ", "\n").as_bytes(),
+                    &self.theme,
+                ));
                 self.top = 0;
                 self.left = 0;
                 self.cursor = (0, 0);
@@ -592,6 +607,64 @@ impl App {
         false
     }
 
+    /// Route a key to the open command line; returns true to quit.
+    fn command_key(&mut self, key: KeyEvent) -> bool {
+        let held = self.bindings.pending_keys().to_vec();
+        match self.bindings.resolve_quit(key) {
+            Resolution::Action(Action::Quit) => return true,
+            Resolution::Pending => return false,
+            _ => {}
+        }
+        let Some(command) = &mut self.command else {
+            return false;
+        };
+        // A failed global quit prefix remains literal command text.
+        for held_key in held {
+            if let KeyCode::Char(c) = held_key.code
+                && !held_key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                command.push(c);
+            }
+        }
+        self.motion_count = 0;
+        match key.code {
+            KeyCode::Esc => self.command = None,
+            KeyCode::Enter => {
+                let text = std::mem::take(&mut command.text);
+                self.command = None;
+                crate::commands::execute(self, &text);
+            }
+            KeyCode::Backspace => command.pop(),
+            KeyCode::Tab => command.complete(false),
+            KeyCode::BackTab => command.complete(true),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                command.push(c);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Switch the theme for this session, re-styling the current view, the
+    /// views reachable through history and nothing else.
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+        if let Some(preview) = &mut self.preview {
+            preview.restyle(&theme);
+        }
+        for view in &mut self.history {
+            if let Some(preview) = &mut view.preview {
+                preview.restyle(&theme);
+            }
+        }
+    }
+
     fn open_diff(&mut self) {
         if self.documentation {
             return;
@@ -601,13 +674,11 @@ impl App {
             self.source = None;
             self.cursor = (0, 0);
             self.navigation = None;
-            let mut preview = Preview::item(&self.capture.cwd, item);
+            let mut preview = Preview::item(&self.capture.cwd, item, &self.theme);
             if !self.capture.stderr.is_empty() {
                 let mut warning = b"\nGit stderr:\n".to_vec();
                 warning.extend_from_slice(&self.capture.stderr);
-                let warning = Preview::original(&warning);
-                preview.width = preview.width.max(warning.width);
-                preview.lines.extend(warning.lines);
+                preview.append(Preview::original(&warning, &self.theme));
             }
             self.preview = Some(preview);
             self.focus = Focus::Preview;
@@ -876,7 +947,7 @@ impl App {
                     self.navigation = None;
                     self.documentation = true;
                     self.source = None;
-                    let mut preview = Preview::original(title.as_bytes());
+                    let mut preview = Preview::original(title.as_bytes(), &self.theme);
                     preview.title = Some("Function documentation".into());
                     self.preview = Some(preview);
                     self.top = 0;
@@ -934,7 +1005,7 @@ impl App {
                 candidate_field(candidate.tag.context.as_deref().unwrap_or(""))
             ));
         }
-        self.preview = Some(Preview::original(text.as_bytes()));
+        self.preview = Some(Preview::original(text.as_bytes(), &self.theme));
         self.source = None;
         self.top = nav
             .selected
@@ -992,6 +1063,7 @@ impl App {
             candidate.tag.line as usize,
             candidate.tag.col as usize,
             candidate.tag.len as usize,
+            &self.theme,
         ) {
             Ok(target) => target,
             Err(error) => {
@@ -1069,7 +1141,10 @@ impl App {
             if let Some(other) = self.capture.catalog.find(side, &path) {
                 self.side = side;
                 self.source = Some(other);
-                self.preview = Some(Preview::source(&self.capture.catalog.sources[other]));
+                self.preview = Some(Preview::source(
+                    &self.capture.catalog.sources[other],
+                    &self.theme,
+                ));
                 self.keep_cursor_visible();
             } else {
                 self.status = format!("{} captured side unavailable for this path", side.label());
