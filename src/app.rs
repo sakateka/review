@@ -431,6 +431,31 @@ impl App {
                     Focus::Files
                 };
             }
+            ToggleAfterChanges
+                if buffer
+                    && self.source.is_none()
+                    && !self.documentation
+                    && !self.definition_preview
+                    && self.capture.unavailable.is_none() =>
+            {
+                if let Some(preview) = &mut self.preview {
+                    (self.cursor.0, self.top) =
+                        preview.toggle_after_changes(self.cursor.0, self.top);
+                    if let Some(search) = &preview.search {
+                        self.status = if search.matches.is_empty() {
+                            format!("/{} · no displayed matches", search.word)
+                        } else {
+                            format!(
+                                "/{} · {} displayed match{}",
+                                search.word,
+                                search.matches.len(),
+                                if search.matches.len() == 1 { "" } else { "es" }
+                            )
+                        };
+                    }
+                    self.keep_cursor_visible();
+                }
+            }
             ToggleMark
                 if self.documentation || self.navigation.is_some() || self.source.is_some() =>
             {
@@ -598,6 +623,8 @@ impl App {
             let index = search.matches.iter().position(|m| *m == found).unwrap_or(0);
             self.status = format!("/{} · {}/{}", search.word, index + 1, search.matches.len());
             self.keep_cursor_visible();
+        } else {
+            self.status = format!("/{} · no displayed matches", search.word);
         }
     }
 

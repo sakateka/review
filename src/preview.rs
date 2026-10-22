@@ -20,6 +20,8 @@ pub struct Preview {
     pub locations: Vec<(Option<usize>, Option<usize>)>,
     /// Display cells to zero-based Unicode scalar columns; prefixes have no source.
     pub cells: Vec<Vec<Option<usize>>>,
+    removed: Option<Vec<bool>>,
+    ordinary: Option<Box<Preview>>,
 }
 
 type MappedColors<'a> = (
@@ -159,13 +161,22 @@ impl Preview {
                 Self::compose(&crate::git::visible_bytes(bytes), None, None, false, false);
             preview.locations.fill((None, None));
             preview.cells.clear();
+            preview.removed = None;
             preview
         }
     }
 
     pub fn item(cwd: &Path, item: &Item) -> Self {
         if item.patch.len() > 256 * 1024 {
-            let mut preview = Self::original(&item.patch);
+            let mut preview = Self::compose(
+                &crate::git::visible_bytes(&item.patch),
+                None,
+                None,
+                false,
+                false,
+            );
+            preview.locations.fill((None, None));
+            preview.cells.clear();
             preview.add_reason(
                 "Large patch: bounded basic rendering; source navigation remains separate",
             );
@@ -404,6 +415,13 @@ impl Preview {
             width,
             locations,
             cells,
+            removed: (!source_view).then(|| {
+                raw.iter()
+                    .zip(&source_lines)
+                    .map(|(line, source)| *source && line.starts_with('-'))
+                    .collect()
+            }),
+            ordinary: None,
         };
         if omitted_rows {
             preview.add_reason("Display omitted rows after 20000");
@@ -412,6 +430,79 @@ impl Preview {
             preview.add_reason("Display omitted columns after 4096 graphemes per row");
         }
         preview
+    }
+
+    /// Project only classified hunk removals from this captured rendering.
+    /// Returns the corresponding cursor and viewport rows without loading Git/source.
+    pub fn toggle_after_changes(&mut self, cursor: usize, top: usize) -> (usize, usize) {
+        let search = self.search.clone();
+        let mapped = if let Some(ordinary) = self.ordinary.take() {
+            let retained: Vec<_> = (0..ordinary.lines.len())
+                .filter(|row| {
+                    !ordinary
+                        .removed
+                        .as_ref()
+                        .is_some_and(|rows| rows.get(*row) == Some(&true))
+                })
+                .collect();
+            let map = |row: usize| retained.get(row).copied().unwrap_or(0);
+            let mapped = (map(cursor), map(top));
+            *self = *ordinary;
+            mapped
+        } else if let Some(removed) = &self.removed {
+            let retained: Vec<_> = (0..self.lines.len())
+                .filter(|row| removed.get(*row) != Some(&true))
+                .collect();
+            let map = |row: usize| {
+                retained
+                    .partition_point(|index| *index < row)
+                    .min(retained.len().saturating_sub(1))
+            };
+            let mapped = (map(cursor), map(top));
+            let ordinary = self.clone();
+            self.lines = retained
+                .iter()
+                .map(|row| {
+                    let mut line = ordinary.lines[*row].clone();
+                    if row
+                        .checked_sub(1)
+                        .is_some_and(|previous| removed.get(previous) == Some(&true))
+                        && line.to_string().trim_start_matches('\\') == " No newline at end of file"
+                    {
+                        line.spans.push(Span::raw(" (removed old-side line)"));
+                    }
+                    line
+                })
+                .collect();
+            self.locations = retained
+                .iter()
+                .map(|row| {
+                    ordinary
+                        .locations
+                        .get(*row)
+                        .copied()
+                        .unwrap_or((None, None))
+                })
+                .collect();
+            self.cells = retained
+                .iter()
+                .map(|row| ordinary.cells.get(*row).cloned().unwrap_or_default())
+                .collect();
+            for (line, cells) in self.lines.iter().zip(&mut self.cells) {
+                cells.resize(line.width(), None);
+            }
+            self.width = self.lines.iter().map(Line::width).max().unwrap_or(0);
+            self.title = Some("After changes · captured diff context".into());
+            self.ordinary = Some(Box::new(ordinary));
+            mapped
+        } else {
+            return (cursor, top);
+        };
+        self.search = search.map(|mut search| {
+            search.refresh(&self.lines);
+            search
+        });
+        mapped
     }
 
     fn add_reason(&mut self, note: &str) {

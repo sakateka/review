@@ -66,6 +66,18 @@ impl BufferSearch {
         ))
     }
 
+    pub fn refresh(&mut self, lines: &[Line<'_>]) {
+        self.matches.clear();
+        for (row, line) in lines.iter().enumerate() {
+            let text = line.to_string();
+            for (start, end, word) in words(&text) {
+                if word == self.word {
+                    self.matches.push(Match { row, start, end });
+                }
+            }
+        }
+    }
+
     pub fn next(&self, cursor: (usize, usize), reverse: bool, count: usize) -> Option<Match> {
         let len = self.matches.len();
         if len == 0 {

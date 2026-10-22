@@ -6085,3 +6085,290 @@ fn file_statistics_no_index_add_delete_and_multiple_hunks_match_git() {
     assert_eq!(oracle.status.code(), Some(1));
     assert!(oracle.stdout.starts_with(b"3\t2\t"));
 }
+
+#[test]
+fn after_changes_projects_captured_rows_and_preserves_navigation_history() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('a'));
+    assert!(app.preview.is_none());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 110, 25);
+    let original = app.preview.as_ref().unwrap().clone();
+    let removed = original
+        .locations
+        .iter()
+        .position(|row| row.0.is_some() && row.1.is_none())
+        .unwrap();
+    app.cursor = (removed, 5);
+    app.key(KeyCode::Char('*'));
+    let marks = app.marks.clone();
+    let patch = app.capture.items[0].patch.clone();
+    std::fs::write(directory.path().join("one.rs"), "fn later_live_edit() {}\n").unwrap();
+    app.cursor.0 = removed;
+    app.key(KeyCode::Char('a'));
+    let projected = app.preview.as_ref().unwrap().clone();
+    assert!(
+        projected
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("captured diff context")
+    );
+    assert!(
+        !projected
+            .locations
+            .iter()
+            .any(|row| row.0.is_some() && row.1.is_none())
+    );
+    assert!(
+        projected
+            .lines
+            .iter()
+            .any(|line| line.to_string().starts_with("@@"))
+    );
+    assert_eq!(projected.lines.len(), projected.locations.len());
+    assert_eq!(projected.lines.len(), projected.cells.len());
+    assert!(
+        projected
+            .search
+            .as_ref()
+            .unwrap()
+            .matches
+            .iter()
+            .all(|hit| hit.row < projected.lines.len())
+    );
+    for (row, location) in projected.locations.iter().enumerate() {
+        if location.1.is_some() {
+            let old = original
+                .locations
+                .iter()
+                .position(|old| old == location)
+                .unwrap();
+            assert_eq!(projected.lines[row], original.lines[old]);
+            assert_eq!(projected.cells[row], original.cells[old]);
+        }
+    }
+    assert!(screen_text(&screen(&mut app, 110, 25)).contains("After changes"));
+    app.key(KeyCode::Char('/'));
+    app.key(KeyCode::Char('a')); // Search input retains its ordinary typing behavior.
+    assert_eq!(app.navigation.as_ref().unwrap().query, "a");
+    app.key(KeyCode::Esc);
+    assert_eq!(app.preview.as_ref().unwrap().lines, projected.lines);
+    app.key(KeyCode::Tab);
+    app.key(KeyCode::Char('a'));
+    assert_eq!(app.preview.as_ref().unwrap().lines, projected.lines);
+    app.key(KeyCode::Tab);
+    app.key(KeyCode::Char('a'));
+    assert_eq!(app.preview.as_ref().unwrap().lines, original.lines);
+    assert_eq!(app.preview.as_ref().unwrap().locations, original.locations);
+    assert_eq!(app.marks, marks);
+    assert_eq!(app.capture.items[0].patch, patch);
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("one.rs")).unwrap(),
+        "fn later_live_edit() {}\n"
+    );
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Enter);
+    assert!(app.preview.as_ref().unwrap().title.is_none());
+}
+
+#[test]
+fn after_changes_classifies_hunks_with_headers_annotations_invalid_and_bounded_output() {
+    let directory = fixture();
+    change(directory.path());
+    let mut captured = capture(directory.path(), &["HEAD"]);
+    let patch = "diff --git a/one.rs b/one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1,2 +1,2 @@\n--- header-like removed source\n+++ header-like added source\n \\t界\n@@ -20 +20 @@\n-deleted\n\\ No newline at end of file\n+retained\n\\ No newline at end of file\n-metadata outside hunk\n";
+    for suffix in [Vec::new(), vec![b'\xff'], vec![b'x'; 270000]] {
+        captured.items[0].patch = [patch.as_bytes(), &suffix].concat();
+        let mut preview = preview::Preview::item(directory.path(), &captured.items[0]);
+        let original = preview.lines.clone();
+        preview.toggle_after_changes(8, 0);
+        let text = preview
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("--- a/one.rs"));
+        assert!(text.contains("+++ header-like added source"));
+        assert!(text.contains("-metadata outside hunk"));
+        assert!(!text.contains("header-like removed source"));
+        assert!(!text.contains("-deleted"));
+        assert_eq!(text.matches("@@").count(), 4);
+        assert_eq!(text.matches("No newline at end of file").count(), 2);
+        assert!(text.contains("No newline at end of file (removed old-side line)\n+retained\n"));
+        assert!(text.contains("+retained\n"));
+        assert_eq!(text.matches("(removed old-side line)").count(), 1);
+        let annotation = preview
+            .lines
+            .iter()
+            .position(|line| line.to_string().contains("(removed old-side line)"))
+            .unwrap();
+        assert!(
+            preview.cells[annotation]
+                .iter()
+                .rev()
+                .take(" (removed old-side line)".len())
+                .all(Option::is_none)
+        );
+        assert_eq!(
+            preview.cells[annotation].len(),
+            preview.lines[annotation].width()
+        );
+        assert_eq!(
+            preview.width,
+            preview.lines.iter().map(|line| line.width()).max().unwrap()
+        );
+        if !suffix.is_empty() {
+            assert!(preview.locations.iter().all(|row| *row == (None, None)));
+        }
+        preview.toggle_after_changes(8, 0);
+        assert_eq!(preview.lines, original);
+    }
+    let mut opaque = preview::Preview::original(patch.as_bytes());
+    let original = opaque.lines.clone();
+    opaque.toggle_after_changes(8, 0);
+    assert_eq!(opaque.lines, original);
+    assert!(opaque.title.is_none());
+}
+
+#[test]
+fn after_changes_binding_supports_both_maps_remapping_disabling_and_collisions() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use keybindings::{Action, Keymap, Resolution};
+    for keymap in [Keymap::Vim, Keymap::Emacs] {
+        let mut bindings = keybindings::Bindings::new(keymap, true, &Default::default()).unwrap();
+        assert!(matches!(
+            bindings.resolve(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), true),
+            Resolution::Action(Action::ToggleAfterChanges)
+        ));
+        assert!(bindings.help().contains("toggle_after_changes: a"));
+    }
+    for binding in ["z", ""] {
+        let mut bindings =
+            config::Config::parse(&format!("[keybindings]\ntoggle_after_changes='{binding}'"))
+                .unwrap()
+                .bindings(None)
+                .unwrap();
+        assert!(matches!(
+            bindings.resolve(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), true),
+            Resolution::Unbound
+        ));
+        assert_eq!(bindings.label(Action::ToggleAfterChanges), binding);
+    }
+    assert!(
+        config::Config::parse("[keybindings]\ntoggle_after_changes='j'")
+            .unwrap()
+            .bindings(None)
+            .is_err()
+    );
+}
+
+#[test]
+fn after_changes_deleted_binary_metadata_and_other_views_remain_truthful() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("binary"), b"old\0binary").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "binary"]);
+    std::fs::remove_file(directory.path().join("one.rs")).unwrap();
+    std::fs::write(directory.path().join("binary"), b"new\0binary").unwrap();
+    git_run(directory.path(), &["update-index", "--chmod=+x", "two.rs"]);
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    for item in &app.capture.items {
+        let mut preview = preview::Preview::item(directory.path(), item);
+        let original = preview.lines.clone();
+        preview.toggle_after_changes(0, 0);
+        assert!(
+            !preview
+                .locations
+                .iter()
+                .any(|row| row.0.is_some() && row.1.is_none())
+        );
+        if item.new_path == b"binary" || item.new_path == b"two.rs" {
+            assert_eq!(preview.lines, original);
+        } else {
+            assert!(
+                preview
+                    .lines
+                    .iter()
+                    .any(|line| line.to_string() == "+++ /dev/null")
+            );
+            assert!(
+                preview
+                    .lines
+                    .iter()
+                    .any(|line| line.to_string().starts_with("@@"))
+            );
+        }
+    }
+    app.key(KeyCode::Enter);
+    for (documentation, definition_preview) in [(true, false), (false, true)] {
+        app.documentation = documentation;
+        app.definition_preview = definition_preview;
+        let before = app.preview.as_ref().unwrap().clone();
+        app.key(KeyCode::Char('a'));
+        assert_eq!(app.preview.as_ref().unwrap().lines, before.lines);
+        assert_eq!(app.preview.as_ref().unwrap().title, before.title);
+    }
+    let captured = &app.capture.catalog.sources[0];
+    let mut source = preview::Preview::source(captured);
+    let original = source.lines.clone();
+    source.toggle_after_changes(0, 0);
+    assert_eq!(source.lines, original);
+}
+
+#[test]
+fn after_changes_search_reports_hidden_matches_and_restores_results() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn deleted_only_word() {}\n",
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "deleted search word"]);
+    std::fs::write(directory.path().join("one.rs"), "fn replacement() {}\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    app.cursor = (
+        app.preview
+            .as_ref()
+            .unwrap()
+            .locations
+            .iter()
+            .position(|row| *row == (Some(1), None))
+            .unwrap(),
+        4,
+    );
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.status, "/deleted_only_word · 1/1");
+    app.key(KeyCode::Char('a'));
+    assert_eq!(app.status, "/deleted_only_word · no displayed matches");
+    assert!(
+        app.preview
+            .as_ref()
+            .unwrap()
+            .search
+            .as_ref()
+            .unwrap()
+            .matches
+            .is_empty()
+    );
+    app.status = "Other transient status".into();
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.status, "/deleted_only_word · no displayed matches");
+    app.key(KeyCode::Char('a'));
+    assert_eq!(app.status, "/deleted_only_word · 1 displayed match");
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.status, "/deleted_only_word · 1/1");
+    assert_eq!(
+        app.preview.as_ref().unwrap().locations[app.cursor.0],
+        (Some(1), None)
+    );
+}

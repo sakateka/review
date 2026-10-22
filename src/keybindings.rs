@@ -42,6 +42,7 @@ actions! {
     GoToReferences => "go_to_references", GoBack => "go_back", OldSide => "old_side", NewSide => "new_side",
     ShowDocumentation => "show_documentation",
     PreviewDefinition => "preview_definition",
+    ToggleAfterChanges => "toggle_after_changes",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
 }
 #[derive(Clone)]
@@ -95,6 +96,7 @@ impl Bindings {
             (ShowDocumentation, &["K"]),
             (PreviewDefinition, &["P"]),
             (ToggleMark, &["space"]),
+            (ToggleAfterChanges, &["a"]),
             (SearchWord, &["*"]),
             (SearchWordBackward, &["#"]),
             (SearchNext, &["n"]),

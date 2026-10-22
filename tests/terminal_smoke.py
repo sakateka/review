@@ -179,6 +179,31 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             os.close(self.master)
             os.close(self.slave)
 
+    # Installed captured-context toggle: reversible, explicit marks unchanged,
+    # source bytes immutable, and ordinary mode restored on reopen/restart.
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"a")
+    assert "After changes" not in session.text()
+    session.send(b"\r")
+    session.wait_text("-fn caller() { main_target(); }")
+    session.send(b"a")
+    session.wait_text("After changes")
+    assert "-fn caller() { main_target(); }" not in session.text()
+    assert "+fn caller() { main_target(); main_target(); }" in session.text()
+    assert "@@" in session.text()
+    assert not (root / "state").exists(), "toggle must not save review state"
+    session.send(b"a")
+    session.wait_text("-fn caller() { main_target(); }")
+    session.send(b"a")
+    session.send(b"\x1b")
+    session.send(b"\r")
+    session.wait_text("-fn caller() { main_target(); }")
+    assert "After changes" not in session.text()
+    session.send(b",q")
+    session.finish()
+    assert before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+
     session = Session()
     session.wait_text("Files")
     for name in fixture_names:
@@ -829,6 +854,12 @@ pub fn invoke(worker: Worker) -> u32 {
     session.pump(0.5)
     session.send(pointer(0, x, y) + pointer(0, x, y, True) + pointer(0, x, y) + pointer(0, x, y, True))
     session.wait_text("Diff")
+    session.send(b"a")
+    session.wait_text("After changes")
+    assert snapshot(root / "state") == state_after_mark, "toggle changed an explicit saved mark"
+    session.send(b"a")
+    session.wait_text("Diff")
+    assert snapshot(root / "state") == state_after_mark
     session.send(b"\x1b[6~\x1b[5~")
     session.send(b"\x1b")
     closed(session)
