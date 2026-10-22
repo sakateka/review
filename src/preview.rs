@@ -80,11 +80,11 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
         side.content.len() <= 1024 * 1024,
         "source exceeds highlighting limit"
     );
-    let names = [
+    let mut names = vec![
         "comment", "string", "keyword", "function", "type", "constant", "number", "operator",
         "variable",
     ];
-    let colors = [
+    let mut colors = vec![
         Color::DarkGray,
         Color::Green,
         Color::Magenta,
@@ -95,6 +95,16 @@ fn syntax(side: &source::Side) -> anyhow::Result<Vec<Option<Color>>> {
         Color::Cyan,
         Color::White,
     ];
+    if matches!(extension, "yaml" | "yml") {
+        names.extend(["property", "boolean", "label", "attribute", "punctuation"]);
+        colors.extend([
+            Color::Cyan,
+            Color::Magenta,
+            Color::Blue,
+            Color::Magenta,
+            Color::DarkGray,
+        ]);
+    }
     let mut configuration =
         HighlightConfiguration::new(language.into(), extension, &query, "", "")?;
     configuration.configure(&names);

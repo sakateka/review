@@ -179,6 +179,39 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             os.close(self.master)
             os.close(self.slave)
 
+    # Installed YAML colors in the actual diff and captured source panes.
+    yaml_text = (pathlib.Path(__file__).parent / "fixtures/yaml-colors.yaml").read_text()
+    (repo / "colors.yaml").write_text(yaml_text)
+    git_run("add", "colors.yaml")
+    git_run("commit", "-qm", "yaml colors")
+    (repo / "colors.yaml").write_text(yaml_text.replace("42", "43"))
+    yaml_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    session = Session([str(binary), "--", "HEAD", "--", "colors.yaml"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("+  count: 43")
+    def yaml_color(token, expected):
+        row, line = next((row, line) for row, line in enumerate(session.text().splitlines()) if token in line)
+        assert session.colors[(row, line.index(token))] == expected, (token, session.text())
+    yaml_color("count:", 6)
+    yaml_color("43", 3)
+    yaml_color("true", 5)
+    session.send(b"\x1b")
+    session.send(b"/service\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old colors.yaml")
+    for token, color in [("service:", 6), ("café", 2), ("42", 3), ("true", 5), ("shared", 4), ("# review", 8)]:
+        yaml_color(token, color)
+    session.send(b",q")
+    session.finish()
+    assert not (root / "state").exists(), "YAML viewing changed marks"
+    assert yaml_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    (repo / "colors.yaml").unlink()
+    git_run("rm", "--cached", "colors.yaml")
+    git_run("commit", "-qm", "remove yaml fixture")
+    before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+
     # Installed captured-context toggle: reversible, explicit marks unchanged,
     # source bytes immutable, and ordinary mode restored on reopen/restart.
     session = Session()

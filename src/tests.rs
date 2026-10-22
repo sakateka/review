@@ -6416,3 +6416,83 @@ fn after_changes_search_reports_hidden_matches_and_restores_results() {
         (Some(1), None)
     );
 }
+
+#[test]
+fn yaml_colors_distinguish_tokens_in_captured_source_and_both_diff_sides() {
+    let text = include_str!("../tests/fixtures/yaml-colors.yaml");
+    for name in ["colors.yaml", "colors.yml"] {
+        let directory = fixture();
+        std::fs::write(directory.path().join(name), text).unwrap();
+        git_run(directory.path(), &["add", "."]);
+        git_run(directory.path(), &["commit", "-qm", "yaml"]);
+        std::fs::write(directory.path().join(name), text.replace("42", "43")).unwrap();
+        let captured = capture(directory.path(), &["HEAD", "--", name]);
+        let sources = source::load(directory.path(), &captured.items[0]).unwrap();
+        let mut catalog = source::Catalog::default();
+        catalog.insert(
+            source::ComparedSide::Old,
+            name.as_bytes().to_vec(),
+            text.as_bytes().to_vec(),
+        );
+        let source_preview = preview::Preview::source(&catalog.sources[0]);
+        let diff = preview::Preview::item(directory.path(), &captured.items[0]);
+        assert_eq!(diff.reason, None);
+        let style_at = |view: &preview::Preview, token: &str| {
+            let line = view
+                .lines
+                .iter()
+                .find(|line| line.to_string().contains(token))
+                .unwrap();
+            let start = line.to_string().find(token).unwrap();
+            let mut offset = 0;
+            line.spans
+                .iter()
+                .find_map(|span| {
+                    let contains = offset <= start && start < offset + span.content.len();
+                    offset += span.content.len();
+                    contains.then_some(span.style)
+                })
+                .unwrap()
+        };
+        for (token, color) in [
+            ("service", Color::Cyan),
+            ("name", Color::Cyan),
+            ("café", Color::Green),
+            ("42", Color::Yellow),
+            ("true", Color::Magenta),
+            ("null", Color::Yellow),
+            ("# review", Color::DarkGray),
+            ("shared", Color::Blue),
+            ("!!str", Color::Cyan),
+            ("%YAML", Color::Magenta),
+            ("nested", Color::Cyan),
+            ("plain", Color::Cyan),
+            ("value", Color::Green),
+            ("block content", Color::Green),
+            ("&", Color::DarkGray),
+            ("*", Color::DarkGray),
+        ] {
+            assert_eq!(style_at(&source_preview, token).fg, Some(color), "{token}");
+        }
+        assert_eq!(style_at(&diff, "42").fg, Some(Color::Yellow));
+        assert_eq!(style_at(&diff, "43").fg, Some(Color::Yellow));
+        for token in ["42", "43"] {
+            assert!(style_at(&diff, token).bg.is_some());
+            let changed_digit = diff.lines.iter().flat_map(|line| &line.spans).any(|span| {
+                span.content.contains(if token == "42" { '2' } else { '3' })
+                    && span
+                        .style
+                        .add_modifier
+                        .contains(Modifier::UNDERLINED | Modifier::BOLD)
+            });
+            assert!(changed_digit);
+        }
+        for view in [&source_preview, &diff] {
+            for (row, cells) in view.cells.iter().enumerate() {
+                assert_eq!(cells.len(), view.lines[row].width());
+            }
+        }
+        assert_eq!(sources.old.content, text);
+        assert_eq!(sources.new.content, text.replace("42", "43"));
+    }
+}

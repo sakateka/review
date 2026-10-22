@@ -1,0 +1,14 @@
+%YAML 1.2
+---
+# review colors
+service:
+  name: "café界"
+  count: 42
+  enabled: true
+  absent: null
+  defaults: &shared {"nested": 'value', plain: 3.5}
+  copy: *shared
+  tagged: !!str value
+  text: |
+    block content
+...
