@@ -267,7 +267,26 @@ impl App {
     pub fn key_event(&mut self, key: KeyEvent) -> bool {
         self.last_click = None;
         if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
-            self.bindings.clear();
+            let held = self.bindings.pending_keys().to_vec();
+            match self.bindings.resolve_quit(key) {
+                Resolution::Action(Action::Quit) => return true,
+                Resolution::Pending => return false,
+                _ => {}
+            }
+            // A failed global quit prefix remains literal query text.
+            for held_key in held {
+                if let KeyCode::Char(c) = held_key.code
+                    && !held_key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|n| n.query.len() < 256)
+                {
+                    self.navigation.as_mut().expect("navigation").query.push(c);
+                }
+            }
             self.motion_count = 0;
             match key.code {
                 KeyCode::Esc => self.back(),
@@ -337,6 +356,12 @@ impl App {
         let buffer = self.focus == Focus::Preview && self.navigation.is_none();
         match action {
             Quit => return true,
+            CloseOrQuit => {
+                if self.preview.is_none() {
+                    return true;
+                }
+                self.close_preview();
+            }
             CloseDiffView if self.capture.unavailable.is_none() => self.close_preview(),
             GoBack => self.back(),
             SearchSymbols => self.begin_navigation(Operation::Search),

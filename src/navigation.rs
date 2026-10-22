@@ -7,8 +7,10 @@ use std::{
 };
 
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
-const MAX_TOTAL_BYTES: usize = 16 * MAX_FILE_BYTES;
-const MAX_TAGS: usize = 100_000;
+const MAX_TOTAL_BYTES: usize = 128 * MAX_FILE_BYTES;
+const MAX_FILES: usize = 16384;
+const MAX_TAGS: usize = 1_000_000;
+const MAX_FILE_TAGS: usize = 100_000;
 const MAX_RESULTS: usize = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
@@ -89,39 +91,59 @@ pub struct Analysis {
 }
 impl Analysis {
     pub fn build(catalog: &Catalog) -> Self {
+        Self::build_with_limits(catalog, MAX_FILES, MAX_TOTAL_BYTES, MAX_TAGS)
+    }
+    fn build_with_limits(
+        catalog: &Catalog,
+        max_files: usize,
+        max_bytes: usize,
+        max_tags: usize,
+    ) -> Self {
         let mut files = Vec::new();
         let mut gaps = catalog.gaps.clone();
         let mut total = 0usize;
         let mut tags_total = 0;
+        let mut eligible = 0;
         for (id, source) in catalog.sources.iter().enumerate() {
             let path = crate::git::visible_bytes(&source.path);
-            if id >= 2048
-                || source.bytes.len() > MAX_FILE_BYTES
-                || total.saturating_add(source.bytes.len()) > MAX_TOTAL_BYTES
-                || tags_total >= MAX_TAGS
-            {
-                gaps.push(format!("{path}: resource limit, skipped"));
-                continue;
-            }
-            total += source.bytes.len();
             let Ok(text) = std::str::from_utf8(&source.bytes) else {
                 gaps.push(format!("{path}: invalid UTF-8, skipped"));
                 continue;
             };
-            let Some(selector) = classify(&source.path, text) else {
+            let Some(selector) = crate::symbols::classify(&source.path, text) else {
                 gaps.push(format!("{path}: unsupported language/shell dialect"));
                 continue;
             };
-            let (mut tags, note) = if selector == "json" || selector == "yaml" {
-                structure(text, selector == "yaml")
-            } else {
-                (
-                    riptags::tag_source(selector, text),
-                    "syntax candidates; parser recovery status unknown".into(),
-                )
+            if eligible >= max_files
+                || source.bytes.len() > MAX_FILE_BYTES
+                || total.saturating_add(source.bytes.len()) > max_bytes
+                || tags_total >= max_tags
+            {
+                gaps.push(format!("{path}: resource limit, skipped"));
+                continue;
+            }
+            eligible += 1;
+            total += source.bytes.len();
+            let extracted = std::panic::catch_unwind(|| {
+                if selector == "json" || selector == "yaml" {
+                    structure(text, selector == "yaml")
+                } else {
+                    crate::symbols::extract(selector, text)
+                }
+            });
+            let (mut tags, note) = match extracted {
+                Ok(extracted) => extracted,
+                Err(_) => {
+                    gaps.push(format!("{path}: extraction failed; skipped"));
+                    continue;
+                }
             };
-            if tags.len() > MAX_TAGS - tags_total {
-                tags.truncate(MAX_TAGS - tags_total);
+            if tags.len() > MAX_FILE_TAGS {
+                tags.truncate(MAX_FILE_TAGS);
+                gaps.push(format!("{path}: per-file tag limit, truncated"));
+            }
+            if tags.len() > max_tags - tags_total {
+                tags.truncate(max_tags - tags_total);
                 gaps.push(format!("{path}: tag limit, truncated"));
             }
             tags_total += tags.len();
@@ -143,6 +165,9 @@ impl Analysis {
         }
     }
     pub fn query(&self, catalog: &Catalog, mut request: Request) -> Results {
+        if request.position.is_some() {
+            request.query.clear();
+        }
         if let Some((source, line, column)) = request.position
             && let Some(file) = self
                 .index
@@ -165,7 +190,12 @@ impl Analysis {
         // Public pre-tagged index owns the symbol inventory; native source keys
         // are reversible integer IDs, independent of the closed language registry.
         let mut truncated = false;
-        for file in self.index.fresh_files() {
+        let mut ordered: Vec<_> = self.index.fresh_files().iter().collect();
+        ordered.sort_by_key(|file| {
+            let id: usize = file.path.parse().expect("internal source ID");
+            (catalog.sources[id].side, &catalog.sources[id].path)
+        });
+        for file in ordered {
             let id: usize = file.path.parse().expect("internal source ID");
             if request
                 .side
@@ -236,57 +266,18 @@ impl Analysis {
         }
     }
 }
-fn classify(path: &[u8], text: &str) -> Option<&'static str> {
-    let basename = path.rsplit(|b| *b == b'/').next().unwrap_or(path);
-    let extension = basename.rsplit(|b| *b == b'.').next().unwrap_or(basename);
-    let shebang = text.lines().next().unwrap_or("");
-    if let Some(shebang) = shebang.strip_prefix("#!") {
-        let mut words = shebang.split_whitespace();
-        let executable = words.next().unwrap_or("").rsplit('/').next().unwrap_or("");
-        let interpreter = if executable == "env" {
-            words
-                .find(|word| !word.starts_with('-') && !word.contains('='))
-                .unwrap_or("")
-        } else {
-            executable
-        };
-        let interpreter = interpreter.rsplit('/').next().unwrap_or("");
-        if ["zsh", "fish", "ksh", "csh", "tcsh", "nu"].contains(&interpreter) {
-            return None;
-        }
-        if ["sh", "bash"].contains(&interpreter) {
-            return Some("buffer.sh");
-        }
-        if matches!(extension, b"sh" | b"bash") {
-            return None;
-        }
-    }
-    match extension {
-        b"rs" => Some("buffer.rs"),
-        b"c" | b"h" => Some("buffer.c"),
-        b"cc" | b"cpp" | b"cxx" | b"hpp" | b"hxx" => Some("buffer.cpp"),
-        b"go" => Some("buffer.go"),
-        b"zig" => Some("buffer.zig"),
-        b"py" => Some("buffer.py"),
-        b"sh" | b"bash" => Some("buffer.sh"),
-        b"yaml" | b"yml" => Some("yaml"),
-        b"json" => Some("json"),
-        _ if matches!(basename, b".bashrc" | b".bash_profile" | b".profile") => Some("buffer.sh"),
-        _ => None,
-    }
-}
 fn make_tag(
     node: tree_sitter::Node<'_>,
     source: &str,
     name: String,
     context: String,
     kind: OccKind,
+    columns: &[u32],
 ) -> Tag {
     let start = node.start_position();
-    let line_start = source[..node.start_byte()].rfind('\n').map_or(0, |n| n + 1);
     Tag {
         line: start.row as u32 + 1,
-        col: source[line_start..node.start_byte()].chars().count() as u32,
+        col: columns[node.start_byte()],
         len: source[node.byte_range()].chars().count() as u32,
         kind,
         sym_kind: SymKind::Field,
@@ -309,7 +300,8 @@ fn structure(source: &str, yaml: bool) -> (Vec<Tag>, String) {
         return (Vec::new(), "parser failed".into());
     };
     let mut tags = Vec::new();
-    let limits = structural_walk(tree.root_node(), source, "$", yaml, &mut tags, 0);
+    let columns = crate::symbols::scalar_columns(source);
+    let limits = structural_walk(tree.root_node(), source, "$", yaml, &mut tags, 0, &columns);
     let recovery = if tree.root_node().has_error() {
         "recovered syntax errors; partial"
     } else {
@@ -333,11 +325,12 @@ fn structural_walk(
     yaml: bool,
     tags: &mut Vec<Tag>,
     depth: usize,
+    columns: &[u32],
 ) -> u8 {
     if depth > 128 {
         return DEPTH_LIMIT;
     }
-    if tags.len() >= MAX_TAGS {
+    if tags.len() >= MAX_FILE_TAGS {
         return TAG_LIMIT;
     }
     let mut limits = 0;
@@ -358,9 +351,10 @@ fn structural_walk(
             name,
             next.clone(),
             OccKind::Definition,
+            columns,
         ));
         if let Some(value) = node.child_by_field_name("value") {
-            limits |= structural_walk(value, source, &next, yaml, tags, depth + 1);
+            limits |= structural_walk(value, source, &next, yaml, tags, depth + 1, columns);
         }
         return limits;
     }
@@ -375,6 +369,7 @@ fn structural_walk(
             } else {
                 OccKind::Path
             },
+            columns,
         ));
         return 0;
     }
@@ -390,7 +385,7 @@ fn structural_walk(
         } else {
             path.into()
         };
-        limits |= structural_walk(child, source, &next, yaml, tags, depth + 1);
+        limits |= structural_walk(child, source, &next, yaml, tags, depth + 1, columns);
         if limits & TAG_LIMIT != 0 {
             break;
         }
@@ -408,4 +403,84 @@ fn yaml_key(raw: &str) -> String {
         return decoded;
     }
     raw.to_string()
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+    #[test]
+    fn eligible_count_bytes_and_tags_are_independent_limits_and_failures_do_not_erase_valid_files()
+    {
+        let mut catalog = Catalog::default();
+        for id in 0..3000 {
+            catalog.insert(
+                ComparedSide::New,
+                format!("{id}.md").into_bytes(),
+                vec![b'x'; 32],
+            );
+        }
+        catalog.insert(ComparedSide::New, b"invalid.rs".to_vec(), vec![0xff]);
+        catalog.insert(
+            ComparedSide::New,
+            b"first.rs".to_vec(),
+            b"fn first() {}".to_vec(),
+        );
+        catalog.insert(
+            ComparedSide::New,
+            b"second.rs".to_vec(),
+            b"fn second() {}".to_vec(),
+        );
+        let request = || Request {
+            generation: 1,
+            position: None,
+            operation: Operation::Definitions,
+            query: "first".into(),
+            side: None,
+        };
+        for index in [
+            Analysis::build_with_limits(&catalog, 1, 100, 100),
+            Analysis::build_with_limits(&catalog, 10, 15, 100),
+            Analysis::build_with_limits(&catalog, 10, 100, 1),
+        ] {
+            let result = index.query(&catalog, request());
+            assert_eq!(result.candidates.len(), 1, "{result:?}");
+            assert_eq!(
+                catalog.sources[result.candidates[0].source].path,
+                b"first.rs"
+            );
+            assert!(result.coverage.contains("resource limit"));
+            assert!(result.coverage.contains("invalid UTF-8"));
+        }
+    }
+    #[test]
+    fn result_cap_selects_sorted_paths_before_cloning_candidates() {
+        let mut catalog = Catalog::default();
+        for id in (0..1100).rev() {
+            catalog.insert(
+                ComparedSide::New,
+                format!("{id:04}.rs").into_bytes(),
+                b"fn target() {}".to_vec(),
+            );
+        }
+        let result = Analysis::build(&catalog).query(
+            &catalog,
+            Request {
+                generation: 1,
+                position: None,
+                operation: Operation::Definitions,
+                query: "target".into(),
+                side: None,
+            },
+        );
+        assert_eq!(result.candidates.len(), 1000);
+        assert_eq!(
+            catalog.sources[result.candidates[0].source].path,
+            b"0000.rs"
+        );
+        assert_eq!(
+            catalog.sources[result.candidates[999].source].path,
+            b"0999.rs"
+        );
+        assert!(result.coverage.contains("Results truncated"));
+    }
 }

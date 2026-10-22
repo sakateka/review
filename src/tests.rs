@@ -1,4 +1,6 @@
 use super::*;
+#[path = "quit_tests.rs"]
+mod quit_tests;
 use app::{App, Focus};
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -2837,7 +2839,7 @@ fn navigation_controls_open_candidates_go_back_choose_old_side_and_never_mark() 
     }
     app.key(KeyCode::Enter);
     await_navigation(&mut app);
-    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 2);
+    assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 4);
     app.key(KeyCode::Enter);
     assert!(
         app.preview
@@ -3053,12 +3055,15 @@ fn navigation_catalog_acquisition_limits_unchanged_blobs_before_retention() {
             .iter()
             .any(|gap| gap.contains("byte limit"))
     );
+    let late = navigation_query(&captured.catalog, navigation::Operation::Search, "b1029.rs");
+    assert_eq!(late.candidates.len(), 2, "{late:?}");
+    // Supported targets beyond the former 1024-entry cutoff survive.
     assert!(
         captured
             .catalog
-            .gaps
+            .sources
             .iter()
-            .any(|gap| gap.contains("count limit"))
+            .any(|source| source.path == b"b1029.rs")
     );
     assert!(
         captured
@@ -3067,7 +3072,7 @@ fn navigation_catalog_acquisition_limits_unchanged_blobs_before_retention() {
             .iter()
             .map(|s| s.bytes.len())
             .sum::<usize>()
-            <= 16 * 1024 * 1024 + 1024
+            <= 128 * 1024 * 1024
     );
 }
 
@@ -4221,4 +4226,607 @@ fn keymap_regression_help_retains_options_and_prints_effective_bindings() {
     assert!(text.contains("cursor_down: z\n"));
     assert!(text.contains("line_end: $, ctrl-e (buffers)\n"));
     assert!(help(None, Some(&directory.path().join("missing.toml"))).is_err());
+}
+
+fn navigation_at(
+    catalog: &source::Catalog,
+    index: &navigation::Analysis,
+    source_id: usize,
+    line: usize,
+    column: usize,
+    operation: navigation::Operation,
+) -> navigation::Results {
+    index.query(
+        catalog,
+        navigation::Request {
+            generation: 1,
+            position: Some((source_id, line, column)),
+            operation,
+            query: String::new(),
+            side: Some(catalog.sources[source_id].side),
+        },
+    )
+}
+
+#[test]
+fn navigation_syntax_bindings_generic_trait_methods_and_reads_have_exact_scalar_spans() {
+    // Positions are independently specified by fixture row and occurrence in that row.
+    for (name, declarations, reads) in [
+        (
+            "bindings.rs",
+            vec![
+                (2, "convert"),
+                (6, "convert"),
+                (7, "local"),
+                (8, "left"),
+                (8, "right"),
+                (13, "value"),
+                (14, "callback"),
+                (18, "café"),
+            ],
+            vec![
+                (7, "input"),
+                (8, "local"),
+                (9, "left"),
+                (14, "transform"),
+                (15, "convert"),
+                (16, "convert"),
+                (17, "callback"),
+                (19, "café"),
+            ],
+        ),
+        (
+            "bindings.py",
+            vec![(1, "parameter"), (2, "local"), (3, "left"), (3, "right")],
+            vec![
+                (2, "parameter"),
+                (3, "local"),
+                (4, "local"),
+                (4, "left"),
+                (4, "right"),
+            ],
+        ),
+        (
+            "bindings.go",
+            vec![(2, "parameter"), (3, "local"), (4, "left"), (4, "right")],
+            vec![
+                (3, "parameter"),
+                (4, "local"),
+                (5, "local"),
+                (5, "left"),
+                (5, "right"),
+            ],
+        ),
+        (
+            "bindings.cpp",
+            vec![
+                (1, "Alias"),
+                (2, "field"),
+                (3, "parameter"),
+                (4, "local"),
+                (5, "record"),
+            ],
+            vec![(4, "parameter"), (6, "field"), (6, "local"), (7, "local")],
+        ),
+        (
+            "bindings.zig",
+            vec![(1, "parameter"), (2, "local")],
+            vec![(2, "parameter"), (3, "local")],
+        ),
+    ] {
+        let bytes = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/navigation")
+                .join(name),
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let mut catalog = source::Catalog::default();
+        catalog.insert(source::ComparedSide::New, name.as_bytes().to_vec(), bytes);
+        let index = navigation::Analysis::build(&catalog);
+        for &(line, symbol) in &declarations {
+            let row = text.lines().nth(line - 1).unwrap();
+            let column = row[..row.find(symbol).unwrap()].chars().count();
+            let result = navigation_at(
+                &catalog,
+                &index,
+                0,
+                line,
+                column,
+                navigation::Operation::Definitions,
+            );
+            assert_eq!(result.query, symbol, "{name}:{line}:{column} {result:?}");
+            assert!(
+                result.candidates.iter().any(|c| c.tag.line as usize == line
+                    && c.tag.col as usize == column
+                    && c.tag.len as usize == symbol.chars().count()),
+                "{name}:{line} {symbol}: {result:?}"
+            );
+        }
+        for &(line, symbol) in &reads {
+            let row = text.lines().nth(line - 1).unwrap();
+            let column = row[..row.find(symbol).unwrap()].chars().count();
+            let result = navigation_at(
+                &catalog,
+                &index,
+                0,
+                line,
+                column,
+                navigation::Operation::References,
+            );
+            assert_eq!(result.query, symbol, "{name}:{line} {result:?}");
+            assert!(
+                result.candidates.iter().any(|c| c.tag.line as usize == line
+                    && c.tag.col as usize == column
+                    && c.tag.len as usize == symbol.chars().count()),
+                "{name}:{line} {symbol}: {result:?}"
+            );
+            let definitions = navigation_at(
+                &catalog,
+                &index,
+                0,
+                line,
+                column,
+                navigation::Operation::Definitions,
+            );
+            assert!(
+                !definitions.candidates.is_empty(),
+                "{name}:{line} gd {symbol}: {definitions:?}"
+            );
+            if symbol == "convert" {
+                assert_eq!(
+                    definitions
+                        .candidates
+                        .iter()
+                        .map(|c| c.tag.line)
+                        .collect::<Vec<_>>(),
+                    vec![2, 6]
+                );
+            }
+        }
+        for (line, row) in text.lines().enumerate() {
+            if let Some(byte_column) = row.find("ghost") {
+                let column = row[..byte_column].chars().count();
+                let result = navigation_at(
+                    &catalog,
+                    &index,
+                    0,
+                    line + 1,
+                    column,
+                    navigation::Operation::References,
+                );
+                assert!(
+                    result.query.is_empty() && result.candidates.is_empty(),
+                    "{name} comment/string {result:?}"
+                );
+            }
+        }
+        let empty = navigation_at(
+            &catalog,
+            &index,
+            0,
+            1,
+            text.lines().next().unwrap().chars().count(),
+            navigation::Operation::Definitions,
+        );
+        assert!(empty.query.is_empty() && empty.candidates.is_empty());
+    }
+}
+
+#[test]
+fn navigation_acquisition_skips_docs_and_assets_and_shares_detection_across_capture_modes() {
+    let directory = fixture();
+    for id in 0..1100 {
+        std::fs::write(
+            directory.path().join(format!("a{id:04}.md")),
+            "documentation local target",
+        )
+        .unwrap();
+    }
+    std::fs::write(directory.path().join("a-invalid.bin"), [0xff, 0, 0xff]).unwrap();
+    for suffix in ["hh", "h++", "ipp", "tpp", "C", "H"] {
+        std::fs::write(
+            directory.path().join(format!("z-target.{suffix}")),
+            "int target() { int local = 1; return local; }\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        directory.path().join("z-script"),
+        "#!/usr/bin/env -S python3 -u\ndef script_target(parameter):\n    return parameter\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("z-shell"),
+        "#!/bin/bash\nshell_target() { echo okay; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("z-unsupported"),
+        "#!/usr/bin/env fish\nfunction excluded; end\n",
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "late sources"]);
+    change(directory.path());
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "second"]);
+    change(directory.path());
+    std::fs::write(
+        directory.path().join("one.rs"),
+        "fn changed_priority() {}\n",
+    )
+    .unwrap();
+    for args in [
+        vec!["HEAD~", "HEAD", "--", "one.rs"],
+        vec!["--cached", "--", "one.rs"],
+        vec!["HEAD", "--", "one.rs"],
+    ] {
+        let captured = capture(directory.path(), &args);
+        for symbol in ["target", "script_target", "shell_target"] {
+            let result = navigation_query(
+                &captured.catalog,
+                navigation::Operation::Definitions,
+                symbol,
+            );
+            assert!(
+                result.candidates.len() >= 2,
+                "{args:?} {symbol}: {result:?}"
+            );
+        }
+        assert!(
+            !captured
+                .catalog
+                .sources
+                .iter()
+                .any(|source| source.path.ends_with(b".md")
+                    || source.path.ends_with(b".bin")
+                    || source.path == b"z-unsupported")
+        );
+        if args[0] == "HEAD" {
+            assert_eq!(captured.catalog.sources[0].path, b"one.rs");
+            assert!(
+                navigation_query(
+                    &captured.catalog,
+                    navigation::Operation::Definitions,
+                    "changed_priority"
+                )
+                .candidates
+                .iter()
+                .any(|candidate| captured.catalog.sources[candidate.source].side
+                    == source::ComparedSide::New)
+            );
+        }
+    }
+}
+
+#[test]
+fn no_index_navigation_late_sources_survive_documentation_catalogs() {
+    let directory = tempfile::tempdir().unwrap();
+    for side in ["left", "right"] {
+        let root = directory.path().join(side);
+        std::fs::create_dir(&root).unwrap();
+        for id in 0..1100 {
+            std::fs::write(root.join(format!("a{id:04}.md")), "documentation").unwrap();
+        }
+        std::fs::write(root.join("z-target.rs"), "fn late_target() {}\n").unwrap();
+        std::fs::write(root.join("change.rs"), format!("fn {side}() {{}}\n")).unwrap();
+    }
+    let captured = capture(directory.path(), &["--no-index", "left", "right"]);
+    let result = navigation_query(
+        &captured.catalog,
+        navigation::Operation::Definitions,
+        "late_target",
+    );
+    assert_eq!(result.candidates.len(), 2, "{result:?}");
+    assert_eq!(
+        result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.tag.line)
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    assert!(
+        captured
+            .catalog
+            .sources
+            .iter()
+            .all(|source| !source.path.ends_with(b".md"))
+    );
+}
+
+fn assert_navigation_occurrences(
+    catalog: &source::Catalog,
+    index: &navigation::Analysis,
+    name: &str,
+    definitions: &[(u32, u32)],
+    references: &[(u32, u32)],
+) {
+    for (operation, expected) in [
+        (navigation::Operation::Definitions, definitions),
+        (navigation::Operation::References, references),
+    ] {
+        let result = index.query(
+            catalog,
+            navigation::Request {
+                generation: 1,
+                position: None,
+                operation,
+                query: name.into(),
+                side: Some(source::ComparedSide::New),
+            },
+        );
+        let actual: Vec<_> = result
+            .candidates
+            .iter()
+            .map(|candidate| {
+                assert_eq!(candidate.tag.len as usize, name.chars().count());
+                (candidate.tag.line, candidate.tag.col)
+            })
+            .collect();
+        assert_eq!(actual, expected, "{name} {operation:?}: {result:?}");
+        for &(line, column) in expected {
+            let at_cursor =
+                navigation_at(catalog, index, 0, line as usize, column as usize, operation);
+            assert_eq!(at_cursor.query, name);
+            assert_eq!(
+                at_cursor
+                    .candidates
+                    .iter()
+                    .map(|candidate| (candidate.tag.line, candidate.tag.col))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn navigation_rust_shorthand_reads_and_patterns_preserve_explicit_field_references() {
+    let text = r#"struct Record { field: u32, local: u32 }
+fn run(record: Record, local: u32) {
+    let value = Record { field: local, local };
+    let Record { field: renamed, local } = record;
+    consume(renamed, local, value.field);
+}
+"#;
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"shorthand.rs".to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(
+        &catalog,
+        &index,
+        "field",
+        &[(1, 16)],
+        &[(3, 25), (4, 17), (5, 34)],
+    );
+    assert_navigation_occurrences(
+        &catalog,
+        &index,
+        "local",
+        &[(1, 28), (2, 23), (4, 33)],
+        &[(3, 32), (3, 39), (5, 21)],
+    );
+    assert_navigation_occurrences(&catalog, &index, "renamed", &[(4, 24)], &[(5, 12)]);
+}
+
+#[test]
+fn navigation_go_range_assignment_is_read_and_short_declaration_introduces_name() {
+    let text = r#"package main
+func run(values []int, key int) {
+    for key = range values { consume(key) }
+    for next := range values { consume(next) }
+}
+"#;
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"range.go".to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(&catalog, &index, "key", &[(2, 23)], &[(3, 8), (3, 37)]);
+    assert_navigation_occurrences(&catalog, &index, "next", &[(4, 8)], &[(4, 39)]);
+}
+
+#[test]
+fn navigation_c_locals_parameters_and_pointer_fields_have_exact_declarations_and_reads() {
+    let text = r#"struct Record { int *field; };
+int run(int parameter) {
+    int local = parameter;
+    struct Record value;
+    value.field = &local;
+    return *value.field;
+}
+"#;
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"bindings.c".to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(&catalog, &index, "parameter", &[(2, 12)], &[(3, 16)]);
+    assert_navigation_occurrences(&catalog, &index, "local", &[(3, 8)], &[(5, 19)]);
+    assert_navigation_occurrences(&catalog, &index, "field", &[(1, 21)], &[(5, 10), (6, 18)]);
+}
+
+#[test]
+fn navigation_code_parser_recovery_does_not_erase_other_valid_sources() {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"valid.rs".to_vec(),
+        b"fn valid(parameter: u32) {\n    let local = parameter;\n    consume(local);\n}\n"
+            .to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"broken.rs".to_vec(),
+        b"fn broken( { let lost = ; }\n".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"invalid.rs".to_vec(),
+        vec![0xff],
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(&catalog, &index, "local", &[(2, 8)], &[(3, 12)]);
+    let result = navigation_at(
+        &catalog,
+        &index,
+        0,
+        3,
+        12,
+        navigation::Operation::Definitions,
+    );
+    assert!(
+        result
+            .coverage
+            .contains("broken.rs: recovered syntax errors"),
+        "{result:?}"
+    );
+    assert!(
+        result.coverage.contains("invalid.rs: invalid UTF-8"),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn navigation_dependency_preflight_limits_dense_deep_and_large_sources_without_erasing_valid_code()
+{
+    let dense = format!(
+        "fn dense(value: u32) {{\n{}}}\n",
+        "consume(value);\n".repeat(10_000)
+    );
+    let deep = format!(
+        "fn deep(value: u32) {{\nconsume({}value{});\n}}\n",
+        "(".repeat(512),
+        ")".repeat(512)
+    );
+    let large = format!("fn large() {{}}\n{}", " ".repeat(256 * 1024));
+    for text in [&dense, &deep, &large] {
+        assert!(text.len() < navigation::MAX_FILE_BYTES);
+        let (_, coverage) = symbols::extract("buffer.rs", text);
+        assert!(
+            coverage.contains("rich riptags extraction skipped"),
+            "{coverage}"
+        );
+        assert!(coverage.contains("bounded syntax supplementation"));
+    }
+    let (rich, coverage) = symbols::extract("buffer.rs", "fn valid() { valid(); }\n");
+    assert!(!coverage.contains("rich riptags extraction skipped"));
+    assert!(rich.iter().any(|tag| tag.name.as_ref() == "valid"
+        && tag.kind == riptags::OccKind::Definition
+        && tag.sym_kind == riptags::SymKind::Function));
+    assert!(
+        rich.iter().any(
+            |tag| tag.kind == riptags::OccKind::Call && tag.context.as_deref() == Some("valid")
+        )
+    );
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"valid.rs".to_vec(),
+        b"fn valid() { valid(); }\n".to_vec(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"dense.rs".to_vec(),
+        dense.into_bytes(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"deep.rs".to_vec(),
+        deep.into_bytes(),
+    );
+    catalog.insert(
+        source::ComparedSide::New,
+        b"large.rs".to_vec(),
+        large.into_bytes(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(&catalog, &index, "valid", &[(1, 3)], &[(1, 13)]);
+    let late_read = navigation_at(
+        &catalog,
+        &index,
+        1,
+        10_001,
+        8,
+        navigation::Operation::Definitions,
+    );
+    assert_eq!(late_read.query, "value");
+    assert!(
+        late_read
+            .candidates
+            .iter()
+            .any(|candidate| candidate.source == 1
+                && candidate.tag.line == 1
+                && candidate.tag.col == 9)
+    );
+    let deep_read = navigation_at(
+        &catalog,
+        &index,
+        2,
+        2,
+        8 + 512,
+        navigation::Operation::Definitions,
+    );
+    assert_eq!(deep_read.query, "value");
+    assert!(
+        deep_read
+            .candidates
+            .iter()
+            .any(|candidate| candidate.source == 2
+                && candidate.tag.line == 1
+                && candidate.tag.col == 8)
+    );
+}
+
+#[test]
+fn navigation_large_flat_arguments_keep_exact_reads_without_declarations() {
+    let arguments = vec!["value"; 10_000].join(", ");
+    let text = format!("fn flat(value: u32) {{\n    consume({arguments});\n}}\n");
+    let (tags, _) = symbols::extract("buffer.rs", &text);
+    let declarations: Vec<_> = tags
+        .iter()
+        .filter(|tag| tag.name.as_ref() == "value" && tag.kind.is_definition())
+        .map(|tag| (tag.line, tag.col))
+        .collect();
+    assert_eq!(declarations, vec![(1, 8)]);
+    let reads: Vec<_> = tags
+        .iter()
+        .filter(|tag| tag.name.as_ref() == "value" && !tag.kind.is_definition())
+        .map(|tag| {
+            assert_eq!(tag.len, 5);
+            (tag.line, tag.col)
+        })
+        .collect();
+    assert_eq!(
+        reads,
+        (0..10_000)
+            .map(|argument| (2, 12 + argument * 7))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn navigation_rust_captured_patterns_declare_whole_and_nested_names() {
+    let text = "fn capture(pair: (u32, u32)) {\n    let whole @ (left, right) = pair;\n    consume(whole, left, right);\n}\n";
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        b"captured.rs".to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    let index = navigation::Analysis::build(&catalog);
+    assert_navigation_occurrences(&catalog, &index, "whole", &[(2, 8)], &[(3, 12)]);
+    assert_navigation_occurrences(&catalog, &index, "left", &[(2, 17)], &[(3, 19)]);
+    assert_navigation_occurrences(&catalog, &index, "right", &[(2, 23)], &[(3, 25)]);
+    assert_navigation_occurrences(&catalog, &index, "pair", &[(1, 11)], &[(2, 32)]);
 }

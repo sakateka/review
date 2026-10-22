@@ -211,7 +211,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.resize(*shape)
     session.send(b" ")
     session.wait_text("Review mark saved")
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
     for exit_method in ["q", "ctrl-c", "SIGINT", "SIGTERM"]:
         session = Session()
@@ -224,7 +224,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
         session.finish()
     session = Session([str(binary), "--", "missing-reference"])
     session.wait_text("Git status")
-    session.send(b"q")
+    session.send(b",q")
     session.finish(128)
     if args.test_binary:
         for scenario in ["panic", "error", "worker-panic"]:
@@ -235,7 +235,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
                 session.wait_text("Analysis failed")
                 assert termios.tcgetattr(session.slave) != session.original, "caught worker panic disabled raw mode"
                 assert b"\x1b[?1049l" not in session.output, "caught worker panic left alternate screen"
-                session.send(b"q")
+                session.send(b",q")
             session.finish(101 if scenario == "panic" else 0)
     after = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     assert before == after, "review changed repository bytes"
@@ -280,7 +280,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Captured old target.rs")
     session.send(b"\x1b")
     assert session.process.poll() is None, "Emacs Escape exited"
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
 
     # CLI style wins discovery, with readline disabled independently of Vim.
@@ -293,7 +293,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     assert (session.row, session.col) == origin, "disabled readline moved the cursor"
     session.send(b"j")
     assert session.row == origin[0] + 1, "CLI keymap did not override discovered Emacs map"
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
 
     # Supplemental readline works in Vim when its action is not overridden.
@@ -306,7 +306,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     origin = (session.row, session.col)
     session.send(b"\x0e")
     assert session.row == origin[0] + 1, "enabled readline failed in Vim diff"
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
 
     # Overrides replace defaults, support sequences and update the legend.
@@ -342,7 +342,7 @@ go_to_definition = "gD"
     session.wait_text("Files")
     assert "┌Diff" not in session.text()
     assert "x close" in session.text(), "footer ignored close override"
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
 
     help_result = subprocess.run([str(binary), "--config", str(explicit_config), "--help"], env=env, capture_output=True, text=True, check=True)
@@ -359,7 +359,7 @@ go_to_definition = "gD"
     origin = (session.row, session.col)
     session.send(b"j\x1b[B")
     assert (session.row, session.col) == origin, "disabled cursor_down action remained active"
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
 
     for invalid in ['[features]\nkeymap="unknown"\n', '[features]\nreadline="yes"\n',
@@ -383,6 +383,44 @@ go_to_definition = "gD"
     config_file.unlink()
     assert config_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     print("PTY passed: discovered/explicit config, Vim/Emacs, overrides, readline, disabled/removed keys and invalid config", flush=True)
+
+    # q closes a view first; leader-q exits directly from every context.
+    for source_view in [False, True]:
+        session = Session()
+        session.wait_text("Files")
+        if source_view:
+            session.send(b"/main_target\r")
+            session.wait_text("Search candidates")
+            session.send(b"\r")
+            session.wait_text("Captured old target.rs")
+        else:
+            session.send(b"\r")
+            session.wait_text("Diff")
+        session.send(b"q")
+        session.wait_text("Files")
+        assert "┌Diff" not in session.text() and "Captured old target.rs" not in session.text()
+        assert session.process.poll() is None, "q exited before closing the view"
+        session.send(b"q")
+        session.finish()
+    for context in ["files", "diff", "candidates", "source", "query", "original"]:
+        command = [str(binary), "--", "--stat", "HEAD"] if context == "original" else None
+        session = Session(command)
+        session.wait_text("Original Git output" if context == "original" else "Files")
+        if context == "diff":
+            session.send(b"\r")
+            session.wait_text("Diff")
+        elif context in ("candidates", "source"):
+            session.send(b"/main_target\r")
+            session.wait_text("Search candidates")
+            if context == "source":
+                session.send(b"\r")
+                session.wait_text("Captured old target.rs")
+        elif context == "query":
+            session.send(b"/main")
+            session.wait_text("Search/outline: main")
+        session.send(b",q")
+        session.finish()
+    print("PTY passed: q closes then exits; leader-q quits from files, diff, candidates, source, query and original output", flush=True)
 
     # Story 6: run product acceptance through the installed executable, keeping
     # setup mutations distinct from read-only review sessions.
@@ -432,9 +470,100 @@ go_to_definition = "gD"
                         break
 
     def quit_unchanged(session, before, cwd=acceptance, expected=0):
-        session.send(b"q")
+        session.send(b",q")
         session.finish(expected)
         assert snapshot(cwd) == before, "installed review modified comparison inputs"
+
+    # Previously omitted bindings and generic trait calls remain navigable even
+    # when non-code files sort before unchanged source in the captured catalog.
+    indexing_repo = root / "indexing"
+    indexing_repo.mkdir()
+    def indexing_git(*words):
+        return subprocess.check_output([git, *words], cwd=indexing_repo, env=env, stderr=subprocess.STDOUT)
+    indexing_git("init", "-q")
+    indexing_git("config", "user.name", "Index acceptance")
+    indexing_git("config", "user.email", "index@example.invalid")
+    docs = indexing_repo / "a-docs"
+    docs.mkdir()
+    for index in range(1030):
+        (docs / f"{index:04}.md").write_text("Documentation only.\n" * 460)
+    trait_source = '''pub trait Convert<T> {
+    fn adapt<U>(&self, input: U) -> T;
+}
+pub struct Worker;
+impl Convert<u32> for Worker {
+    fn adapt<U>(&self, _input: U) -> u32 { 7 }
+}
+pub fn convert_value<U>(value: U) -> U { value }
+pub fn invoke(worker: Worker) -> u32 {
+    let local_value = 3;
+    let callback = convert_value::<u32>;
+    let after = callback(local_value);
+    // adapt local_value convert_value
+    let ignored = "adapt local_value convert_value";
+    worker.adapt::<u32>(after)
+}
+'''
+    (indexing_repo / "zzz-traits.rs").write_text(trait_source)
+    (indexing_repo / "caller.rs").write_text("fn caller() { invoke(Worker); }\n")
+    indexing_git("add", ".")
+    indexing_git("commit", "-qm", "generic trait and late source")
+    (indexing_repo / "caller.rs").write_text("fn caller() { let result = invoke(Worker); }\n")
+    indexing_before = snapshot(indexing_repo)
+    index_state_before = snapshot(root / "state")
+    session = Session([str(binary), "--", "HEAD", "--", "caller.rs"], cwd=indexing_repo)
+    closed(session)
+    session.send(b"/adapt\r")
+    session.wait_text("4 results")  # trait declaration and impl, on both sides
+    session.send(b"\r")
+    session.wait_text("Captured old zzz-traits.rs")
+    def index_position(text):
+        for row, line in enumerate(session.text().splitlines()):
+            if text in line:
+                return line.index(text), row
+        raise AssertionError((text, session.text()))
+    symbol_x, symbol_y = index_position("adapt<U>")
+    assert session.colors[(symbol_y, symbol_x)] is not None, "generic trait declaration lost highlighting"
+    session.send(b"gr")
+    session.wait_text("1 results")  # excludes same text in comment and string
+    session.send(b"\r")
+    session.wait_text("Captured old zzz-traits.rs")
+    symbol_x, symbol_y = index_position("adapt::<u32>")
+    assert (session.row, session.col) == (symbol_y, symbol_x), "generic call opened at wrong scalar position"
+    read_cursor = (session.row, session.col)
+    session.send(b"gd")
+    session.wait_text("2 results")  # ambiguity retains trait declaration and impl
+    session.send(b"\x0f")
+    session.wait_text("Captured old zzz-traits.rs")
+    assert (session.row, session.col) == read_cursor
+    session.send(b"]")
+    session.wait_text("Captured new zzz-traits.rs")
+    session.send(b"gd")
+    session.wait_text("2 results")
+    session.send(b"\x1b")
+    closed(session)
+
+    for symbol, occurrence in [("local_value", "local_value);"), ("convert_value", "convert_value::<u32>")]:
+        session.send(b"/" + symbol.encode() + b"\r")
+        session.wait_text("2 results")
+        session.send(b"\r")
+        session.wait_text("Captured old zzz-traits.rs")
+        session.send(b"gr")
+        session.wait_text("1 results")
+        session.send(b"\r")
+        session.wait_text("Captured old zzz-traits.rs")
+        symbol_x, symbol_y = index_position(occurrence)
+        assert (session.row, session.col) == (symbol_y, symbol_x), (symbol, session.text())
+        session.send(b"gd")
+        session.wait_text("1 results")
+        session.send(b"\x1b")
+        closed(session)
+    assert "Partial name/syntax" not in session.text()
+    session.send(b",q")
+    session.finish()
+    assert snapshot(indexing_repo) == indexing_before, "indexing/navigation changed repository bytes"
+    assert snapshot(root / "state") == index_state_before, "indexing/navigation implicitly changed marks"
+    print("PTY passed: late unchanged sources, generic trait declarations/turbofish calls, local bindings, function references and exact read-only navigation", flush=True)
 
     # R13: installed cursor/mouse behavior, independently captured immutable inputs.
     mouse_repo = root / "cursor-mouse"
@@ -540,7 +669,7 @@ go_to_definition = "gD"
     session.wait_text("Diff")
     for shape in [(1, 1), (3, 8), (30, 140)]:
         session.resize(*shape)
-    session.send(b"q")
+    session.send(b",q")
     session.finish()
     assert snapshot(mouse_repo) == mouse_before, "cursor/mouse review changed repository bytes"
     assert snapshot(root / "state") == state_after_mark, "cursor/mouse input changed marks"

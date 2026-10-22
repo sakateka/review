@@ -245,6 +245,8 @@ pub struct CapturedSource {
 pub struct Catalog {
     pub sources: Vec<CapturedSource>,
     pub gaps: Vec<String>,
+    lookup: std::collections::BTreeMap<(ComparedSide, Vec<u8>), usize>,
+    usage: [(usize, usize); 2],
 }
 impl Catalog {
     pub fn insert(&mut self, side: ComparedSide, path: Vec<u8>, bytes: Vec<u8>) {
@@ -255,19 +257,76 @@ impl Catalog {
             bytes: bytes.into(),
             identity,
         };
-        if let Some(existing) = self
-            .sources
-            .iter_mut()
-            .find(|s| s.side == side && s.path == source.path)
-        {
-            *existing = source;
+        let key = (side, source.path.clone());
+        let usage = &mut self.usage[side as usize];
+        if let Some(&id) = self.lookup.get(&key) {
+            usage.1 = usage.1 - self.sources[id].bytes.len() + source.bytes.len();
+            self.sources[id] = source;
         } else {
+            usage.0 += 1;
+            usage.1 += source.bytes.len();
+            self.lookup.insert(key, self.sources.len());
             self.sources.push(source);
         }
     }
+    pub fn insert_captured(&mut self, side: ComparedSide, path: Vec<u8>, bytes: &[u8]) {
+        self.insert_with_limits(
+            side,
+            path,
+            bytes,
+            crate::git::CATALOG_FILES_PER_SIDE,
+            crate::git::CATALOG_BYTES_PER_SIDE,
+        );
+    }
+    fn insert_with_limits(
+        &mut self,
+        side: ComparedSide,
+        path: Vec<u8>,
+        bytes: &[u8],
+        max_files: usize,
+        max_bytes: usize,
+    ) {
+        let (count, total) = self.usage[side as usize];
+        let previous = self
+            .find(side, &path)
+            .map(|id| self.sources[id].bytes.len());
+        if bytes.len() > crate::navigation::MAX_FILE_BYTES
+            || (previous.is_none() && count >= max_files)
+            || total - previous.unwrap_or(0) + bytes.len() > max_bytes
+        {
+            self.gaps.push(format!(
+                "{} {}: catalog count/byte limit, skipped",
+                side.label(),
+                crate::git::visible_bytes(&path)
+            ));
+            return;
+        }
+        self.insert(side, path, bytes.to_vec());
+    }
     pub fn find(&self, side: ComparedSide, path: &[u8]) -> Option<usize> {
-        self.sources
-            .iter()
-            .position(|s| s.side == side && s.path == path)
+        self.lookup.get(&(side, path.to_vec())).copied()
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn independent_side_budgets_preserve_stable_ids_and_changed_content() {
+        let mut catalog = Catalog::default();
+        for side in [ComparedSide::Old, ComparedSide::New] {
+            catalog.insert_with_limits(side, b"changed.rs".to_vec(), b"first", 2, 8);
+            catalog.insert_with_limits(side, b"tiny.rs".to_vec(), b"x", 2, 8);
+            catalog.insert_with_limits(side, b"extra.rs".to_vec(), b"x", 2, 8);
+            let id = catalog.find(side, b"changed.rs").unwrap();
+            catalog.insert_with_limits(side, b"changed.rs".to_vec(), b"second", 2, 8);
+            assert_eq!(catalog.find(side, b"changed.rs"), Some(id));
+            assert_eq!(catalog.sources[id].bytes.as_ref(), b"second");
+            catalog.insert_with_limits(side, b"changed.rs".to_vec(), b"too many bytes", 2, 8);
+            assert_eq!(catalog.sources[id].bytes.as_ref(), b"second");
+            assert_eq!(catalog.find(side, b"extra.rs"), None);
+        }
+        assert_eq!(catalog.sources.len(), 4);
+        assert_eq!(catalog.gaps.len(), 4);
     }
 }

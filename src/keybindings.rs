@@ -38,7 +38,7 @@ actions! {
     FirstLine => "first_line", LastLine => "last_line", HalfPageUp => "half_page_up", HalfPageDown => "half_page_down",
     PageUp => "page_up", PageDown => "page_down", SearchWord => "search_word", SearchWordBackward => "search_word_backward",
     SearchNext => "search_next", SearchPrevious => "search_previous", OpenDiffView => "open_diff_view", CloseDiffView => "close_diff_view",
-    SwitchPane => "switch_pane", Quit => "quit", SearchSymbols => "search_symbols", GoToDefinition => "go_to_definition",
+    SwitchPane => "switch_pane", CloseOrQuit => "close_or_quit", Quit => "quit", SearchSymbols => "search_symbols", GoToDefinition => "go_to_definition",
     GoToReferences => "go_to_references", GoBack => "go_back", OldSide => "old_side", NewSide => "new_side",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
 }
@@ -84,7 +84,8 @@ impl Bindings {
             (OpenDiffView, &["enter"]),
             (CloseDiffView, &["esc"]),
             (SwitchPane, &["tab"]),
-            (Quit, &["q"]),
+            (CloseOrQuit, &["q"]),
+            (Quit, &[",q"]),
             (SearchSymbols, &["/"]),
             (OldSide, &["["]),
             (NewSide, &["]"]),
@@ -236,10 +237,19 @@ impl Bindings {
     pub fn pending(&self) -> bool {
         !self.pending.is_empty()
     }
+    pub fn pending_keys(&self) -> &[KeyEvent] {
+        &self.pending
+    }
     pub fn resolve(&mut self, key: KeyEvent, buffer: bool) -> Resolution {
+        self.resolve_filtered(key, buffer, false)
+    }
+    pub fn resolve_quit(&mut self, key: KeyEvent) -> Resolution {
+        self.resolve_filtered(key, false, true)
+    }
+    fn resolve_filtered(&mut self, key: KeyEvent, buffer: bool, only_quit: bool) -> Resolution {
         self.pending.push(normalize(key));
         for binding in &self.bindings {
-            if binding.supplemental && !buffer {
+            if (binding.supplemental && !buffer) || (only_quit && binding.action != Action::Quit) {
                 continue;
             }
             if binding.keys.starts_with(&self.pending) {
@@ -299,6 +309,7 @@ impl Bindings {
             (GoToDefinition, "definition"),
             (GoBack, "back"),
             (CloseDiffView, "close"),
+            (CloseOrQuit, "close/quit"),
             (Quit, "quit"),
         ]
         .into_iter()

@@ -8,6 +8,7 @@ mod preview;
 mod search;
 mod source;
 mod state;
+mod symbols;
 mod ui;
 
 use anyhow::{Result, bail};

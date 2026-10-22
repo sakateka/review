@@ -838,6 +838,34 @@ pub(crate) fn capture_with_hook(
         }
     }
     let mut catalog = crate::source::Catalog::default();
+    if let Some(items) = &items {
+        for item in items {
+            if let Some((old, new)) = &item.captured_sources {
+                if matches!(item.old_mode.as_str(), "100644" | "100755")
+                    && catalog_eligible(&item.old_path, old)
+                {
+                    catalog.insert_captured(
+                        crate::source::ComparedSide::Old,
+                        item.old_path.clone(),
+                        old,
+                    );
+                }
+                if matches!(item.new_mode.as_str(), "100644" | "100755")
+                    && catalog_eligible(&item.new_path, new)
+                {
+                    catalog.insert_captured(
+                        crate::source::ComparedSide::New,
+                        item.new_path.clone(),
+                        new,
+                    );
+                }
+            } else {
+                catalog
+                    .gaps
+                    .push(format!("{}: compared source unavailable", item.name()));
+            }
+        }
+    }
     if refs_stable || analysis.no_index || (refs_before.is_none() && analysis.operands.is_empty()) {
         let stable = before
             .as_ref()
@@ -877,7 +905,9 @@ pub(crate) fn capture_with_hook(
                 (crate::source::ComparedSide::New, new),
             ] {
                 for (path, bytes) in files {
-                    catalog.insert(side, path, bytes);
+                    if catalog.find(side, &path).is_none() {
+                        catalog.insert_captured(side, path, &bytes);
+                    }
                 }
             }
             catalog.gaps.push("Search includes captured tracked ordinary files; untracked files, submodules and symlinks are excluded".into());
@@ -888,30 +918,6 @@ pub(crate) fn capture_with_hook(
         catalog
             .gaps
             .push("Comparison inputs moved; searching proven changed sources only".into());
-    }
-    if let Some(items) = &items {
-        for item in items {
-            if let Some((old, new)) = &item.captured_sources {
-                if matches!(item.old_mode.as_str(), "100644" | "100755") {
-                    catalog.insert(
-                        crate::source::ComparedSide::Old,
-                        item.old_path.clone(),
-                        old.clone(),
-                    );
-                }
-                if matches!(item.new_mode.as_str(), "100644" | "100755") {
-                    catalog.insert(
-                        crate::source::ComparedSide::New,
-                        item.new_path.clone(),
-                        new.clone(),
-                    );
-                }
-            } else {
-                catalog
-                    .gaps
-                    .push(format!("{}: compared source unavailable", item.name()));
-            }
-        }
     }
     Ok(Capture {
         catalog,
@@ -1733,9 +1739,9 @@ fn unquote(encoded: &[u8]) -> Option<Vec<u8>> {
 type CatalogFiles = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
 // These limits apply before reading any broad-catalog object content. Existing
 // comparison output and canonical item proofs deliberately retain their policy.
-const CATALOG_FILES_PER_SIDE: usize = 1024;
-const CATALOG_BYTES_PER_SIDE: usize = 8 * 1024 * 1024;
-const CATALOG_LIST_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const CATALOG_FILES_PER_SIDE: usize = 8192;
+pub(crate) const CATALOG_BYTES_PER_SIDE: usize = 64 * 1024 * 1024;
+const CATALOG_LIST_BYTES: usize = 16 * 1024 * 1024;
 fn listed_catalog(
     cwd: &Path,
     entries: &[u8],
@@ -1757,24 +1763,30 @@ fn listed_catalog(
         let mut files = CatalogFiles::new();
         let mut total = 0usize;
         let mut omitted = 0usize;
-        for (position, entry) in entries
-            .split(|b| *b == 0)
-            .filter(|e| !e.is_empty())
-            .enumerate()
-        {
-            if position >= CATALOG_FILES_PER_SIDE {
-                gaps.push(
-                    "Catalog acquisition count limit: remaining entries omitted (1024 per side)"
-                        .into(),
-                );
-                break;
-            }
+        let mut sniffed = 0usize;
+        let mut sniff_bytes = 0usize;
+        for entry in entries.split(|b| *b == 0).filter(|e| !e.is_empty()) {
             let tab = entry.iter().position(|b| *b == b'\t')?;
             let fields: Vec<_> = entry[..tab].split(|b| *b == b' ').collect();
             if fields.len() != 3 {
                 return None;
             }
             if !matches!(fields[0], b"100644" | b"100755") || (index && fields[2] != b"0") {
+                continue;
+            }
+            let path = &entry[tab + 1..];
+            let known = crate::symbols::classify(path, "").is_some();
+            if !known {
+                if !crate::symbols::sniff_candidate(path, fields[0] == b"100755") {
+                    continue;
+                }
+                if sniffed >= crate::symbols::SNIFF_FILES {
+                    omitted += 1;
+                    continue;
+                }
+            }
+            if files.len() >= CATALOG_FILES_PER_SIDE {
+                omitted += 1;
                 continue;
             }
             let oid = std::str::from_utf8(fields[if index { 1 } else { 2 }]).ok()?;
@@ -1796,6 +1808,16 @@ fn listed_catalog(
                 omitted += 1;
                 continue;
             }
+            if !known {
+                sniffed += 1;
+                if sniff_bytes.saturating_add(size)
+                    > crate::symbols::SNIFF_BYTES * crate::symbols::SNIFF_FILES
+                {
+                    omitted += 1;
+                    continue;
+                }
+                sniff_bytes += size;
+            }
             writeln!(input, "contents {oid}").ok()?;
             input.flush().ok()?;
             let mut content_header = String::new();
@@ -1814,11 +1836,14 @@ fn listed_catalog(
             if newline != *b"\n" {
                 return None;
             }
+            if !catalog_eligible(path, &bytes) {
+                continue;
+            }
             total += size;
-            files.insert(entry[tab + 1..].to_vec(), bytes);
+            files.insert(path.to_vec(), bytes);
         }
         if omitted > 0 {
-            gaps.push(format!("Catalog acquisition omitted {omitted} source(s): 1 MiB per file / 8 MiB per side byte limit"));
+            gaps.push(format!("Catalog acquisition omitted {omitted} source(s): 8192 eligible files / 1 MiB per file / 64 MiB per side byte limit or script sniff allowance"));
         }
         Some(files)
     })();
@@ -1845,7 +1870,7 @@ fn tree_catalog(cwd: &Path, tree: &[u8], gaps: &mut Vec<String>) -> Option<Catal
     if read.is_err() || entries.len() > CATALOG_LIST_BYTES {
         let _ = child.kill();
         let _ = child.wait();
-        gaps.push("Catalog acquisition tree listing exceeds 2 MiB; this side omitted".into());
+        gaps.push("Catalog acquisition tree listing exceeds 16 MiB; this side omitted".into());
         return Some(CatalogFiles::new());
     }
     if !child.wait().ok()?.success() {
@@ -1865,35 +1890,73 @@ fn index_catalog(
         gaps,
     )
 }
+fn catalog_eligible(path: &[u8], bytes: &[u8]) -> bool {
+    // Eligibility uses the same bounded shebang prefix as analysis. Invalid UTF-8
+    // in a supported file stays retained so analysis can report its omission.
+    let prefix = &bytes[..bytes.len().min(crate::symbols::SNIFF_BYTES)];
+    crate::symbols::classify(
+        path,
+        std::str::from_utf8(prefix).unwrap_or_else(|error| {
+            std::str::from_utf8(&prefix[..error.valid_up_to()]).unwrap_or("")
+        }),
+    )
+    .is_some()
+}
 fn worktree_catalog(snapshot: &CatalogFiles, gaps: &mut Vec<String>) -> CatalogFiles {
-    let mut count = 0usize;
+    worktree_catalog_selected(snapshot, gaps, None)
+}
+fn worktree_catalog_selected(
+    snapshot: &CatalogFiles,
+    gaps: &mut Vec<String>,
+    prefix: Option<&[u8]>,
+) -> CatalogFiles {
     let mut total = 0usize;
-    let mut omitted = false;
-    let files = snapshot
-        .iter()
-        .filter(|(path, _)| {
-            !path.starts_with(b"\0")
-                && snapshot
-                    .get(&[b"\0MODE".as_slice(), path].concat())
-                    .is_some_and(|mode| matches!(mode.as_slice(), b"100644" | b"100755"))
-        })
-        .take(CATALOG_FILES_PER_SIDE + 1)
-        .filter(|(_, bytes)| {
-            count += 1;
-            if count > CATALOG_FILES_PER_SIDE
-                || bytes.len() > crate::navigation::MAX_FILE_BYTES
-                || total.saturating_add(bytes.len()) > CATALOG_BYTES_PER_SIDE
-            {
-                omitted = true;
-                return false;
+    let mut omitted = 0usize;
+    let mut sniffed = 0usize;
+    let mut files = CatalogFiles::new();
+    for (path, bytes) in snapshot {
+        if prefix.is_some_and(|prefix| {
+            path.as_slice() != prefix
+                && !path
+                    .strip_prefix(prefix)
+                    .is_some_and(|tail| tail.starts_with(b"/"))
+        }) {
+            continue;
+        }
+        if path.starts_with(b"\0") {
+            continue;
+        }
+        let Some(mode) = snapshot.get(&[b"\0MODE".as_slice(), path].concat()) else {
+            continue;
+        };
+        if !matches!(mode.as_slice(), b"100644" | b"100755") {
+            continue;
+        }
+        if crate::symbols::classify(path, "").is_none() {
+            if !crate::symbols::sniff_candidate(path, mode == b"100755") {
+                continue;
             }
-            total += bytes.len();
-            true
-        })
-        .map(|(p, b)| (p.clone(), b.clone()))
-        .collect();
-    if omitted {
-        gaps.push("Catalog acquisition omitted snapshot sources: 1024 files / 1 MiB per file / 8 MiB per side limit".into());
+            if sniffed >= crate::symbols::SNIFF_FILES {
+                omitted += 1;
+                continue;
+            }
+            sniffed += 1;
+        }
+        if !catalog_eligible(path, bytes) {
+            continue;
+        }
+        if files.len() >= CATALOG_FILES_PER_SIDE
+            || bytes.len() > crate::navigation::MAX_FILE_BYTES
+            || total.saturating_add(bytes.len()) > CATALOG_BYTES_PER_SIDE
+        {
+            omitted += 1;
+            continue;
+        }
+        total += bytes.len();
+        files.insert(path.clone(), bytes.clone());
+    }
+    if omitted > 0 {
+        gaps.push(format!("Catalog acquisition omitted {omitted} snapshot sources: 8192 eligible files / 1 MiB per file / 64 MiB per side limit or script sniff allowance"));
     }
     files
 }
@@ -1907,18 +1970,10 @@ fn no_index_catalog(
     if operands.len() != 2 {
         return None;
     }
-    let files = worktree_catalog(snapshot, gaps);
-    let select = |operand: &OsString| {
+    let mut select = |operand: &OsString| {
         let prefix = operand.as_encoded_bytes();
-        files
-            .clone()
+        worktree_catalog_selected(snapshot, gaps, Some(prefix))
             .into_iter()
-            .filter(|(path, _)| {
-                path.as_slice() == prefix
-                    || path
-                        .strip_prefix(prefix)
-                        .is_some_and(|tail| tail.starts_with(b"/"))
-            })
             .map(|(path, bytes)| (path.strip_prefix(b"/").unwrap_or(&path).to_vec(), bytes))
             .collect()
     };
