@@ -32,9 +32,55 @@ pub struct Item {
     /// Missing when the representation cannot prove complete side bytes.
     pub canonical_identity: Option<String>,
     pub captured_sources: Option<(Vec<u8>, Vec<u8>)>,
+    statistics: Statistics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Statistics {
+    Text { additions: usize, deletions: usize },
+    Binary,
+    Unavailable,
 }
 
 impl Item {
+    pub fn statistics(&self) -> Statistics {
+        self.statistics
+    }
+
+    /// Count only the validated native hunks, never a reconstructed/live diff.
+    fn derive_statistics(&self) -> Statistics {
+        let mut in_hunk = false;
+        let (mut additions, mut deletions) = (0, 0);
+        for line in self.patch.split(|byte| *byte == b'\n') {
+            if line.starts_with(b"@@ ") {
+                in_hunk = true;
+            } else if in_hunk {
+                match line.first() {
+                    Some(b'+') => additions += 1,
+                    Some(b'-') => deletions += 1,
+                    _ => {}
+                }
+            } else if line.starts_with(b"Binary files ") {
+                return Statistics::Binary;
+            }
+        }
+        if in_hunk
+            || self
+                .captured_sources
+                .as_ref()
+                .is_some_and(|(old, new)| old == new)
+        {
+            Statistics::Text {
+                additions,
+                deletions,
+            }
+        } else {
+            // A metadata header alone can hide content suppressed by Git's
+            // whitespace/filter options. Only complete equal sides prove zero.
+            Statistics::Unavailable
+        }
+    }
+
     pub fn name(&self) -> String {
         if self.old_path != self.new_path {
             format!(
@@ -48,7 +94,7 @@ impl Item {
     }
 }
 
-fn visible_name(bytes: &[u8]) -> String {
+pub(crate) fn visible_name(bytes: &[u8]) -> String {
     visible_bytes(bytes)
         .chars()
         .map(|character| {
@@ -806,6 +852,27 @@ pub(crate) fn capture_with_hook(
             if let Some((identity, old, new)) = proven {
                 item.canonical_identity = Some(identity);
                 item.captured_sources = Some((old, new));
+            }
+            item.statistics = item.derive_statistics();
+            if item.statistics == Statistics::Unavailable {
+                let content_oid = match item.status.as_str() {
+                    "A" if item.old_mode == "000000" => Some(&item.new_oid),
+                    "D" if item.new_mode == "000000" => Some(&item.old_oid),
+                    _ => None,
+                };
+                // Empty creation/deletion has no hunk. A verified empty Git
+                // object plus the explicit absent side proves zero even when
+                // mutable-source capture cannot restore a review identity.
+                if content_oid.is_some_and(|oid| {
+                    !oid.is_empty()
+                        && !oid.bytes().all(|byte| byte == b'0')
+                        && object_side(cwd, oid).is_some_and(|bytes| bytes.is_empty())
+                }) {
+                    item.statistics = Statistics::Text {
+                        additions: 0,
+                        deletions: 0,
+                    };
+                }
             }
             item.legacy_fingerprints =
                 legacy_fingerprints(cwd, item, &analysis).unwrap_or_default();
@@ -1616,7 +1683,10 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
             legacy_fingerprints: Vec::new(),
             canonical_identity: None,
             captured_sources: None,
+            statistics: Statistics::Unavailable,
         });
+        let item = items.last_mut().expect("inserted item");
+        item.statistics = item.derive_statistics();
     }
     let mut identities = std::collections::BTreeSet::new();
     if items

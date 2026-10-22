@@ -21,6 +21,134 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+fn clip_name(name: &str, width: usize) -> String {
+    if name.width() <= width {
+        return name.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let left_budget = width.saturating_sub(1).div_ceil(2);
+    let right_budget = width.saturating_sub(1) / 2;
+    fn take(parts: Vec<&str>, budget: usize) -> Vec<&str> {
+        let mut used = 0;
+        parts
+            .into_iter()
+            .take_while(|part| {
+                used += part.width();
+                used <= budget
+            })
+            .collect::<Vec<_>>()
+    }
+    let left = take(name.graphemes(true).collect(), left_budget).concat();
+    let mut right = take(name.graphemes(true).rev().collect(), right_budget);
+    right.reverse();
+    format!("{left}…{}", right.concat())
+}
+
+fn file_row(item: &crate::git::Item, reviewed: bool, width: usize) -> Line<'static> {
+    use crate::git::Statistics;
+    let name = item.name();
+    let available = width.saturating_sub(2);
+    let statistics = item.statistics();
+    let label = match statistics {
+        Statistics::Text {
+            additions,
+            deletions,
+        } => (additions + deletions).to_string(),
+        Statistics::Binary => "binary".into(),
+        Statistics::Unavailable => "unavailable".into(),
+    };
+    // Names retain at least twelve cells (or the entire tiny pane). Statistics
+    // yield first; the graph is optional and bounded to twelve cells.
+    let name_minimum = name.width().min(12);
+    let show_stats = available >= name_minimum + 2 + label.width();
+    let graph_width = if show_stats {
+        available
+            .saturating_sub(name_minimum + 3 + label.width())
+            .min(12)
+    } else {
+        0
+    };
+    let (plus, minus) = match statistics {
+        Statistics::Text {
+            additions,
+            deletions,
+        } if additions + deletions > 0 => {
+            let cells = graph_width.min(additions + deletions);
+            let plus = if additions == 0 {
+                0
+            } else if deletions == 0 {
+                cells
+            } else if cells >= 2 {
+                (cells as u128 * additions as u128 / (additions + deletions) as u128)
+                    .clamp(1, (cells - 1) as u128) as usize
+            } else {
+                usize::from(additions >= deletions) * cells
+            };
+            (plus, cells - plus)
+        }
+        _ => (0, 0),
+    };
+    let suffix_width = if show_stats {
+        2 + label.width()
+            + if plus + minus > 0 {
+                1 + plus + minus
+            } else {
+                0
+            }
+    } else {
+        0
+    };
+    let name_width = available.saturating_sub(suffix_width);
+    let displayed_name = if name.width() <= name_width {
+        name
+    } else if item.old_path != item.new_path && name_width >= 9 {
+        let old = crate::git::visible_name(&item.old_path);
+        let new = crate::git::visible_name(&item.new_path);
+        let old_width = (name_width - 3) / 2;
+        format!(
+            "{} → {}",
+            clip_name(&old, old_width),
+            clip_name(&new, name_width - 3 - old_width)
+        )
+    } else {
+        clip_name(&name, name_width)
+    };
+    let padding = available.saturating_sub(displayed_name.width() + suffix_width);
+    let mut spans = vec![
+        Span::styled(
+            if reviewed { "+ " } else { "- " },
+            Style::default().fg(if reviewed { Color::Gray } else { Color::Yellow }),
+        ),
+        Span::styled(
+            displayed_name,
+            Style::default().fg(if reviewed {
+                Color::DarkGray
+            } else {
+                Color::White
+            }),
+        ),
+    ];
+    if show_stats {
+        spans.push(Span::raw(format!("{}  {label}", " ".repeat(padding))));
+        if plus + minus > 0 {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                "+".repeat(plus),
+                Style::default().fg(Color::Green),
+            ));
+            spans.push(Span::styled(
+                "-".repeat(minus),
+                Style::default().fg(Color::Red),
+            ));
+        }
+    }
+    Line::from(spans)
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let areas = Layout::default()
@@ -50,24 +178,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .zip(&app.marks)
             .enumerate()
             .map(|(index, (item, reviewed))| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if *reviewed { "+ " } else { "- " },
-                        Style::default().fg(if *reviewed {
-                            Color::Gray
-                        } else {
-                            Color::Yellow
-                        }),
-                    ),
-                    Span::styled(
-                        item.name(),
-                        Style::default().fg(if *reviewed {
-                            Color::DarkGray
-                        } else {
-                            Color::White
-                        }),
-                    ),
-                ]))
+                ListItem::new(file_row(
+                    item,
+                    *reviewed,
+                    panels[0].width.saturating_sub(4) as usize,
+                ))
                 .style(if index == app.selected {
                     Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
                 } else {

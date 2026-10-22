@@ -5862,3 +5862,226 @@ fn preview_status_source_documentation_and_definition_restore_drawn_origin() {
     assert!(app.marks.iter().all(|mark| !mark));
     assert!(state.path().read_dir().unwrap().next().is_none());
 }
+
+#[test]
+fn file_statistics_follow_native_captured_hunks_and_metadata_evidence() {
+    use git::Statistics::{Binary, Text, Unavailable};
+    let directory = fixture();
+    let root = directory.path();
+    std::fs::write(root.join("text.txt"), "--- header\nkeep\nold\nend").unwrap();
+    std::fs::write(root.join("binary.dat"), b"old\0binary").unwrap();
+    std::fs::write(root.join("empty.txt"), "").unwrap();
+    git_run(root, &["add", "."]);
+    git_run(root, &["commit", "-qm", "statistics fixture"]);
+    std::fs::write(root.join("text.txt"), "+++ header\nkeep\nnew\nextra\nend").unwrap();
+    std::fs::write(root.join("binary.dat"), b"new\0binary").unwrap();
+    std::fs::remove_file(root.join("empty.txt")).unwrap();
+    git_run(root, &["mv", "two.rs", "renamed.rs"]);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root.join("one.rs"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(root.join("new-empty.txt"), "").unwrap();
+    git_run(root, &["add", "."]);
+    for words in [
+        vec!["HEAD"],
+        vec!["--cached"],
+        vec!["-w", "HEAD"],
+        vec!["--unified=0", "HEAD"],
+        vec!["--no-renames", "HEAD"],
+    ] {
+        let captured = capture(root, &words);
+        assert!(captured.unavailable.is_none());
+        let mut oracle_args = vec!["diff", "--numstat"];
+        oracle_args.extend(&words);
+        let oracle = String::from_utf8(git_run(root, &oracle_args)).unwrap();
+        for line in oracle.lines() {
+            let fields: Vec<_> = line.splitn(3, '\t').collect();
+            if fields.len() != 3 {
+                continue;
+            }
+            let item = captured
+                .items
+                .iter()
+                .find(|item| {
+                    fields[2].ends_with(std::str::from_utf8(&item.new_path).unwrap())
+                        || fields[2] == "two.rs => renamed.rs" && item.new_path == b"renamed.rs"
+                })
+                .unwrap();
+            let expected = if fields[0] == "-" {
+                Binary
+            } else {
+                Text {
+                    additions: fields[0].parse().unwrap(),
+                    deletions: fields[1].parse().unwrap(),
+                }
+            };
+            if words.contains(&"-w") && item.statistics() == Unavailable {
+                assert_eq!(
+                    expected,
+                    Text {
+                        additions: 0,
+                        deletions: 0
+                    }
+                );
+            } else {
+                assert_eq!(item.statistics(), expected, "{words:?}: {line}");
+            }
+        }
+    }
+    let captured = capture(root, &["HEAD"]);
+    let text = captured
+        .items
+        .iter()
+        .find(|item| item.new_path == b"text.txt")
+        .unwrap();
+    assert_eq!(
+        text.statistics(),
+        Text {
+            additions: 3,
+            deletions: 2
+        }
+    );
+    std::fs::write(root.join("text.txt"), "completely different\n").unwrap();
+    assert_eq!(
+        text.statistics(),
+        Text {
+            additions: 3,
+            deletions: 2
+        }
+    );
+    // A mode-only section with suppressed whitespace changes cannot prove zero.
+    std::fs::write(root.join("one.rs"), "fn one() {\n    let answer = 1;\n}\n").unwrap();
+    let omitted = capture(root, &["-w", "HEAD", "--", "one.rs"]);
+    assert_eq!(omitted.items[0].statistics(), Unavailable);
+    assert!(capture(root, &["--binary", "HEAD"]).unavailable.is_some());
+    assert!(capture(root, &["--stat", "HEAD"]).unavailable.is_some());
+    git_run(root, &["commit", "-qm", "second"]);
+    let refs = capture(root, &["HEAD~", "HEAD"]);
+    assert!(refs.items.iter().any(|item| item.statistics() == Binary));
+}
+
+#[test]
+fn file_statistics_rows_keep_names_styles_marks_and_resize_safe() {
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    change(directory.path());
+    let mut app = application(directory.path(), state.path());
+    let rendered = screen(&mut app, 100, 24);
+    let text = screen_text(&rendered);
+    assert!(text.contains("one.rs"));
+    assert!(text.contains("2 +-"), "{text}");
+    assert!(
+        rendered
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "+" && cell.fg == Color::Green)
+    );
+    assert!(
+        rendered
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "-" && cell.fg == Color::Red)
+    );
+    app.key(KeyCode::Char(' '));
+    app.key(KeyCode::Enter);
+    assert!(screen_text(&screen(&mut app, 100, 24)).contains("2 +-"));
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Up);
+    assert_eq!(app.marks, [true, false]);
+    let rendered = screen(&mut app, 100, 24);
+    assert!(
+        rendered
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "o" && cell.fg == Color::DarkGray)
+    );
+    let item = &mut app.capture.items[0];
+    item.old_path = "old/界界界界界界界界界界.rs".as_bytes().to_vec();
+    item.new_path = "new/e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}.rs"
+        .as_bytes()
+        .to_vec();
+    let text = screen_text(&screen(&mut app, 45, 24));
+    assert!(text.contains(" → "), "{text}");
+    assert!(text.contains("old/") && text.contains("new/"), "{text}");
+    for width in 0..50 {
+        for height in [0, 1, 3, 10] {
+            screen(&mut app, width, height);
+        }
+    }
+    assert_eq!(app.marks, [true, false]);
+}
+
+#[test]
+fn file_statistics_no_index_add_delete_and_multiple_hunks_match_git() {
+    use git::Statistics::Text;
+    let directory = fixture();
+    let root = directory.path();
+    let old = (0..30).map(|n| format!("line {n}\n")).collect::<String>();
+    std::fs::write(root.join("many.txt"), &old).unwrap();
+    std::fs::write(root.join("deleted.txt"), "first\nsecond").unwrap();
+    git_run(root, &["add", "."]);
+    git_run(root, &["commit", "-qm", "hunks"]);
+    std::fs::write(
+        root.join("many.txt"),
+        old.replace("line 1\n", "new first\n")
+            .replace("line 28\n", "new last\n"),
+    )
+    .unwrap();
+    std::fs::remove_file(root.join("deleted.txt")).unwrap();
+    std::fs::write(root.join("added.txt"), "first\nsecond\nthird").unwrap();
+    git_run(root, &["add", "."]);
+    let captured = capture(root, &["HEAD"]);
+    for (path, additions, deletions) in [
+        ("many.txt", 2, 2),
+        ("deleted.txt", 0, 2),
+        ("added.txt", 3, 0),
+    ] {
+        let item = captured
+            .items
+            .iter()
+            .find(|item| item.new_path == path.as_bytes())
+            .unwrap();
+        assert_eq!(
+            item.statistics(),
+            Text {
+                additions,
+                deletions
+            }
+        );
+        let oracle = git_run(root, &["diff", "--numstat", "HEAD", "--", path]);
+        assert!(
+            String::from_utf8(oracle)
+                .unwrap()
+                .starts_with(&format!("{additions}\t{deletions}\t"))
+        );
+        if path == "many.txt" {
+            assert_eq!(
+                item.patch
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| line.starts_with(b"@@ "))
+                    .count(),
+                2
+            );
+        }
+    }
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("old.txt"), "--- header\nold").unwrap();
+    std::fs::write(outside.path().join("new.txt"), "+++ header\nnew\nextra").unwrap();
+    let args = ["--no-index", "old.txt", "new.txt"];
+    let captured = capture(outside.path(), &args);
+    assert_eq!(
+        captured.items[0].statistics(),
+        Text {
+            additions: 3,
+            deletions: 2
+        }
+    );
+    let oracle = Command::new("git")
+        .current_dir(outside.path())
+        .args(["diff", "--numstat"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(oracle.status.code(), Some(1));
+    assert!(oracle.stdout.starts_with(b"3\t2\t"));
+}

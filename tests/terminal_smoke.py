@@ -902,6 +902,52 @@ pub fn invoke(worker: Worker) -> u32 {
     assert snapshot(root / "state") == marks_before, "status navigation changed review marks"
     print("PTY passed: diff status top/middle/bottom/fit, cursor cells, wheel/page, status mouse exclusion and tiny resize", flush=True)
 
+    # Per-file statistics come from captured hunks, including mixed graphs,
+    # binary evidence, metadata zeros and omitted-content uncertainty.
+    stats_repo = root / "file-statistics"
+    stats_repo.mkdir()
+    def stats_git(*words):
+        return subprocess.check_output([git, *words], cwd=stats_repo, env=env, stderr=subprocess.STDOUT)
+    stats_git("init", "-q")
+    stats_git("config", "user.name", "Statistics acceptance")
+    stats_git("config", "user.email", "statistics@example.invalid")
+    (stats_repo / "a.txt").write_text("old\nkeep\n")
+    (stats_repo / "binary.dat").write_bytes(b"old\0binary")
+    (stats_repo / "mode.txt").write_text("same\n")
+    stats_git("add", ".")
+    stats_git("commit", "-qm", "base")
+    (stats_repo / "a.txt").write_text("new\nextra\nkeep\n")
+    (stats_repo / "binary.dat").write_bytes(b"new\0binary")
+    (stats_repo / "mode.txt").chmod(0o755)
+    oracle = stats_git("diff", "--numstat", "HEAD").decode()
+    assert "2\t1\ta.txt" in oracle and "-\t-\tbinary.dat" in oracle
+    stats_before = snapshot(stats_repo)
+    marks_before = snapshot(root / "state")
+    session = Session([str(binary), "--", "HEAD"], cwd=stats_repo)
+    closed(session)
+    session.wait_text("3 ++-")
+    session.wait_text("binary")
+    def stats_row(name):
+        return next(line for line in session.text().splitlines() if name in line)
+    assert "binary" in stats_row("binary.dat")
+    assert re.search(r"mode.txt +0", stats_row("mode.txt")), session.text()
+    session.send(b"\r")
+    session.wait_text("3 ++-")
+    session.send(b"\x1b")
+    session.send(b"jk")
+    for shape in [(30, 28), (3, 8), (1, 1), (30, 140)]:
+        session.resize(*shape)
+    session.wait_text("3 ++-")
+    quit_unchanged(session, stats_before, stats_repo)
+    assert snapshot(root / "state") == marks_before, "statistics navigation changed marks"
+    (stats_repo / "mode.txt").write_text("same   \n")
+    stats_before = snapshot(stats_repo)
+    session = Session([str(binary), "--", "-w", "HEAD", "--", "mode.txt"], cwd=stats_repo)
+    closed(session)
+    session.wait_text("unavailable")
+    quit_unchanged(session, stats_before, stats_repo)
+    print("PTY passed: captured file statistics, binary/metadata/unavailable, open pane and tiny resize", flush=True)
+
     # R2-R10: exact ticket invocation, explicit marks, closed previews and gray
     # names after restart, selective invalidation, ref movement and isolation.
     branch_args = [left, right]
