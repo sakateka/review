@@ -1,5 +1,7 @@
 mod app;
+mod config;
 mod git;
+mod keybindings;
 mod motion;
 mod navigation;
 mod preview;
@@ -11,48 +13,106 @@ mod ui;
 use anyhow::{Result, bail};
 use std::{ffi::OsString, io::IsTerminal};
 
-const HELP: &str = "review [--help | --version] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\n\nControls: hjkl/arrows move; w/b/e and W/B/E move by words; 0/^/$ move within a line;\ngg/G jump to first/last line; counts work (10j, 3w, 20gg).\n* searches the word in this buffer; # searches backward; n/N repeats.\nCtrl-U/D scroll half pages; Ctrl-B/F or PageUp/PageDown scroll pages.\nEnter opens; Escape closes the open view; Tab switches panes; q quits.\n/ searches symbols; gd/gr finds definitions/references; Ctrl-O goes back;\n[ and ] choose old/new side; ? in candidates shows analysis details.\nClick selects/positions; double-click opens; wheel scrolls.\nSpace toggles and immediately saves the selected file's review mark.\n\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nRequires system Git and an interactive terminal.\n";
+const HELP: &str = "review [--help | --version] [--keymap vim|emacs] [--config PATH] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\nConfigure [features] keymap/readline and [keybindings] action=\"key\" in --config\nor $XDG_CONFIG_HOME/review/config.toml (fallback $HOME/.config/review/config.toml).\nCLI keymap overrides config. Overrides replace all defaults; \"\" disables an action.\nKeys: characters, named keys (enter, esc, space, down), ctrl-/alt- chords, sequences (gd).\n\n";
+
+fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -> Result<String> {
+    let bindings = config::Config::load(config)?.bindings(keymap)?;
+    let style = match bindings.keymap {
+        keybindings::Keymap::Vim => "Vim",
+        keybindings::Keymap::Emacs => "Emacs",
+    };
+    let mut text = format!("{HELP}Active bindings ({style}):\n{}", bindings.help());
+    if bindings.keymap == keybindings::Keymap::Vim {
+        text.push_str("Vim counts repeat configured motions and line jumps.\n");
+    }
+    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nReviewing requires system Git and an interactive terminal.\n");
+    Ok(text)
+}
 
 #[derive(Debug, PartialEq)]
 enum Cli {
-    Help,
+    Help {
+        keymap: Option<keybindings::Keymap>,
+        config: Option<std::path::PathBuf>,
+    },
     Version,
-    Review(Vec<OsString>),
+    Review {
+        args: Vec<OsString>,
+        keymap: Option<keybindings::Keymap>,
+        config: Option<std::path::PathBuf>,
+    },
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
     let mut args = args.into_iter();
-    match args.next().as_deref() {
-        None => Ok(Cli::Review(Vec::new())),
-        Some(s) if s == "--help" || s == "-h" => {
-            if args.next().is_some() {
-                bail!("--help takes no arguments");
+    let mut keymap = None;
+    let mut config = None;
+    let mut help = false;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--help" | "-h") => {
+                help = true;
             }
-            Ok(Cli::Help)
-        }
-        Some(s) if s == "--version" || s == "-V" => {
-            if args.next().is_some() {
-                bail!("--version takes no arguments");
+            Some("--version" | "-V") => {
+                if args.next().is_some() {
+                    bail!("--version takes no arguments");
+                }
+                return Ok(Cli::Version);
             }
-            Ok(Cli::Version)
+            Some("--keymap") => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--keymap requires vim or emacs"))?;
+                keymap = Some(keybindings::Keymap::parse(value.to_str().unwrap_or(""))?);
+            }
+            Some("--config") => {
+                config = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--config requires a path"))?
+                        .into(),
+                );
+            }
+            Some("--") => {
+                if help {
+                    bail!("--help does not accept Git arguments");
+                }
+                return Ok(Cli::Review {
+                    args: args.collect(),
+                    keymap,
+                    config,
+                });
+            }
+            _ => bail!("place Git diff arguments after review's --; see review --help"),
         }
-        Some(s) if s == "--" => Ok(Cli::Review(args.collect())),
-        Some(_) => bail!("place Git diff arguments after review's --; see review --help"),
+    }
+    if help {
+        Ok(Cli::Help { keymap, config })
+    } else {
+        Ok(Cli::Review {
+            args: Vec::new(),
+            keymap,
+            config,
+        })
     }
 }
 
 fn run() -> Result<i32> {
-    let args = match parse_args(std::env::args_os().skip(1))? {
-        Cli::Help => {
-            print!("{HELP}");
+    let (args, keymap, config) = match parse_args(std::env::args_os().skip(1))? {
+        Cli::Help { keymap, config } => {
+            print!("{}", help(keymap, config.as_deref())?);
             return Ok(0);
         }
         Cli::Version => {
             println!("review {}", env!("CARGO_PKG_VERSION"));
             return Ok(0);
         }
-        Cli::Review(args) => args,
+        Cli::Review {
+            args,
+            keymap,
+            config,
+        } => (args, keymap, config),
     };
+    let bindings = config::Config::load(config.as_deref())?.bindings(keymap)?;
     let cwd = std::env::current_dir()?;
     let capture = git::capture(&cwd, &args)?;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -60,6 +120,7 @@ fn run() -> Result<i32> {
     }
     let store = state::Store::for_session(&capture.cwd, &capture.args)?;
     let mut app = app::App::new(capture, store);
+    app.bindings = bindings;
     ui::run(&mut app)?;
     Ok(app.capture.status.code().unwrap_or(1))
 }

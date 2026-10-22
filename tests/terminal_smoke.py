@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     tools = root / "tools"
     tools.mkdir()
     (tools / "git").symlink_to(git)
-    env = dict(os.environ, TERM="xterm-256color", PATH=str(tools), HOME=str(root), XDG_STATE_HOME=str(root / "state"), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    env = dict(os.environ, TERM="xterm-256color", PATH=str(tools), HOME=str(root), XDG_STATE_HOME=str(root / "state"), XDG_CONFIG_HOME=str(root / "config"), GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
     env.pop("NO_COLOR", None)  # The PTY models a color-capable terminal.
     before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
 
@@ -172,39 +172,41 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     for name in fixture_names:
         symbol = "navtarget_" + name.split(".")[-1] + "_end"
-        session.send(b"\ths" + symbol.encode() + b"\r")
+        session.send(b"/" + symbol.encode() + b"\r")
         session.wait_text("2 results")
         session.send(b"\r")
         session.wait_text("Captured old " + name)
-        session.send(b"d")
+        session.send(b"gd")
         session.wait_text("Definitions candidates")
         session.wait_text("1 results")
-        session.send(b"\x0fr")
+        session.send(b"\x0fgr")
         session.wait_text("References candidates")
         session.wait_text("1 results")
-        session.send(b"h")
+        session.send(b"\x1b")
     for extension in ["yaml", "json"]:
-        session.send(b"\thsnavport_" + extension.encode() + b"\r")
+        session.send(b"/navport_" + extension.encode() + b"\r")
         session.wait_text("Search candidates")
         session.send(b"\r")
         session.wait_text("Captured old sample." + extension)
-        session.send(b"d")
+        session.send(b"gd")
         session.wait_text("Definitions candidates")
-        session.send(b"\x0fr")
+        session.send(b"\x0fgr")
         session.wait_text("References candidates")
         session.wait_text("0 results")
-        session.send(b"h")
+        session.send(b"\x1b")
     session.send(b"\r")
     session.wait_text("界")
     session.send(b"\x1b[C"*20 + b"\x1b[D"*5)
-    session.send(b"\ths")
+    session.send(b"\x1b")
+    session.send(b"/")
     session.send(b"main_target\r")
     session.wait_text("results")
     session.send(b"\r")
     session.wait_text("Captured old")
-    session.send(b"]r")
+    session.send(b"]gr")
     session.wait_text("References")
-    session.send(b"\r\x0f\x0f\th")
+    session.send(b"\r\x0f\x0f")
+    session.send(b"\x1b")
     for shape in [(1, 1), (3, 8), (30, 140)]:
         session.resize(*shape)
     session.send(b" ")
@@ -229,7 +231,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             session = Session([str(args.test_binary.resolve()), "--exact", "tests::terminal_lifecycle_worker", "--nocapture"], scenario)
             if scenario == "worker-panic":
                 session.wait_text("Files")
-                session.send(b"s\r")
+                session.send(b"/\r")
                 session.wait_text("Analysis failed")
                 assert termios.tcgetattr(session.slave) != session.original, "caught worker panic disabled raw mode"
                 assert b"\x1b[?1049l" not in session.output, "caught worker panic left alternate screen"
@@ -238,6 +240,149 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     after = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
     assert before == after, "review changed repository bytes"
     print("PTY passed: language navigation and terminal lifecycle", flush=True)
+
+    # Config and keymap acceptance uses the installed executable and actual
+    # terminal modifier events, independent of the in-process dispatch tests.
+    config_before = {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    config_dir = root / "config" / "review"
+    config_dir.mkdir(parents=True)
+    config_file = config_dir / "config.toml"
+    config_file.write_text('[features]\nkeymap = "emacs"\nreadline = false\n')
+    session = Session()
+    session.wait_text("Files")
+    session.send(b"hl")
+    assert "┌Diff" not in session.text(), "legacy file-pane h/l opened a diff"
+    session.send(b"\r")
+    session.wait_text("Diff")
+    origin = (session.row, session.col)
+    session.send(b"jdrs")
+    assert (session.row, session.col) == origin, "legacy/Vim keys leaked into Emacs map"
+    assert "candidates for" not in session.text()
+    session.send(b"\x0e")  # C-n
+    assert (session.row, session.col) == (origin[0] + 1, origin[1])
+    session.send(b"\x10")  # C-p
+    assert (session.row, session.col) == origin
+    session.send(b"\x06")  # C-f
+    assert (session.row, session.col) == (origin[0], origin[1] + 1)
+    session.send(b"\x02")  # C-b
+    assert (session.row, session.col) == origin
+    session.send(b"\x05")  # C-e
+    assert session.col > origin[1]
+    session.send(b"\x01")  # C-a
+    assert (session.row, session.col) == origin
+    session.send(b"/main_target\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old target.rs")
+    session.send(b"\x1b.")  # M-.
+    session.wait_text("Definitions candidates")
+    session.send(b"\x1b,")  # M-,
+    session.wait_text("Captured old target.rs")
+    session.send(b"\x1b")
+    assert session.process.poll() is None, "Emacs Escape exited"
+    session.send(b"q")
+    session.finish()
+
+    # CLI style wins discovery, with readline disabled independently of Vim.
+    session = Session([str(binary), "--keymap", "vim", "--", "HEAD"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("Diff")
+    origin = (session.row, session.col)
+    session.send(b"\x0e")
+    assert (session.row, session.col) == origin, "disabled readline moved the cursor"
+    session.send(b"j")
+    assert session.row == origin[0] + 1, "CLI keymap did not override discovered Emacs map"
+    session.send(b"q")
+    session.finish()
+
+    # Supplemental readline works in Vim when its action is not overridden.
+    readline_config = root / "readline.toml"
+    readline_config.write_text('[features]\nkeymap="vim"\nreadline=true\n')
+    session = Session([str(binary), "--config", str(readline_config), "--", "HEAD"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("Diff")
+    origin = (session.row, session.col)
+    session.send(b"\x0e")
+    assert session.row == origin[0] + 1, "enabled readline failed in Vim diff"
+    session.send(b"q")
+    session.finish()
+
+    # Overrides replace defaults, support sequences and update the legend.
+    explicit_config = root / "custom.toml"
+    explicit_config.write_text('''[features]
+keymap = "vim"
+readline = true
+[keybindings]
+close_diff_view = "x"
+cursor_down = "z"
+go_to_definition = "gD"
+''')
+    session = Session([str(binary), "--config", str(explicit_config), "--", "HEAD"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("Diff")
+    origin = (session.row, session.col)
+    session.send(b"j")
+    assert (session.row, session.col) == origin, "overridden j binding survived"
+    session.send(b"z")
+    assert session.row == origin[0] + 1
+    session.send(b"\x0e")
+    assert session.row == origin[0] + 1, "overridden action retained its readline alias"
+    session.send(b"/main_target\r")
+    session.wait_text("Search candidates")
+    session.send(b"\r")
+    session.wait_text("Captured old target.rs")
+    session.send(b"gd")
+    assert "Definitions candidates" not in session.text(), "overridden gd binding survived"
+    session.send(b"gD")
+    session.wait_text("Definitions candidates")
+    session.send(b"x")
+    session.wait_text("Files")
+    assert "┌Diff" not in session.text()
+    assert "x close" in session.text(), "footer ignored close override"
+    session.send(b"q")
+    session.finish()
+
+    help_result = subprocess.run([str(binary), "--config", str(explicit_config), "--help"], env=env, capture_output=True, text=True, check=True)
+    assert "close_diff_view: x\n" in help_result.stdout
+    assert "cursor_down: z\n" in help_result.stdout
+    assert "go_to_definition: gD\n" in help_result.stdout
+
+    # An empty value disables its action; explicit config also wins discovery.
+    explicit_config.write_text('[features]\nkeymap="vim"\nreadline=false\n[keybindings]\ncursor_down=""\n')
+    session = Session([str(binary), "--config", str(explicit_config), "--", "HEAD"])
+    session.wait_text("Files")
+    session.send(b"\r")
+    session.wait_text("Diff")
+    origin = (session.row, session.col)
+    session.send(b"j\x1b[B")
+    assert (session.row, session.col) == origin, "disabled cursor_down action remained active"
+    session.send(b"q")
+    session.finish()
+
+    for invalid in ['[features]\nkeymap="unknown"\n', '[features]\nreadline="yes"\n',
+                    '[unknown]\nx=true\n', '[keybindings]\nunknown="j"\n',
+                    '[keybindings]\ncursor_down="ctrl-unknown"\n',
+                    '[keybindings]\ncursor_down="k"\n',
+                    '[keybindings]\ncursor_down="g"\n',
+                    '[keybindings]\ngo_to_definition="g esc"\n',
+                    '[keybindings]\nopen_diff_view="ctrl-i"\n',
+                    '[keybindings]\ngo_to_definition="ctrl-["\n']:
+        explicit_config.write_text(invalid)
+        result = subprocess.run([str(binary), "--config", str(explicit_config), "--", "HEAD"], cwd=repo, env=env, capture_output=True)
+        assert result.returncode != 0 and b"review:" in result.stderr, (invalid, result.stderr)
+        assert b"interactive terminal" not in result.stderr, "config was not validated before terminal setup"
+    result = subprocess.run([str(binary), "--config", str(root / "missing.toml"), "--", "HEAD"], cwd=repo, env=env, capture_output=True)
+    assert result.returncode != 0 and b"interactive terminal" not in result.stderr
+    explicit_config.write_text('[keybindings]\ncursor_down=""\n')
+    help_result = subprocess.run([str(binary), "--help", "--config", str(explicit_config), "--keymap", "vim"], env=env, capture_output=True, text=True, check=True)
+    assert "cursor_down: (disabled)\n" in help_result.stdout
+    assert "Active bindings (Vim)" in help_result.stdout
+    config_file.unlink()
+    assert config_before == {str(p.relative_to(repo)): p.read_bytes() for p in repo.rglob("*") if p.is_file()}
+    print("PTY passed: discovered/explicit config, Vim/Emacs, overrides, readline, disabled/removed keys and invalid config", flush=True)
 
     # Story 6: run product acceptance through the installed executable, keeping
     # setup mutations distinct from read-only review sessions.
@@ -361,12 +506,12 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     assert (session.row, session.col) == first_match
     session.send(b"gg0ww")
     assert (session.row, session.col) == cursor
-    session.send(b"d")
+    session.send(b"gd")
     session.wait_text('Definitions candidates for "new_symbol_03"')
     session.send(b"\x0f")
     session.wait_text("Captured new a03.rs")
     assert (session.row, session.col) == cursor, "back did not restore the cursor"
-    session.send(b"[d")
+    session.send(b"[gd")
     session.wait_text('Definitions candidates for "old_symbol_03"')
     session.send(b"\x0f")
     session.wait_text("Captured old a03.rs")
@@ -415,7 +560,8 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
     session.wait_text("Files")
     assert "+ one.rs" not in session.text(), "opening a diff implicitly marked it"
     assert snapshot(root / "state") == state_before, "viewing wrote review state"
-    session.send(b"\th ")
+    session.send(b"\x1b")
+    session.send(b" ")
     session.wait_text("Review mark saved")
     session.send(b"j ")
     session.wait_text("+ two.rs")
@@ -487,7 +633,7 @@ with tempfile.TemporaryDirectory(prefix="review-pty-") as directory:
             saved_before = snapshot(root / "state")
             session.send(b" ")
             session.wait_text("Marks are unavailable")
-            session.send(b"s")
+            session.send(b"/")
             session.wait_text("Navigation unavailable")
             assert "Search/outline:" not in session.text(), session.text()
             assert snapshot(root / "state") == saved_before, "opaque output wrote review marks"

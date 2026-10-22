@@ -149,12 +149,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         });
     let status = prompt.as_deref().or(omission).unwrap_or(app.status.trim());
     frame.render_widget(Paragraph::new(status), areas[1]);
-    frame.render_widget(
-        Paragraph::new(
-            "hjkl move · */# search · n/N next · gd/gr jump · Ctrl-O back · Esc close · q quit",
-        ),
-        areas[2],
-    );
+    frame.render_widget(Paragraph::new(app.bindings.legend()), areas[2]);
 }
 
 fn restore_terminal() {

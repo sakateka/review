@@ -92,14 +92,22 @@ fn outer_and_inner_argument_boundaries_are_native() {
     let args = ["--", "HEAD", "--", "a file", "--stat"].map(OsString::from);
     assert_eq!(
         parse_args(args).unwrap(),
-        Cli::Review(
-            ["HEAD", "--", "a file", "--stat"]
+        Cli::Review {
+            args: ["HEAD", "--", "a file", "--stat"]
                 .map(OsString::from)
-                .to_vec()
-        )
+                .to_vec(),
+            keymap: None,
+            config: None
+        }
     );
     assert!(parse_args(["HEAD".into()]).is_err());
-    assert_eq!(parse_args(["--help".into()]).unwrap(), Cli::Help);
+    assert_eq!(
+        parse_args(["--help".into()]).unwrap(),
+        Cli::Help {
+            keymap: None,
+            config: None
+        }
+    );
 }
 
 #[test]
@@ -108,7 +116,11 @@ fn native_argument_bytes_and_length_delimiters_do_not_alias() {
     let raw = OsString::from_vec(vec![b'p', 0xff]);
     assert_eq!(
         parse_args(["--".into(), raw.clone()]).unwrap(),
-        Cli::Review(vec![raw.clone()])
+        Cli::Review {
+            args: vec![raw.clone()],
+            keymap: None,
+            config: None
+        }
     );
     let one = state::Store::at(Path::new("/tmp"), Path::new("/repository"), &[raw]);
     let two = state::Store::at(Path::new("/tmp"), Path::new("/repository"), &["p�".into()]);
@@ -2819,7 +2831,7 @@ fn navigation_controls_open_candidates_go_back_choose_old_side_and_never_mark() 
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
     app.key(KeyCode::Enter);
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     for character in "two".chars() {
         app.key(KeyCode::Char(character));
     }
@@ -2846,6 +2858,7 @@ fn navigation_controls_open_candidates_go_back_choose_old_side_and_never_mark() 
             .unwrap()
             .contains("new two.rs")
     );
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().candidates.len(), 1);
@@ -2872,9 +2885,9 @@ fn navigation_selection_changes_cannot_publish_obsolete_worker_results() {
     change(directory.path());
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     app.key(KeyCode::Enter);
-    app.key(KeyCode::Char('h'));
+    app.key(KeyCode::Esc);
     app.key(KeyCode::Char('j'));
     for _ in 0..1000 {
         app.poll_analysis();
@@ -3125,10 +3138,10 @@ fn navigation_new_search_editing_rejects_inflight_results() {
     change(directory.path());
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     app.key(KeyCode::Char('t'));
     app.key(KeyCode::Enter);
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     app.key(KeyCode::Char('z'));
     // Let the old worker answer while the new query is still being edited.
     let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -3153,7 +3166,7 @@ fn navigation_horizontal_movement_uses_cursor_after_target_opening() {
     .unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     for ch in "first".chars() {
         app.key(KeyCode::Char(ch));
     }
@@ -3164,6 +3177,7 @@ fn navigation_horizontal_movement_uses_cursor_after_target_opening() {
     for _ in 0..14 {
         app.key(KeyCode::Right);
     }
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "second");
@@ -3171,6 +3185,7 @@ fn navigation_horizontal_movement_uses_cursor_after_target_opening() {
     for _ in 0..14 {
         app.key(KeyCode::Left);
     }
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "first");
@@ -3189,7 +3204,7 @@ fn navigation_side_switch_discards_previous_target_coordinates() {
     std::fs::write(directory.path().join("one.rs"), "fn early() {}\n").unwrap();
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     for ch in "late".chars() {
         app.key(KeyCode::Char(ch));
     }
@@ -3200,6 +3215,7 @@ fn navigation_side_switch_discards_previous_target_coordinates() {
     app.viewport = (1, 1);
     app.key(KeyCode::Char(']'));
     assert_eq!(app.top, 0);
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "early");
@@ -3246,7 +3262,7 @@ fn review_fix_multiline_candidate_fields_keep_one_row_and_selection_visible() {
     change(directory.path());
     let state_dir = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state_dir.path());
-    app.key(KeyCode::Char('s'));
+    app.key(KeyCode::Char('/'));
     app.key(KeyCode::Enter);
     await_navigation(&mut app);
     let nav = app.navigation.as_ref().unwrap();
@@ -3426,12 +3442,14 @@ fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
         .position(|row| *row == (None, Some(1)))
         .unwrap();
     app.cursor = (0, 0);
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     assert!(app.navigation.is_none());
     assert!(app.status.contains("no mapped"));
     // The prefix is unmapped, including when a side is available.
     app.cursor = (old_row, 0);
     assert_eq!(app.side, source::ComparedSide::New);
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     assert!(app.navigation.is_none());
     assert!(app.status.contains("no mapped"));
@@ -3464,6 +3482,7 @@ fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
     assert_eq!((app.cursor, app.top, app.left), saved);
     // A live edit cannot replace the captured symbol.
     std::fs::write(directory.path().join("one.rs"), "fn unrelated_live() {}\n").unwrap();
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "old_symbol");
@@ -3475,6 +3494,7 @@ fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
     assert_eq!((app.cursor, app.top, app.left), saved);
     app.cursor = (new_row, 8);
     app.key(KeyCode::Char(']'));
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('r'));
     await_navigation(&mut app);
     assert_eq!(app.navigation.as_ref().unwrap().query, "new_symbol");
@@ -3484,6 +3504,7 @@ fn diff_cursor_navigation_uses_exact_captured_side_and_history() {
     ));
     // A mapped whitespace cell cannot search forward to the next identifier.
     app.cursor = (new_row, 5 + 2);
+    app.key(KeyCode::Char('g'));
     app.key(KeyCode::Char('d'));
     await_navigation(&mut app);
     assert!(app.navigation.as_ref().unwrap().query.is_empty());
@@ -3592,7 +3613,7 @@ fn cursor_wheel_resize_and_focus_movement_preserve_viewport_bounds() {
             assert!(app.cursor.1 >= app.left && app.cursor.1 < app.left + app.viewport.1);
         }
     }
-    app.key(KeyCode::Char('h'));
+    app.key(KeyCode::Esc);
     assert!(app.preview.is_none());
     assert!(app.marks.iter().all(|mark| !mark));
 }
@@ -3909,4 +3930,295 @@ fn star_search_uses_vim_keyword_boundaries_including_underscores() {
     let (search, origin) = crate::search::BufferSearch::at_cursor(&lines, (0, 20), false).unwrap();
     assert_eq!(search.word, "_");
     assert_eq!(search.next(origin, false, 1).unwrap().start, 22);
+}
+
+#[test]
+fn configurable_keymaps_validate_and_replace_every_default() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use keybindings::{Action, Keymap, Resolution};
+    let config = config::Config::parse("[features]\nkeymap = 'emacs'\nreadline = false\n[keybindings]\ncursor_down = 'z'\nclose_diff_view = ''\ngo_to_definition = 'gD'\n").unwrap();
+    let mut bindings = config.bindings(Some(Keymap::Vim)).unwrap();
+    assert_eq!(bindings.keymap, Keymap::Vim);
+    for key in [
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ] {
+        assert!(matches!(bindings.resolve(key, true), Resolution::Unbound));
+    }
+    assert!(matches!(
+        bindings.resolve(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), true),
+        Resolution::Action(Action::CursorDown)
+    ));
+    assert!(matches!(
+        bindings.resolve(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), true),
+        Resolution::Pending
+    ));
+    assert!(matches!(
+        bindings.resolve(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), true),
+        Resolution::Action(Action::GoToDefinition)
+    ));
+    for invalid in [
+        "[features]\nkeymap='unknown'",
+        "[features]\nunknown=true",
+        "[keybindings]\nunknown='x'",
+        "[keybindings]\ncursor_down='k'",
+        "[keybindings]\ncursor_down='g'",
+        "[keybindings]\ncursor_down='ctrl-bogus'",
+        "[keybindings]\nquit='ctrl-c'",
+    ] {
+        assert!(
+            config::Config::parse(invalid)
+                .and_then(|c| c.bindings(None))
+                .is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn configurable_actions_preserve_query_mouse_and_cancelled_prefixes() {
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.bindings = config::Config::parse(
+        "[keybindings]\nopen_diff_view='o'\nclose_diff_view='x'\nsearch_symbols='f'\n",
+    )
+    .unwrap()
+    .bindings(None)
+    .unwrap();
+    app.key(KeyCode::Enter);
+    assert!(app.preview.is_none());
+    screen(&mut app, 100, 24);
+    let click = mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        app.file_area.x,
+        app.file_area.y,
+    );
+    let now = std::time::Instant::now();
+    app.mouse(click, now);
+    app.mouse(click, now + std::time::Duration::from_millis(100));
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Char('d'));
+    assert!(app.navigation.is_none());
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Char('f'));
+    for c in "gd/qx".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+        app.key_event(KeyEvent::new(KeyCode::Char('z'), modifiers));
+    }
+    assert_eq!(app.navigation.as_ref().unwrap().query, "gd/qx");
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Char('x'));
+    assert!(app.preview.is_none());
+    assert!(app.marks.iter().all(|mark| !mark));
+    let legend = app.bindings.legend();
+    assert!(legend.contains("o open") && legend.contains("x close"));
+    assert!(!legend.contains("esc"));
+}
+
+#[test]
+fn emacs_and_optional_readline_have_distinct_precedence() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use keybindings::{Action, Keymap, Resolution};
+    for readline in [true, false] {
+        let mut emacs =
+            keybindings::Bindings::new(Keymap::Emacs, readline, &Default::default()).unwrap();
+        for (ch, action) in [
+            ('b', Action::CursorLeft),
+            ('f', Action::CursorRight),
+            ('a', Action::LineStart),
+            ('n', Action::CursorDown),
+        ] {
+            assert!(
+                matches!(emacs.resolve(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL), true), Resolution::Action(found) if found == action)
+            );
+        }
+        let mut vim =
+            keybindings::Bindings::new(Keymap::Vim, readline, &Default::default()).unwrap();
+        assert!(matches!(
+            vim.resolve(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                true
+            ),
+            Resolution::Action(Action::PageUp)
+        ));
+        let resolved = vim.resolve(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            true,
+        );
+        assert_eq!(
+            matches!(resolved, Resolution::Action(Action::LineStart)),
+            readline
+        );
+        assert!(matches!(
+            vim.resolve(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                false
+            ),
+            Resolution::Unbound
+        ));
+    }
+}
+
+#[test]
+fn keymap_regression_terminal_equivalent_chords_collide_and_dispatch() {
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use keybindings::{Action, Resolution, parse_keys};
+    for (chord, named, code, action) in [
+        ("ctrl-i", "tab", KeyCode::Tab, Action::SwitchPane),
+        ("ctrl-m", "enter", KeyCode::Enter, Action::OpenDiffView),
+    ] {
+        assert_eq!(parse_keys(chord).unwrap(), parse_keys(named).unwrap());
+        let invalid = format!("[keybindings]\nquit='{chord}'");
+        let error = config::Config::parse(&invalid)
+            .unwrap()
+            .bindings(None)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("conflicts"), "{error}");
+        let valid = format!("[keybindings]\n{}='{chord}'", action.name());
+        let mut bindings = config::Config::parse(&valid)
+            .unwrap()
+            .bindings(None)
+            .unwrap();
+        assert!(
+            matches!(bindings.resolve(KeyEvent::new(code, KeyModifiers::NONE), false), Resolution::Action(found) if found == action)
+        );
+        let character = if chord == "ctrl-i" { 'i' } else { 'm' };
+        assert!(
+            matches!(bindings.resolve(KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL), false), Resolution::Action(found) if found == action)
+        );
+    }
+    for unsupported in [
+        "ctrl-[", "ctrl-?", "ctrl-@", "ctrl-2", "ctrl-3", "ctrl-8", "ctrl-!", "ctrl-é",
+    ] {
+        let error = parse_keys(unsupported).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported Ctrl character"),
+            "{unsupported}: {error}"
+        );
+    }
+    for supported in [
+        "ctrl-a",
+        "ctrl-Z",
+        "ctrl-space",
+        "ctrl-4",
+        "ctrl-5",
+        "ctrl-6",
+        "ctrl-7",
+        "ctrl-left",
+        "alt-[",
+        "alt-?",
+        "alt-@",
+    ] {
+        assert!(parse_keys(supported).is_ok(), "{supported}");
+    }
+    assert_ne!(parse_keys("ctrl-j").unwrap(), parse_keys("enter").unwrap());
+    let mut bindings = config::Config::parse("[keybindings]\nquit='ctrl-j'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    assert!(matches!(
+        bindings.resolve(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            false
+        ),
+        Resolution::Action(Action::Quit)
+    ));
+    assert!(matches!(
+        bindings.resolve(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+        Resolution::Action(Action::OpenDiffView)
+    ));
+}
+
+#[test]
+fn keymap_regression_escape_cannot_complete_a_pending_sequence() {
+    for sequence in ["g esc", "g escape", "g d esc"] {
+        let text = format!("[keybindings]\ngo_to_definition='{sequence}'");
+        let error = config::Config::parse(&text)
+            .unwrap()
+            .bindings(None)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Escape cancels pending key sequences"),
+            "{error}"
+        );
+    }
+    assert!(keybindings::parse_keys("esc").is_ok());
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_some());
+    app.key(KeyCode::Char('d'));
+    assert!(app.navigation.is_none());
+    app.key(KeyCode::Esc);
+    assert!(app.preview.is_none());
+}
+
+#[test]
+fn keymap_regression_help_retains_options_and_prints_effective_bindings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("custom.toml");
+    std::fs::write(&path, "[features]\nkeymap='emacs'\n[keybindings]\ncursor_down='z'\nclose_diff_view=''\ngo_to_definition='gD'\n").unwrap();
+    for args in [
+        vec![
+            "--config".into(),
+            path.clone().into_os_string(),
+            "--help".into(),
+        ],
+        vec![
+            "--help".into(),
+            "--config".into(),
+            path.clone().into_os_string(),
+        ],
+    ] {
+        let Cli::Help { keymap, config } = parse_args(args).unwrap() else {
+            panic!("help options lost")
+        };
+        assert_eq!(config.as_deref(), Some(path.as_path()));
+        let text = help(keymap, config.as_deref()).unwrap();
+        assert!(text.contains("Active bindings (Emacs)"));
+        assert!(text.contains("cursor_down: z\n"));
+        assert!(text.contains("close_diff_view: (disabled)\n"));
+        assert!(text.contains("go_to_definition: gD\n"));
+        assert!(text.contains("cursor_left: left, ctrl-b\n"));
+        assert!(!text.contains("Ctrl-N/P/B/F move"));
+        assert!(!text.contains("Escape closes"));
+        assert!(!text.contains("ctrl-n"));
+    }
+    let Cli::Help { keymap, config } = parse_args([
+        "--config".into(),
+        path.clone().into_os_string(),
+        "--keymap".into(),
+        "vim".into(),
+        "--help".into(),
+    ])
+    .unwrap() else {
+        panic!("help options lost")
+    };
+    assert_eq!(keymap, Some(keybindings::Keymap::Vim));
+    let text = help(keymap, config.as_deref()).unwrap();
+    assert!(text.contains("Active bindings (Vim)"));
+    assert!(text.contains("cursor_left: left, h\n"));
+    assert!(text.contains("cursor_down: z\n"));
+    assert!(text.contains("line_end: $, ctrl-e (buffers)\n"));
+    assert!(help(None, Some(&directory.path().join("missing.toml"))).is_err());
 }

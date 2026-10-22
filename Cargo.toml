@@ -7,6 +7,7 @@ description = "Review captured Git diffs locally with explicit persistent file m
 license = "MIT"
 
 [dependencies]
+toml = "0.8"
 anyhow = "=1.0.104"
 crossterm = "=0.29.0"
 ratatui = "=0.29.0"

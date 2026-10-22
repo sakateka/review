@@ -1,3 +1,4 @@
+use crate::keybindings::{Action, Bindings, Keymap, Resolution};
 use crate::{git::Capture, preview::Preview, state::Store};
 use crate::{
     navigation::{Candidate, Operation, Request, Worker},
@@ -38,7 +39,7 @@ pub struct App {
     pub file_offset: usize,
     last_click: Option<(usize, Instant)>,
     motion_count: usize,
-    pending_g: bool,
+    pub bindings: Bindings,
 }
 
 #[derive(Clone)]
@@ -106,7 +107,7 @@ impl App {
             file_offset: 0,
             last_click: None,
             motion_count: 0,
-            pending_g: false,
+            bindings: Bindings::default(),
             history: Vec::new(),
             capture,
             store,
@@ -237,7 +238,7 @@ impl App {
                 self.select(0);
                 self.last_click = if double { None } else { Some((index, now)) };
                 if double {
-                    self.key(KeyCode::Enter);
+                    self.dispatch(Action::OpenDiffView, 1, false);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if preview => {
@@ -264,105 +265,199 @@ impl App {
     }
 
     pub fn key_event(&mut self, key: KeyEvent) -> bool {
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !self.navigation.as_ref().is_some_and(|nav| nav.editing)
-        {
-            self.pending_g = false;
-            let count = self.motion_count.max(1);
+        self.last_click = None;
+        if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
+            self.bindings.clear();
             self.motion_count = 0;
             match key.code {
-                KeyCode::Char('o') => self.back(),
-                KeyCode::Char('u' | 'd' | 'f' | 'b') => {
-                    let half = matches!(key.code, KeyCode::Char('u' | 'd'));
-                    let rows = if half {
-                        self.viewport.0 / 2
-                    } else {
-                        self.viewport.0
-                    };
-                    let direction = if matches!(key.code, KeyCode::Char('u' | 'b')) {
-                        -1
-                    } else {
-                        1
-                    };
-                    self.scroll_preview(direction * rows.max(1).saturating_mul(count) as isize, 0);
+                KeyCode::Esc => self.back(),
+                KeyCode::Enter => {
+                    self.navigation.as_mut().expect("navigation").editing = false;
+                    self.submit();
+                }
+                KeyCode::Backspace => {
+                    self.navigation.as_mut().expect("navigation").query.pop();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && self
+                            .navigation
+                            .as_ref()
+                            .is_some_and(|n| n.query.len() < 256) =>
+                {
+                    self.navigation.as_mut().expect("navigation").query.push(c);
                 }
                 _ => {}
             }
             return false;
         }
-        self.key(key.code)
-    }
-
-    fn vim_motion(&mut self, key: KeyCode) -> bool {
-        if let KeyCode::Char(digit @ '0'..='9') = key
+        // Escape always cancels an incomplete command without executing it.
+        if key.code == KeyCode::Esc && (self.bindings.pending() || self.motion_count > 0) {
+            self.bindings.clear();
+            self.motion_count = 0;
+            self.status.clear();
+            return false;
+        }
+        if self.bindings.keymap == Keymap::Vim
+            && !self.bindings.pending()
+            && key.modifiers.is_empty()
+            && let KeyCode::Char(digit @ '0'..='9') = key.code
             && (digit != '0' || self.motion_count > 0)
+            && self.bindings.count_digit(digit)
         {
             self.motion_count =
                 (self.motion_count * 10 + digit.to_digit(10).unwrap() as usize).min(9999);
-            return true;
+            return false;
         }
-        let count = self.motion_count.max(1);
-        let explicit_count = self.motion_count > 0;
-        self.motion_count = 0;
-        if self.pending_g {
-            self.pending_g = false;
-            match key {
-                KeyCode::Char('d') => {
-                    self.begin_navigation(Operation::Definitions);
-                    return true;
-                }
-                KeyCode::Char('r') => {
-                    self.begin_navigation(Operation::References);
-                    return true;
-                }
-                KeyCode::Char('g') => {
-                    self.go_to_row(count.saturating_sub(1));
-                    return true;
-                }
-                _ => {}
+        let buffer = self.focus == Focus::Preview && self.navigation.is_none();
+        match self.bindings.resolve(key, buffer) {
+            Resolution::Pending => false,
+            Resolution::Unbound => {
+                self.motion_count = 0;
+                false
+            }
+            Resolution::Action(action) => {
+                let count = self.motion_count.max(1);
+                let explicit = self.motion_count > 0;
+                self.motion_count = 0;
+                self.dispatch(action, count, explicit)
             }
         }
-        match key {
-            KeyCode::Char('g') => {
-                self.pending_g = true;
-                self.motion_count = if explicit_count { count } else { 0 };
+    }
+
+    #[cfg(test)]
+    pub fn key(&mut self, key: KeyCode) -> bool {
+        self.key_event(KeyEvent::new(key, KeyModifiers::NONE))
+    }
+
+    fn dispatch(&mut self, action: Action, count: usize, explicit: bool) -> bool {
+        use Action::*;
+        let buffer = self.focus == Focus::Preview && self.navigation.is_none();
+        match action {
+            Quit => return true,
+            CloseDiffView if self.capture.unavailable.is_none() => self.close_preview(),
+            GoBack => self.back(),
+            SearchSymbols => self.begin_navigation(Operation::Search),
+            GoToDefinition => self.begin_navigation(Operation::Definitions),
+            GoToReferences => self.begin_navigation(Operation::References),
+            AnalysisDetails if self.navigation.is_some() => {
+                let coverage = self
+                    .navigation
+                    .as_ref()
+                    .expect("navigation")
+                    .coverage
+                    .clone();
+                self.save_view();
+                self.navigation = None;
+                self.source = None;
+                self.preview = Some(Preview::original(coverage.replace("; ", "\n").as_bytes()));
+                self.top = 0;
+                self.left = 0;
+                self.cursor = (0, 0);
+                self.focus = Focus::Preview;
+                self.status = format!("Analysis details; {} returns", self.bindings.label(GoBack));
             }
-            KeyCode::Char('G') => {
-                let last = if self.focus == Focus::Files {
+            OldSide => self.change_side(ComparedSide::Old),
+            NewSide => self.change_side(ComparedSide::New),
+            OpenDiffView if self.navigation.is_some() => self.open_candidate(),
+            OpenDiffView => self.open_diff(),
+            SwitchPane if self.preview.is_some() && self.capture.unavailable.is_none() => {
+                self.focus = if self.focus == Focus::Files {
+                    Focus::Preview
+                } else {
+                    Focus::Files
+                };
+            }
+            ToggleMark if self.navigation.is_some() || self.source.is_some() => {
+                self.status = format!(
+                    "Close the source view with {} before marking",
+                    self.bindings.label(CloseDiffView)
+                );
+            }
+            ToggleMark => self.toggle_mark(),
+            CursorDown | CursorUp => {
+                let direction = if action == CursorDown {
+                    count as isize
+                } else {
+                    -(count as isize)
+                };
+                if let Some(nav) = &mut self.navigation {
+                    nav.selected = nav
+                        .selected
+                        .saturating_add_signed(direction)
+                        .min(nav.candidates.len().saturating_sub(1));
+                    self.render_candidates();
+                } else if self.focus == Focus::Files {
+                    self.select(direction);
+                } else {
+                    self.move_cursor(direction, 0);
+                }
+            }
+            CursorLeft | CursorRight if buffer => self.move_cursor(
+                0,
+                if action == CursorLeft {
+                    -(count as isize)
+                } else {
+                    count as isize
+                },
+            ),
+            FirstLine => self.go_to_row(count.saturating_sub(1)),
+            LastLine => {
+                let last = if let Some(nav) = &self.navigation {
+                    nav.candidates.len()
+                } else if self.focus == Focus::Files {
                     self.capture.items.len()
                 } else {
                     self.preview.as_ref().map_or(0, |p| p.lines.len())
                 };
-                self.go_to_row(if explicit_count {
+                self.go_to_row(if explicit {
                     count.saturating_sub(1)
                 } else {
                     last.saturating_sub(1)
                 });
             }
-            KeyCode::Char('*' | '#' | 'n' | 'N')
-                if self.focus == Focus::Preview && self.navigation.is_none() =>
-            {
-                self.search_buffer(key, count);
+            PageUp | PageDown | HalfPageUp | HalfPageDown => {
+                let half = matches!(action, HalfPageUp | HalfPageDown);
+                let rows = if half {
+                    self.viewport.0 / 2
+                } else {
+                    self.viewport.0
+                };
+                let direction = if matches!(action, PageUp | HalfPageUp) {
+                    -1
+                } else {
+                    1
+                };
+                self.scroll_preview(direction * rows.max(1).saturating_mul(count) as isize, 0);
             }
-            KeyCode::Char('w' | 'W' | 'b' | 'B' | 'e' | 'E')
-                if self.focus == Focus::Preview && self.navigation.is_none() =>
+            WordForward | WordBackward | WordEnd | BigWordForward | BigWordBackward
+            | BigWordEnd
+                if buffer =>
             {
-                if let (Some(preview), KeyCode::Char(motion)) = (&self.preview, key) {
+                let motion = match action {
+                    WordForward => 'w',
+                    WordBackward => 'b',
+                    WordEnd => 'e',
+                    BigWordForward => 'W',
+                    BigWordBackward => 'B',
+                    _ => 'E',
+                };
+                if let Some(preview) = &self.preview {
                     self.cursor = crate::motion::word(&preview.lines, self.cursor, motion, count);
                 }
                 self.keep_cursor_visible();
             }
-            KeyCode::Char('0' | '^' | '$')
-                if self.focus == Focus::Preview && self.navigation.is_none() =>
-            {
+            LineStart | FirstNonblank | LineEnd if buffer => {
                 if let Some(line) = self
                     .preview
                     .as_ref()
                     .and_then(|p| p.lines.get(self.cursor.0))
                 {
-                    self.cursor.1 = match key {
-                        KeyCode::Char('0') => 0,
-                        KeyCode::Char('^') => {
+                    self.cursor.1 = match action {
+                        LineStart => 0,
+                        FirstNonblank => {
                             use unicode_width::UnicodeWidthStr;
                             let text = line.to_string();
                             text[..text.len() - text.trim_start().len()].width()
@@ -372,20 +467,43 @@ impl App {
                 }
                 self.keep_cursor_visible();
             }
-            KeyCode::Char('j' | 'k' | 'h' | 'l')
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Left
-            | KeyCode::Right
-                if count > 1 =>
-            {
-                for _ in 0..count {
-                    self.key(key);
-                }
+            SearchWord | SearchWordBackward | SearchNext | SearchPrevious if buffer => {
+                self.search_buffer(
+                    KeyCode::Char(match action {
+                        SearchWord => '*',
+                        SearchWordBackward => '#',
+                        SearchNext => 'n',
+                        _ => 'N',
+                    }),
+                    count,
+                );
             }
-            _ => return false,
+            _ => {}
         }
-        true
+        self.clamp_scroll();
+        false
+    }
+
+    fn open_diff(&mut self) {
+        if let Some(item) = self.capture.items.get(self.selected) {
+            self.source = None;
+            self.cursor = (0, 0);
+            self.navigation = None;
+            let mut preview = Preview::item(&self.capture.cwd, item);
+            if !self.capture.stderr.is_empty() {
+                let mut warning = b"\nGit stderr:\n".to_vec();
+                warning.extend_from_slice(&self.capture.stderr);
+                let warning = Preview::original(&warning);
+                preview.width = preview.width.max(warning.width);
+                preview.lines.extend(warning.lines);
+            }
+            self.preview = Some(preview);
+            self.focus = Focus::Preview;
+            self.top = 0;
+            self.left = 0;
+        } else if self.capture.unavailable.is_some() {
+            self.status = "File actions are unavailable in original-output mode".into();
+        }
     }
 
     fn search_buffer(&mut self, key: KeyCode, count: usize) {
@@ -438,175 +556,6 @@ impl App {
         self.top = 0;
         self.left = 0;
         self.status.clear();
-    }
-
-    // Returns true only for an explicit quit. Drawing has no state/store effects.
-    pub fn key(&mut self, key: KeyCode) -> bool {
-        self.last_click = None;
-        if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
-            match key {
-                KeyCode::Esc => {
-                    self.back();
-                }
-                KeyCode::Enter => {
-                    if let Some(nav) = &mut self.navigation {
-                        nav.editing = false;
-                    }
-                    self.submit();
-                }
-                KeyCode::Backspace => {
-                    if let Some(nav) = &mut self.navigation {
-                        nav.query.pop();
-                    }
-                }
-                KeyCode::Char(c)
-                    if self
-                        .navigation
-                        .as_ref()
-                        .is_some_and(|n| n.query.len() < 256) =>
-                {
-                    self.navigation.as_mut().expect("navigation").query.push(c);
-                }
-                _ => {}
-            }
-            return false;
-        }
-        if key == KeyCode::Esc {
-            self.motion_count = 0;
-            self.pending_g = false;
-            if self.capture.unavailable.is_none() {
-                self.close_preview();
-            }
-            return false;
-        }
-        if self.vim_motion(key) {
-            return false;
-        }
-        match key {
-            KeyCode::Char('s') | KeyCode::Char('/') => {
-                self.begin_navigation(Operation::Search);
-                return false;
-            }
-            KeyCode::Char('d') => {
-                self.begin_navigation(Operation::Definitions);
-                return false;
-            }
-            KeyCode::Char('r') => {
-                self.begin_navigation(Operation::References);
-                return false;
-            }
-            KeyCode::Char('?') if self.navigation.is_some() => {
-                let coverage = self
-                    .navigation
-                    .as_ref()
-                    .expect("navigation")
-                    .coverage
-                    .clone();
-                self.save_view();
-                self.navigation = None;
-                self.source = None;
-                self.preview = Some(Preview::original(coverage.replace("; ", "\n").as_bytes()));
-                self.top = 0;
-                self.left = 0;
-                self.cursor = (0, 0);
-                self.focus = Focus::Preview;
-                self.status = "Analysis details; Ctrl-O returns".into();
-                return false;
-            }
-            KeyCode::Char('[') | KeyCode::Char(']') => {
-                self.change_side(if key == KeyCode::Char('[') {
-                    ComparedSide::Old
-                } else {
-                    ComparedSide::New
-                });
-                return false;
-            }
-            KeyCode::Enter if self.navigation.is_some() => {
-                self.open_candidate();
-                return false;
-            }
-            KeyCode::Down | KeyCode::Char('j') if self.navigation.is_some() => {
-                let nav = self.navigation.as_mut().expect("navigation");
-                nav.selected = (nav.selected + 1).min(nav.candidates.len().saturating_sub(1));
-                self.render_candidates();
-                return false;
-            }
-            KeyCode::Up | KeyCode::Char('k') if self.navigation.is_some() => {
-                let nav = self.navigation.as_mut().expect("navigation");
-                nav.selected = nav.selected.saturating_sub(1);
-                self.render_candidates();
-                return false;
-            }
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('h') | KeyCode::Left
-                if self.focus == Focus::Preview && self.navigation.is_none() =>
-            {
-                self.move_cursor(0, -1)
-            }
-            KeyCode::Char('l') | KeyCode::Right
-                if self.focus == Focus::Preview && self.navigation.is_none() =>
-            {
-                self.move_cursor(0, 1)
-            }
-            KeyCode::Enter | KeyCode::Char('l') => {
-                if let Some(item) = self.capture.items.get(self.selected) {
-                    self.source = None;
-                    self.cursor = (0, 0);
-                    self.navigation = None;
-                    let mut preview = Preview::item(&self.capture.cwd, item);
-                    if !self.capture.stderr.is_empty() {
-                        let mut warning = b"\nGit stderr:\n".to_vec();
-                        warning.extend_from_slice(&self.capture.stderr);
-                        let warning = Preview::original(&warning);
-                        preview.width = preview.width.max(warning.width);
-                        preview.lines.extend(warning.lines);
-                    }
-                    self.preview = Some(preview);
-                    self.focus = Focus::Preview;
-                    self.top = 0;
-                    self.left = 0;
-                } else if self.capture.unavailable.is_some() {
-                    self.status = "File actions are unavailable in original-output mode".into();
-                }
-            }
-            KeyCode::Char('h') if self.capture.unavailable.is_none() => {
-                self.abandon_navigation();
-                self.preview = None;
-                self.focus = Focus::Files;
-                self.top = 0;
-                self.left = 0;
-            }
-            KeyCode::Tab if self.preview.is_some() && self.capture.unavailable.is_none() => {
-                self.focus = if self.focus == Focus::Files {
-                    Focus::Preview
-                } else {
-                    Focus::Files
-                };
-            }
-            KeyCode::Char(' ') if self.navigation.is_some() || self.source.is_some() => {
-                self.status = "Close the source view with Escape before marking".into();
-            }
-            KeyCode::Char(' ') => self.toggle_mark(),
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.focus == Focus::Files {
-                    self.select(1);
-                } else {
-                    self.move_cursor(1, 0);
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.focus == Focus::Files {
-                    self.select(-1);
-                } else {
-                    self.move_cursor(-1, 0);
-                }
-            }
-            KeyCode::PageDown => self.scroll_preview(self.viewport.0.max(1) as isize, 0),
-            KeyCode::PageUp => self.scroll_preview(-(self.viewport.0.max(1) as isize), 0),
-            _ => {}
-        }
-        self.clamp_scroll();
-        false
     }
 
     fn select(&mut self, direction: isize) {
@@ -759,10 +708,14 @@ impl App {
             return;
         };
         let mut text = format!(
-            "{:?} candidates for {:?} — {} results\nEnter opens selected; Ctrl-O returns; [ old / ] new\n",
+            "{:?} candidates for {:?} — {} results\n{} opens; {} returns; {} old / {} new\n",
             nav.operation,
             nav.query,
-            nav.candidates.len()
+            nav.candidates.len(),
+            self.bindings.label(Action::OpenDiffView),
+            self.bindings.label(Action::GoBack),
+            self.bindings.label(Action::OldSide),
+            self.bindings.label(Action::NewSide),
         );
         for (index, candidate) in nav.candidates.iter().enumerate() {
             let source = &self.capture.catalog.sources[candidate.source];
@@ -785,7 +738,10 @@ impl App {
         self.left = 0;
         self.cursor = (nav.selected + 2, 0);
         self.status = if nav.coverage.contains("Analysis failed") {
-            "Analysis failed; ? for details".into()
+            format!(
+                "Analysis failed; {} for details",
+                self.bindings.label(Action::AnalysisDetails)
+            )
         } else if nav.coverage.contains("no tagged symbol") {
             "No symbol at cursor".into()
         } else {
