@@ -46,6 +46,7 @@ actions! {
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
     CommandLine => "command_line", CommandPalette => "command_palette",
     Comment => "comment", SelectRange => "select_range", DeleteComment => "delete_comment",
+    NextFileDiff => "next_file_diff", PreviousFileDiff => "previous_file_diff",
 }
 #[derive(Clone)]
 struct Binding {
@@ -105,6 +106,8 @@ impl Bindings {
             (SearchPrevious, &["N"]),
             (Comment, &["c"]),
             (DeleteComment, &["dc"]),
+            (NextFileDiff, &["ctrl-j"]),
+            (PreviousFileDiff, &["ctrl-k"]),
         ];
         let vim: &[(Action, &[&str])] = &[
             (GoToDefinition, &["gd"]),

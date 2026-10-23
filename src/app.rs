@@ -40,6 +40,8 @@ pub struct App {
     source: Option<usize>,
     pub documentation: bool,
     pub definition_preview: bool,
+    /// The preview was opened as a captured file diff (see `file_diff_open`).
+    file_diff: bool,
     center_preview_on_layout: Option<(usize, usize)>,
     pub cursor: (usize, usize),
     history: Vec<View>,
@@ -79,6 +81,7 @@ struct View {
     navigation: Option<Navigation>,
     documentation: bool,
     definition_preview: bool,
+    file_diff: bool,
     center_preview_on_layout: Option<(usize, usize)>,
     focus: Focus,
     status: String,
@@ -133,6 +136,7 @@ impl App {
             source: None,
             documentation: false,
             definition_preview: false,
+            file_diff: false,
             center_preview_on_layout: None,
             cursor: (0, 0),
             file_area: Rect::default(),
@@ -493,6 +497,7 @@ impl App {
                 self.save_view();
                 self.navigation = None;
                 self.source = None;
+                self.file_diff = false;
                 self.preview = Some(Preview::original(
                     coverage.replace("; ", "\n").as_bytes(),
                     &self.theme,
@@ -507,6 +512,8 @@ impl App {
             NewSide => self.change_side(ComparedSide::New),
             OpenDiffView if self.navigation.is_some() => self.open_candidate(),
             OpenDiffView => self.open_diff(),
+            NextFileDiff => self.switch_file_diff(true),
+            PreviousFileDiff => self.switch_file_diff(false),
             SwitchPane if self.preview.is_some() && self.capture.unavailable.is_none() => {
                 self.focus = if self.focus == Focus::Files {
                     Focus::Preview
@@ -784,6 +791,7 @@ impl App {
                 preview.append(Preview::original(&warning, &self.theme));
             }
             self.preview = Some(preview);
+            self.file_diff = true;
             self.focus = Focus::Preview;
             self.top = 0;
             self.left = 0;
@@ -840,6 +848,7 @@ impl App {
         self.selection = None;
         self.abandon_navigation();
         self.preview = None;
+        self.file_diff = false;
         self.focus = Focus::Files;
         self.cursor = (0, 0);
         self.top = 0;
@@ -855,10 +864,15 @@ impl App {
             .saturating_add_signed(direction)
             .min(self.capture.items.len().saturating_sub(1));
         self.preview = None;
+        self.file_diff = false;
         self.focus = Focus::Files;
         self.cursor = (0, 0);
         self.top = 0;
         self.left = 0;
+        self.keep_selection_visible();
+    }
+
+    fn keep_selection_visible(&mut self) {
         let height = self.file_area.height as usize;
         if self.selected < self.file_offset {
             self.file_offset = self.selected;
@@ -866,6 +880,53 @@ impl App {
         if height > 0 && self.selected >= self.file_offset + height {
             self.file_offset = self.selected + 1 - height;
         }
+    }
+
+    /// A captured file diff is showing: not a source, candidate,
+    /// documentation, definition or analysis view.
+    fn file_diff_open(&self) -> bool {
+        self.file_diff
+            && self.preview.is_some()
+            && self.source.is_none()
+            && self.navigation.is_none()
+            && !self.documentation
+            && !self.definition_preview
+    }
+
+    /// Open the next (or previous) file diff in place, wrapping at the ends
+    /// and keeping the current pane focus. Review state is never touched.
+    fn switch_file_diff(&mut self, forward: bool) {
+        if self.capture.unavailable.is_some() {
+            self.status = "File actions are unavailable in original-output mode".into();
+            return;
+        }
+        if !self.file_diff_open() {
+            self.status = "Next/previous file works while a file diff is open".into();
+            return;
+        }
+        let len = self.capture.items.len();
+        if len < 2 {
+            self.status = "Only one file".into();
+            return;
+        }
+        let selected = self.selected.min(len - 1);
+        let (next, wrapped) = if forward {
+            ((selected + 1) % len, selected + 1 == len)
+        } else {
+            ((selected + len - 1) % len, selected == 0)
+        };
+        let focus = self.focus;
+        self.selected = next;
+        // History views belong to the previous file; drop them as `select` does.
+        self.abandon_navigation();
+        self.open_diff();
+        self.focus = focus;
+        self.keep_selection_visible();
+        self.status = match (wrapped, forward) {
+            (false, _) => String::new(),
+            (true, true) => "Wrapped to first file".into(),
+            (true, false) => "Wrapped to last file".into(),
+        };
     }
 
     fn save_view(&mut self) {
@@ -883,6 +944,7 @@ impl App {
             navigation: self.navigation.clone(),
             documentation: self.documentation,
             definition_preview: self.definition_preview,
+            file_diff: self.file_diff,
             center_preview_on_layout: self.center_preview_on_layout,
             focus: self.focus,
             status: self.status.clone(),
@@ -914,6 +976,7 @@ impl App {
             self.navigation = view.navigation;
             self.documentation = view.documentation;
             self.definition_preview = view.definition_preview;
+            self.file_diff = view.file_diff;
             self.center_preview_on_layout = view.center_preview_on_layout;
             self.focus = view.focus;
             self.status = view.status;

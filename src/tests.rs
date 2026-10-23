@@ -4218,7 +4218,7 @@ fn keymap_regression_terminal_equivalent_chords_collide_and_dispatch() {
         assert!(parse_keys(supported).is_ok(), "{supported}");
     }
     assert_ne!(parse_keys("ctrl-j").unwrap(), parse_keys("enter").unwrap());
-    let mut bindings = config::Config::parse("[keybindings]\nquit='ctrl-j'")
+    let mut bindings = config::Config::parse("[keybindings]\nquit='ctrl-j'\nnext_file_diff=''")
         .unwrap()
         .bindings(None)
         .unwrap();
@@ -7863,10 +7863,12 @@ fn palette_opens_in_both_keymaps_and_rebinds() {
     // The footer legend is unchanged.
     assert!(!app.bindings.legend().contains("alt-p"));
     // Rebound and disabled like any other action.
-    app.bindings = config::Config::parse("[keybindings]\ncommand_palette = 'ctrl-k'\n")
-        .unwrap()
-        .bindings(None)
-        .unwrap();
+    app.bindings = config::Config::parse(
+        "[keybindings]\ncommand_palette = 'ctrl-k'\nprevious_file_diff = ''\n",
+    )
+    .unwrap()
+    .bindings(None)
+    .unwrap();
     app.key_event(alt('p'));
     assert!(app.palette.is_none());
     app.key_event(ctrl('k'));
@@ -9289,4 +9291,341 @@ fn syntect_fallback_colors_name_and_shebang_diffs_including_added_files() {
         "{:?}",
         notes.reason
     );
+}
+
+mod switch_file_diffs {
+    use super::*;
+
+    /// A repository with three changed files: one.rs, three.rs, two.rs.
+    fn three_files() -> tempfile::TempDir {
+        let directory = fixture();
+        std::fs::write(directory.path().join("three.rs"), "fn three() {}\n").unwrap();
+        git_run(directory.path(), &["add", "."]);
+        git_run(directory.path(), &["commit", "-qm", "three"]);
+        change(directory.path());
+        std::fs::write(directory.path().join("three.rs"), "fn three() { 3 }\n").unwrap();
+        directory
+    }
+
+    fn shown(app: &App) -> String {
+        app.preview
+            .as_ref()
+            .expect("preview")
+            .lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_diff_of(app: &App, index: usize) {
+        assert_eq!(app.selected, index);
+        let path = String::from_utf8_lossy(&app.capture.items[index].new_path).into_owned();
+        assert!(shown(app).contains(&path), "{}", shown(app));
+        for (other, item) in app.capture.items.iter().enumerate() {
+            if other != index {
+                let path = String::from_utf8_lossy(&item.new_path).into_owned();
+                assert!(!shown(app).contains(&path));
+            }
+        }
+    }
+
+    #[test]
+    fn next_previous_and_wrap_in_both_panes() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        assert_eq!(app.capture.items.len(), 3);
+        app.key(KeyCode::Enter);
+        assert_diff_of(&app, 0);
+        app.status = "stale".into();
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('l'));
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 1);
+        assert_eq!(app.focus, Focus::Preview);
+        assert_eq!(app.status, "");
+        assert_eq!((app.cursor, app.top, app.left), ((0, 0), 0, 0));
+        app.key_event(ctrl('k'));
+        assert_diff_of(&app, 0);
+        app.key_event(ctrl('k'));
+        assert_diff_of(&app, 2);
+        assert_eq!(app.status, "Wrapped to last file");
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 0);
+        assert_eq!(app.status, "Wrapped to first file");
+        // Counts are ignored.
+        app.key(KeyCode::Char('2'));
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 1);
+        assert_eq!(app.status, "");
+        // From the Files pane focus stays there.
+        app.key(KeyCode::Tab);
+        assert_eq!(app.focus, Focus::Files);
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 2);
+        assert_eq!(app.focus, Focus::Files);
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 0);
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.status, "Wrapped to first file");
+    }
+
+    #[test]
+    fn file_list_keeps_the_new_selection_visible() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        screen(&mut app, 80, 5);
+        let height = app.file_area.height as usize;
+        assert!(height > 0 && height < 3, "{height} {:?}", app.file_area);
+        app.key(KeyCode::Enter);
+        app.key(KeyCode::Tab);
+        app.key_event(ctrl('k'));
+        assert_eq!(app.selected, 2);
+        assert!(app.file_offset <= 2 && 2 < app.file_offset + height);
+        app.key_event(ctrl('j'));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.file_offset, 0);
+    }
+
+    #[test]
+    fn inactive_without_a_file_diff() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.key_event(ctrl('j'));
+        assert_eq!(app.selected, 0);
+        assert!(app.preview.is_none());
+        assert_eq!(
+            app.status,
+            "Next/previous file works while a file diff is open"
+        );
+        // A source view opened from symbol search is not a file diff.
+        app.key(KeyCode::Enter);
+        app.key(KeyCode::Char('/'));
+        for character in "two".chars() {
+            app.key(KeyCode::Char(character));
+        }
+        // Ctrl-J inside the query input keeps its current (ignored) handling.
+        app.key_event(ctrl('j'));
+        assert_eq!(app.navigation.as_ref().unwrap().query, "two");
+        app.key(KeyCode::Enter);
+        await_navigation(&mut app);
+        app.status.clear();
+        app.key_event(ctrl('k'));
+        assert_eq!(app.selected, 0);
+        assert!(app.navigation.is_some());
+        assert_eq!(
+            app.status,
+            "Next/previous file works while a file diff is open"
+        );
+        app.key(KeyCode::Enter);
+        assert!(app.navigation.is_none());
+        let source = shown(&app);
+        app.key_event(ctrl('j'));
+        assert_eq!(app.selected, 0);
+        assert_eq!(shown(&app), source);
+        assert_eq!(
+            app.status,
+            "Next/previous file works while a file diff is open"
+        );
+    }
+
+    #[test]
+    fn switching_drops_the_previous_file_history() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.key(KeyCode::Enter);
+        let first = shown(&app);
+        app.key(KeyCode::Char('/'));
+        for character in "two".chars() {
+            app.key(KeyCode::Char(character));
+        }
+        app.key(KeyCode::Enter);
+        await_navigation(&mut app);
+        app.key(KeyCode::Enter);
+        assert!(app.navigation.is_none());
+        // Enter in the source view reopens the diff of the first file with
+        // the navigation history kept.
+        app.key(KeyCode::Enter);
+        assert_diff_of(&app, 0);
+        assert_eq!(shown(&app), first);
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 1);
+        let second = shown(&app);
+        app.key_event(ctrl('o'));
+        assert_eq!(app.status, "No earlier navigation target");
+        assert_eq!(app.selected, 1);
+        assert_eq!(shown(&app), second);
+        assert!(app.navigation.is_none());
+    }
+
+    #[test]
+    fn documentation_and_definition_views_are_not_file_diffs() {
+        for (text, query, key, documentation) in [
+            (
+                include_str!("../tests/fixtures/navigation/documentation.rs"),
+                "documented",
+                'K',
+                true,
+            ),
+            (
+                "struct CapturedType;\nfn captured_function() {}\nfn caller() { captured_function(); }\n",
+                "captured_function",
+                'P',
+                false,
+            ),
+        ] {
+            let directory = three_files();
+            std::fs::write(directory.path().join("one.rs"), text).unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let mut app = application(directory.path(), state.path());
+            assert_eq!(app.capture.items.len(), 3);
+            app.key(KeyCode::Char('/'));
+            for character in query.chars() {
+                app.key(KeyCode::Char(character));
+            }
+            app.key(KeyCode::Enter);
+            await_navigation(&mut app);
+            app.key(KeyCode::Char(key));
+            await_navigation(&mut app);
+            assert!(app.navigation.is_none(), "{key}: {}", app.status);
+            assert_eq!(app.documentation, documentation, "{key}");
+            assert_eq!(app.definition_preview, !documentation, "{key}");
+            let view = shown(&app);
+            for key_event in [ctrl('j'), ctrl('k')] {
+                app.key_event(key_event);
+                assert_eq!(
+                    app.status,
+                    "Next/previous file works while a file diff is open"
+                );
+                assert_eq!(app.selected, 0);
+                assert_eq!(shown(&app), view);
+                assert_eq!(app.documentation, documentation);
+                assert_eq!(app.definition_preview, !documentation);
+            }
+        }
+    }
+
+    #[test]
+    fn single_file_and_original_output_mode() {
+        let directory = fixture();
+        std::fs::write(
+            directory.path().join("one.rs"),
+            "fn one() {\n\tlet answer = 100;\n}\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        assert_eq!(app.capture.items.len(), 1);
+        app.key(KeyCode::Enter);
+        let before = shown(&app);
+        app.key_event(ctrl('j'));
+        assert_eq!(app.status, "Only one file");
+        assert_eq!((app.selected, shown(&app)), (0, before.clone()));
+        app.key_event(ctrl('k'));
+        assert_eq!(app.status, "Only one file");
+        assert_eq!((app.selected, shown(&app)), (0, before));
+
+        change(directory.path());
+        let mut app = App::new(
+            capture(directory.path(), &["--stat", "HEAD"]),
+            state::Store::at(state.path(), directory.path(), &[]),
+        );
+        let before = shown(&app);
+        app.key_event(ctrl('j'));
+        assert_eq!(
+            app.status,
+            "File actions are unavailable in original-output mode"
+        );
+        assert_eq!(shown(&app), before);
+    }
+
+    #[test]
+    fn marks_and_state_are_untouched() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.key(KeyCode::Char('m'));
+        assert!(app.marks[0]);
+        let bytes = std::fs::read(&app.store.path).unwrap();
+        app.key(KeyCode::Enter);
+        for _ in 0..4 {
+            app.key_event(ctrl('j'));
+        }
+        for _ in 0..4 {
+            app.key_event(ctrl('k'));
+        }
+        assert_eq!(app.marks, vec![true, false, false]);
+        assert_eq!(std::fs::read(&app.store.path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn comment_editor_keeps_ctrl_j_as_newline() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.key(KeyCode::Enter);
+        for _ in 0..5 {
+            app.key(KeyCode::Char('j'));
+        }
+        app.key(KeyCode::Char('c'));
+        assert!(app.editor.is_some(), "{}", app.status);
+        app.key(KeyCode::Char('a'));
+        app.key_event(ctrl('j'));
+        app.key(KeyCode::Char('b'));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "a\nb");
+        assert_diff_of(&app, 0);
+        app.key(KeyCode::Esc);
+        assert!(app.editor.is_none());
+        assert_diff_of(&app, 0);
+    }
+
+    #[test]
+    fn emacs_keymap_rebinding_and_help() {
+        let directory = three_files();
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        app.bindings = config::Config::parse("[features]\nkeymap = 'emacs'\n")
+            .unwrap()
+            .bindings(None)
+            .unwrap();
+        app.key(KeyCode::Enter);
+        app.key_event(ctrl('j'));
+        assert_diff_of(&app, 1);
+        app.key_event(ctrl('k'));
+        app.key_event(ctrl('k'));
+        assert_diff_of(&app, 2);
+        assert_eq!(app.status, "Wrapped to last file");
+        for keymap in ["vim", "emacs"] {
+            let help = config::Config::parse(&format!("[features]\nkeymap = '{keymap}'\n"))
+                .unwrap()
+                .bindings(None)
+                .unwrap()
+                .help();
+            assert!(help.contains("  next_file_diff: ctrl-j\n"), "{help}");
+            assert!(help.contains("  previous_file_diff: ctrl-k\n"), "{help}");
+        }
+        assert!(!app.bindings.legend().contains("ctrl-j"));
+        app.bindings = config::Config::parse(
+            "[keybindings]\nnext_file_diff = \"alt-j\"\nprevious_file_diff = \"\"\n",
+        )
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+        let help = app.bindings.help();
+        assert!(help.contains("  next_file_diff: alt-j\n"), "{help}");
+        assert!(
+            help.contains("  previous_file_diff: (disabled)\n"),
+            "{help}"
+        );
+        app.key_event(ctrl('j'));
+        app.key_event(ctrl('k'));
+        assert_diff_of(&app, 2);
+        app.key_event(alt('j'));
+        assert_diff_of(&app, 0);
+        assert_eq!(app.status, "Wrapped to first file");
+    }
 }

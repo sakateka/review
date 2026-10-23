@@ -278,6 +278,7 @@ fn terminal_smoke() {
     file_statistics(&ctx);
     marks_invalidation_and_compatibility(&ctx, &acceptance, left, right);
     comments(&ctx);
+    switch_file_diffs(&ctx);
 
     let suffix = if ctx.test_binary.is_some() {
         ", injected panic/I/O failure"
@@ -2581,4 +2582,128 @@ fn session_kills_child_on_panic() {
     );
     let alive = unsafe { libc::kill(pid.get() as libc::pid_t, 0) } == 0;
     assert!(!alive, "child {} survived the panic", pid.get());
+}
+
+fn switch_file_diffs(ctx: &Ctx) {
+    // Story 25: Ctrl-J/Ctrl-K open the next/previous file diff in place.
+    let switch_repo = ctx.root.join("switch-files");
+    std::fs::create_dir(&switch_repo).unwrap();
+    let switch_git = |words: &[&str]| ctx.git_in(&switch_repo, words);
+    switch_git(&["init", "-q"]);
+    switch_git(&["config", "user.name", "Switch acceptance"]);
+    switch_git(&["config", "user.email", "switch@example.invalid"]);
+    let names = ["alpha", "beta", "gamma"];
+    for name in names {
+        write(
+            &switch_repo.join(format!("{name}.rs")),
+            format!("fn {name}() {{\n    let value = 1;\n}}\n"),
+        );
+    }
+    switch_git(&["add", "."]);
+    switch_git(&["commit", "-qm", "base"]);
+    for name in names {
+        write(
+            &switch_repo.join(format!("{name}.rs")),
+            format!("fn {name}() {{\n    let {name}_changed = 2;\n}}\n"),
+        );
+    }
+    let marker = |index: usize| format!("{}_changed", names[index]);
+    let shows = |session: &mut Session, index: usize| {
+        session.wait_text(&marker(index));
+        for other in (0..names.len()).filter(|other| *other != index) {
+            assert!(
+                !session.text().contains(&marker(other)),
+                "{}",
+                session.text()
+            );
+        }
+    };
+    let repo_before = snapshot(&switch_repo);
+    let mut session = ctx.session_in(&switch_repo, &["--", "HEAD"]);
+    closed(&mut session);
+    // Mark alpha; switching must never change marks or state.
+    session.send(b"m");
+    marks(&mut session, &[("alpha.rs", true), ("beta.rs", false)]);
+    let state_before = ctx.state_snapshot();
+    // Without an open diff the keys only explain themselves.
+    session.send(b"\n");
+    session.wait_text("Next/previous file works while a file diff is open");
+    closed(&mut session);
+    session.send(b"\r");
+    shows(&mut session, 0);
+    assert!(session.cursor_visible);
+    session.send(b"\n");
+    shows(&mut session, 1);
+    assert!(
+        !status_row(&session).contains("Wrapped"),
+        "{}",
+        session.text()
+    );
+    assert!(session.cursor_visible, "focus left the diff");
+    session.send(b"\n");
+    shows(&mut session, 2);
+    session.send(b"\n");
+    shows(&mut session, 0);
+    session.wait_text("Wrapped to first file");
+    session.send(b"\x0b");
+    shows(&mut session, 2);
+    session.wait_text("Wrapped to last file");
+    session.send(b"\x0b");
+    shows(&mut session, 1);
+    assert!(!session.text().contains("Wrapped"), "{}", session.text());
+    // From the Files pane the focus stays on Files.
+    session.send(b"\t");
+    assert!(!session.cursor_visible, "Tab did not focus Files");
+    session.send(b"\n");
+    shows(&mut session, 2);
+    assert!(!session.cursor_visible, "focus left the Files pane");
+    session.send(b"\x0b");
+    shows(&mut session, 1);
+    assert!(!session.cursor_visible, "focus left the Files pane");
+    // The Files selection followed: closing and reopening shows beta again.
+    session.send(b"\x1b");
+    closed(&mut session);
+    session.send(b"\r");
+    shows(&mut session, 1);
+    // The comment editor keeps Ctrl-J as a newline.
+    session.send(b"jjjjjc");
+    session.wait_text("Comment · beta.rs");
+    session.send(b"first\nsecond");
+    session.wait_text("second");
+    let (first_row, first_line) = find_line(&session, "first");
+    let (second_row, _) = find_line(&session, "second");
+    assert_eq!(second_row, first_row + 1, "{}", session.text());
+    assert!(!first_line.contains("second"), "{}", session.text());
+    // The editor covers the changed line; the diff header still names beta.
+    assert!(
+        session.text().contains("+++ b/beta.rs"),
+        "{}",
+        session.text()
+    );
+    session.send(b"\x1b");
+    session.wait_text("Comment edit cancelled");
+    assert!(!session.text().contains("Comment · "), "{}", session.text());
+    shows(&mut session, 1);
+    session.send(b",q");
+    session.finish(0);
+    // Emacs uses the same keys.
+    let mut session = ctx.session_in(&switch_repo, &["--keymap", "emacs", "--", "HEAD"]);
+    closed(&mut session);
+    session.send(b"\r");
+    shows(&mut session, 0);
+    session.send(b"\n");
+    shows(&mut session, 1);
+    session.send(b",q");
+    session.finish(0);
+    assert_same(
+        &repo_before,
+        &snapshot(&switch_repo),
+        "file switching repository",
+    );
+    assert_same(
+        &state_before,
+        &ctx.state_snapshot(),
+        "file switching review state",
+    );
+    pty_passed("switch file diffs with Ctrl-J/Ctrl-K");
 }
