@@ -41,6 +41,9 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
     for setting in commands::SETTINGS {
         text.push_str(&format!("  {} - {}\n", setting.key, setting.summary));
     }
+    text.push_str(
+        "Command palette (command_palette): type to filter, Up/Down select, Enter runs, Escape cancels.\n",
+    );
     text.push_str(&format!(
         "Themes (default {}): {}\n",
         theme::DEFAULT,

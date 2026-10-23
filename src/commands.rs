@@ -1,6 +1,7 @@
-//! The `:` command line: a small registry of commands and settings, their
-//! completion and their execution. Commands only change runtime state; they
-//! never write configuration, review state, sources or Git.
+//! The `:` command line and the command palette: a small registry of commands
+//! and settings, their completion, palette listing and execution. Commands
+//! only change runtime state; they never write configuration, review state,
+//! sources or Git.
 
 use crate::{app::App, theme::Theme};
 
@@ -11,18 +12,25 @@ pub struct Command {
     pub name: &'static str,
     pub usage: &'static str,
     pub summary: &'static str,
+    /// Completion values of the optional argument, if it has a fixed set.
+    values: Option<fn() -> Vec<&'static str>>,
 }
+
+/// The command whose arguments are the registered settings.
+const SET: &str = "set";
 
 pub const COMMANDS: &[Command] = &[
     Command {
         name: "colorscheme",
         usage: "colorscheme [<name>]",
         summary: "show or switch the color theme for this session",
+        values: Some(Theme::names),
     },
     Command {
-        name: "set",
+        name: SET,
         usage: "set <key>[=<value>]",
         summary: "show or change a runtime setting",
+        values: None,
     },
 ];
 
@@ -121,8 +129,7 @@ fn candidates(text: &str) -> (&str, &str, Vec<&'static str>) {
     let argument_start = start + space + (rest.len() - rest.trim_start().len());
     let argument = &text[argument_start..];
     match name {
-        "colorscheme" => (&text[..argument_start], argument, Theme::names()),
-        "set" => match argument.find('=') {
+        SET => match argument.find('=') {
             Some(equals) => {
                 let key = argument[..equals].trim();
                 let values = SETTINGS
@@ -141,7 +148,122 @@ fn candidates(text: &str) -> (&str, &str, Vec<&'static str>) {
                 SETTINGS.iter().map(|setting| setting.key).collect(),
             ),
         },
-        _ => (text, "", Vec::new()),
+        _ => match COMMANDS
+            .iter()
+            .find(|command| command.name == name)
+            .and_then(|command| command.values)
+        {
+            Some(values) => (&text[..argument_start], argument, values()),
+            None => (text, "", Vec::new()),
+        },
+    }
+}
+
+/// One runnable palette line: command text and its registry summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub text: String,
+    pub summary: &'static str,
+}
+
+/// Every palette entry, in registry order: each command bare and with each
+/// argument value; `set` is expanded per setting (`set <key>` and
+/// `set <key>=<value>`) instead of being listed bare, since bare `set` only
+/// reports an error.
+pub fn entries() -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for command in COMMANDS {
+        if command.name == SET {
+            for setting in SETTINGS {
+                entries.push(Entry {
+                    text: format!("{SET} {}", setting.key),
+                    summary: setting.summary,
+                });
+                entries.extend((setting.values)().into_iter().map(|value| Entry {
+                    text: format!("{SET} {}={value}", setting.key),
+                    summary: setting.summary,
+                }));
+            }
+            continue;
+        }
+        entries.push(Entry {
+            text: command.name.to_owned(),
+            summary: command.summary,
+        });
+        if let Some(values) = command.values {
+            entries.extend(values().into_iter().map(|value| Entry {
+                text: format!("{} {value}", command.name),
+                summary: command.summary,
+            }));
+        }
+    }
+    entries
+}
+
+/// The command palette: a filter query over the registry entries and the
+/// selected match.
+#[derive(Debug, Clone)]
+pub struct Palette {
+    pub query: String,
+    /// Index into the current matches.
+    pub selected: usize,
+    entries: Vec<Entry>,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            selected: 0,
+            entries: entries(),
+        }
+    }
+}
+
+impl Palette {
+    pub fn push(&mut self, character: char) {
+        if self.query.len() + character.len_utf8() <= LIMIT {
+            self.query.push(character);
+            self.selected = 0;
+        }
+    }
+
+    pub fn pop(&mut self) {
+        if self.query.pop().is_some() {
+            self.selected = 0;
+        }
+    }
+
+    /// Move the selection by `delta` matches, clamped to the match list.
+    pub fn move_selection(&mut self, delta: isize) {
+        let last = self.matches().len().saturating_sub(1);
+        self.selected = self.selected.saturating_add_signed(delta).min(last);
+    }
+
+    /// Entries whose text or summary contains every query word, ignoring case.
+    pub fn matches(&self) -> Vec<&Entry> {
+        let words: Vec<String> = self
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.entries
+            .iter()
+            .filter(|entry| {
+                let text = entry.text.to_lowercase();
+                let summary = entry.summary.to_lowercase();
+                words
+                    .iter()
+                    .all(|word| text.contains(word.as_str()) || summary.contains(word.as_str()))
+            })
+            .collect()
+    }
+
+    /// Command text of the selected match.
+    pub fn selected_text(&self) -> Option<String> {
+        self.matches()
+            .get(self.selected)
+            .map(|entry| entry.text.clone())
     }
 }
 

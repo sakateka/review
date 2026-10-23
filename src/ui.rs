@@ -421,8 +421,90 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(status), areas[1]);
     }
     frame.render_widget(Paragraph::new(app.bindings.legend()), areas[2]);
+    if let Some(palette) = &app.palette {
+        draw_palette(frame, palette, &app.theme);
+    }
     if let Some(editor) = &app.editor {
         draw_editor(frame, editor, &app.theme);
+    }
+}
+
+/// Centered floating command palette; owns the terminal cursor while open.
+fn draw_palette(
+    frame: &mut Frame,
+    palette: &crate::commands::Palette,
+    theme: &crate::theme::Theme,
+) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(90);
+    let height = screen.height.saturating_sub(4).min(16);
+    if width < 3 || height < 3 {
+        return;
+    }
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focused))
+        .title(" Command palette ")
+        .title_bottom(" enter run · esc cancel · ↑/↓ select ");
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let rows = inner.height as usize;
+    let columns = inner.width as usize;
+    if rows == 0 || columns == 0 {
+        return;
+    }
+    // The query row keeps its end, and the cursor after it, in view.
+    let text = format!("> {}", palette.query);
+    let skip = text.width().saturating_sub(columns.saturating_sub(1));
+    let mut shown = String::new();
+    let mut cells = 0;
+    for grapheme in text.graphemes(true) {
+        if cells >= skip {
+            shown.push_str(grapheme);
+        }
+        cells += grapheme.width();
+    }
+    let column = shown.width().min(columns - 1);
+    frame.render_widget(
+        Paragraph::new(shown),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.set_cursor_position((inner.x + column as u16, inner.y));
+    let list = rows - 1;
+    if list == 0 {
+        return;
+    }
+    let matches = palette.matches();
+    if matches.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No matching commands").style(Style::default().fg(theme.metrics)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+        return;
+    }
+    let top = (palette.selected + 1).saturating_sub(list);
+    for (offset, entry) in matches.iter().enumerate().skip(top).take(list) {
+        let line = Line::from(vec![
+            Span::raw(entry.text.clone()),
+            Span::raw("  "),
+            Span::styled(entry.summary, Style::default().fg(theme.metrics)),
+        ]);
+        let style = if offset == palette.selected {
+            theme.selection
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(line).style(style),
+            Rect::new(inner.x, inner.y + 1 + (offset - top) as u16, inner.width, 1),
+        );
     }
 }
 

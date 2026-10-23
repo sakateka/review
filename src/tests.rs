@@ -7481,6 +7481,417 @@ fn command_line_renders_in_status_row_with_cursor_and_rebinds() {
     );
 }
 
+fn alt(character: char) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        KeyCode::Char(character),
+        crossterm::event::KeyModifiers::ALT,
+    )
+}
+
+fn ctrl(character: char) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(
+        KeyCode::Char(character),
+        crossterm::event::KeyModifiers::CONTROL,
+    )
+}
+
+fn palette_texts(app: &App) -> Vec<String> {
+    app.palette
+        .as_ref()
+        .unwrap()
+        .matches()
+        .into_iter()
+        .map(|entry| entry.text.clone())
+        .collect()
+}
+
+#[test]
+fn palette_entries_follow_the_registry_order() {
+    let names = theme::Theme::names();
+    let entries = commands::entries();
+    let mut expected = vec!["colorscheme".to_owned()];
+    expected.extend(names.iter().map(|name| format!("colorscheme {name}")));
+    expected.push("set appearance.colorscheme".into());
+    expected.extend(
+        names
+            .iter()
+            .map(|name| format!("set appearance.colorscheme={name}")),
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    // Bare `set` only errors and is not listed.
+    assert!(!entries.iter().any(|entry| entry.text == "set"));
+    for entry in &entries {
+        let summary = if entry.text.starts_with("set ") {
+            commands::SETTINGS[0].summary
+        } else {
+            commands::COMMANDS[0].summary
+        };
+        assert_eq!(entry.summary, summary, "{}", entry.text);
+    }
+    // Every listed entry is a command the command line accepts.
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    for entry in &entries {
+        commands::execute(&mut app, &entry.text);
+        assert!(
+            !app.status.contains("Unknown") && !app.status.contains("requires"),
+            "{}: {}",
+            entry.text,
+            app.status
+        );
+    }
+}
+
+#[test]
+fn palette_filters_runs_like_the_command_line_and_cancels() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let mut reference = application(directory.path(), state.path());
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Char('m'));
+    app.key(KeyCode::Up);
+    let marks = app.marks.clone();
+    let store = std::fs::read(&app.store.path).unwrap();
+    app.key(KeyCode::Enter);
+    reference.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let default = colors(app.preview.as_ref().unwrap());
+    // Filter a setting: only its entries remain.
+    app.key_event(alt('p'));
+    assert!(app.palette.is_some());
+    assert_eq!(palette_texts(&app).len(), commands::entries().len());
+    type_text(&mut app, "APPEARANCE");
+    let texts = palette_texts(&app);
+    assert!(!texts.is_empty());
+    assert!(
+        texts
+            .iter()
+            .all(|text| text.starts_with("set appearance.colorscheme")),
+        "{texts:?}"
+    );
+    // Multi-word: every word must match the text or the summary.
+    for _ in 0.."APPEARANCE".len() {
+        app.key(KeyCode::Backspace);
+    }
+    type_text(&mut app, "set dracula");
+    assert_eq!(palette_texts(&app), ["set appearance.colorscheme=Dracula"]);
+    app.key(KeyCode::Esc);
+    assert!(app.palette.is_none());
+    // Run a theme: identical to the equivalent `:` command.
+    app.key_event(alt('p'));
+    type_text(&mut app, "classic");
+    assert_eq!(
+        palette_texts(&app),
+        [
+            "colorscheme review-classic",
+            "set appearance.colorscheme=review-classic"
+        ]
+    );
+    app.key(KeyCode::Enter);
+    assert!(app.palette.is_none());
+    run_command(&mut reference, "colorscheme review-classic");
+    assert_eq!(app.theme.name, "review-classic");
+    assert_eq!(
+        app.status,
+        "appearance.colorscheme=review-classic (this session only)"
+    );
+    assert_eq!(app.status, reference.status);
+    assert_eq!(
+        app.preview.as_ref().unwrap().lines,
+        reference.preview.as_ref().unwrap().lines
+    );
+    // Cancel: theme, status, diff, focus and cursor untouched.
+    app.cursor = (1, 2);
+    let view = (
+        app.focus,
+        app.cursor,
+        app.top,
+        app.left,
+        app.selected,
+        app.preview.as_ref().unwrap().lines.clone(),
+    );
+    app.status = "kept".into();
+    for cancel in [crossterm::event::KeyEvent::from(KeyCode::Esc), ctrl('g')] {
+        app.key_event(alt('p'));
+        type_text(&mut app, "dark");
+        app.key_event(cancel);
+        assert!(app.palette.is_none());
+        assert_eq!(app.theme.name, "review-classic");
+        assert_eq!(app.status, "kept");
+        assert_eq!(
+            (
+                app.focus,
+                app.cursor,
+                app.top,
+                app.left,
+                app.selected,
+                app.preview.as_ref().unwrap().lines.clone(),
+            ),
+            view
+        );
+    }
+    // No match: Enter keeps the palette open and changes nothing.
+    app.key_event(alt('p'));
+    type_text(&mut app, "zzz");
+    assert!(palette_texts(&app).is_empty());
+    app.key(KeyCode::Enter);
+    assert!(app.palette.is_some());
+    assert_eq!(app.status, "kept");
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(text.contains("No matching commands"), "{text}");
+    app.key(KeyCode::Esc);
+    // Selection moves with arrows and Ctrl-N/Ctrl-P, clamps and resets on edits.
+    app.key_event(alt('p'));
+    type_text(&mut app, "gruvbox");
+    let gruvbox = palette_texts(&app);
+    assert_eq!(gruvbox[0], "colorscheme gruvbox-baby");
+    let selected = |app: &App| app.palette.as_ref().unwrap().selected;
+    app.key(KeyCode::Up);
+    assert_eq!(selected(&app), 0);
+    app.key(KeyCode::Down);
+    app.key_event(ctrl('n'));
+    assert_eq!(selected(&app), 2);
+    app.key_event(ctrl('p'));
+    assert_eq!(selected(&app), 1);
+    for _ in 0..gruvbox.len() + 3 {
+        app.key(KeyCode::Down);
+    }
+    assert_eq!(selected(&app), gruvbox.len() - 1);
+    app.key(KeyCode::Backspace);
+    assert_eq!(selected(&app), 0);
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Char('x'));
+    assert_eq!(selected(&app), 0);
+    app.key(KeyCode::Backspace);
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Enter);
+    assert_eq!(app.theme.name, "gruvbox-dark");
+    assert_eq!(
+        app.status,
+        "appearance.colorscheme=gruvbox-dark (this session only)"
+    );
+    run_command(&mut app, "colorscheme gruvbox-baby");
+    assert_eq!(colors(app.preview.as_ref().unwrap()), default);
+    // Query text never reaches other actions; the 256-byte cap holds.
+    app.key_event(alt('p'));
+    type_text(&mut app, "mqa:");
+    assert!(app.command.is_none());
+    type_text(&mut app, &"x".repeat(300));
+    assert_eq!(app.palette.as_ref().unwrap().query.len(), 256);
+    app.key(KeyCode::Esc);
+    assert_eq!(app.marks, marks);
+    assert_eq!(std::fs::read(&app.store.path).unwrap(), store);
+    assert!(app.preview.is_some());
+    // The quit sequence quits; a failed quit prefix becomes query text.
+    app.key_event(alt('p'));
+    app.key(KeyCode::Char(','));
+    app.key(KeyCode::Char('x'));
+    assert_eq!(app.palette.as_ref().unwrap().query, ",x");
+    assert!(!app.key(KeyCode::Char(',')));
+    assert!(app.key(KeyCode::Char('q')));
+}
+
+#[test]
+fn palette_is_modal_and_opening_clears_pending_keys() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    screen(&mut app, 100, 24);
+    // A pending count is dropped when the palette opens.
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    app.cursor = (0, 0);
+    app.key(KeyCode::Char('3'));
+    app.key_event(alt('p'));
+    assert!(app.palette.is_some());
+    assert!(!app.bindings.pending());
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Char('j'));
+    assert_eq!(app.cursor.0, 1);
+    app.key(KeyCode::Char('q'));
+    assert!(app.preview.is_none());
+    let selected = app.selected;
+    let offset = app.file_offset;
+    app.key_event(alt('p'));
+    let area = app.file_area;
+    app.mouse(
+        mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 1,
+            area.y + 1,
+        ),
+        std::time::Instant::now(),
+    );
+    app.mouse(
+        mouse_event(
+            crossterm::event::MouseEventKind::ScrollDown,
+            area.x + 1,
+            area.y + 1,
+        ),
+        std::time::Instant::now(),
+    );
+    assert_eq!((app.selected, app.file_offset), (selected, offset));
+    assert!(app.palette.is_some());
+    app.key(KeyCode::Esc);
+    // The same click acts once the palette is closed.
+    app.mouse(
+        mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            area.x + 1,
+            area.y + 1,
+        ),
+        std::time::Instant::now(),
+    );
+    assert_eq!(app.selected, 1);
+}
+
+#[test]
+fn palette_renders_a_floating_box_with_cursor_and_selection() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    let before = screen(&mut app, 100, 24);
+    app.key_event(alt('p'));
+    type_text(&mut app, "classic");
+    app.key(KeyCode::Down);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let row = |y: u16| -> String {
+        (0..100)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    };
+    // 90x16 box centered on 100x24: x 5..95, y 4..20.
+    assert!(row(4).contains("┌ Command palette "), "{}", row(4));
+    assert_eq!(buffer[(5, 4)].fg, app.theme.border_focused);
+    assert!(
+        row(19).contains(" enter run · esc cancel · ↑/↓ select "),
+        "{}",
+        row(19)
+    );
+    assert!(row(5)[..].contains("│> classic "), "{}", row(5));
+    terminal
+        .backend_mut()
+        .assert_cursor_position((6 + "> classic".len() as u16, 5));
+    assert!(
+        row(6).contains("│colorscheme review-classic  show or switch"),
+        "{}",
+        row(6)
+    );
+    assert!(
+        row(7).contains("│set appearance.colorscheme=review-classic  color theme"),
+        "{}",
+        row(7)
+    );
+    // The selected row is highlighted across the inner width; others are not.
+    let selection = app.theme.selection;
+    assert!(!selection.add_modifier.is_empty());
+    for x in 6..94 {
+        assert!(
+            buffer[(x, 7)].modifier.contains(selection.add_modifier),
+            "{x}"
+        );
+        assert!(
+            !buffer[(x, 6)].modifier.contains(selection.add_modifier),
+            "{x}"
+        );
+    }
+    assert_ne!(buffer[(6, 6)].style(), buffer[(6, 7)].style());
+    assert!(!row(8).contains("colorscheme"), "{}", row(8));
+    // The selection scrolls into view in a long list.
+    app.palette = Some(commands::Palette::default());
+    for _ in 0..30 {
+        app.key(KeyCode::Down);
+    }
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(
+        text.contains(&format!("colorscheme {}", theme::Theme::names()[29])),
+        "{text}"
+    );
+    assert!(!text.contains("colorscheme 1337"), "{text}");
+    // Escape restores the screen behind it.
+    app.key(KeyCode::Esc);
+    assert_eq!(screen(&mut app, 100, 24), before);
+    // Too small terminals skip drawing without panicking.
+    app.key_event(alt('p'));
+    for (width, height) in [(1, 1), (6, 6), (7, 7), (20, 8)] {
+        screen(&mut app, width, height);
+    }
+    app.key(KeyCode::Esc);
+}
+
+#[test]
+fn palette_opens_in_both_keymaps_and_rebinds() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key_event(alt('p'));
+    assert!(app.palette.is_some());
+    app.key(KeyCode::Esc);
+    assert!(
+        keybindings::Bindings::default()
+            .help()
+            .contains("command_palette: alt-p\n")
+    );
+    // Emacs: alt-p opens it; ctrl-p stays cursor up.
+    app.bindings = config::Config::parse("[features]\nkeymap = 'emacs'\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key_event(ctrl('n'));
+    assert_eq!(app.selected, 1);
+    app.key_event(ctrl('p'));
+    assert_eq!(app.selected, 0);
+    assert!(app.palette.is_none());
+    app.key_event(alt('p'));
+    assert!(app.palette.is_some());
+    app.key(KeyCode::Esc);
+    // The footer legend is unchanged.
+    assert!(!app.bindings.legend().contains("alt-p"));
+    // Rebound and disabled like any other action.
+    app.bindings = config::Config::parse("[keybindings]\ncommand_palette = 'ctrl-k'\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key_event(alt('p'));
+    assert!(app.palette.is_none());
+    app.key_event(ctrl('k'));
+    assert!(app.palette.is_some());
+    app.key(KeyCode::Esc);
+    app.bindings = config::Config::parse("[keybindings]\ncommand_palette = ''\n")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    assert!(
+        app.bindings
+            .help()
+            .contains("command_palette: (disabled)\n")
+    );
+    app.key_event(alt('p'));
+    assert!(app.palette.is_none());
+    let help = help(None, None).unwrap();
+    assert!(
+        help.contains(
+            "Command palette (command_palette): type to filter, Up/Down select, Enter runs, Escape cancels.\n"
+        ),
+        "{help}"
+    );
+}
+
 #[test]
 fn appearance_config_selects_and_validates_the_startup_theme() {
     assert_eq!(

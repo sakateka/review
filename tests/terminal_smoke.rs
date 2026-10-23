@@ -546,6 +546,110 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     session.wait_text("appearance.colorscheme=gruvbox-baby");
     session.send(b",q");
     session.finish(0);
+    // Command palette: alt-p filters registry entries and runs them through the
+    // command line's execution; cancelling leaves the view and theme untouched.
+    let palette_state = ctx.state_snapshot();
+    let palette_repo = ctx.repo_snapshot();
+    let mut session = ctx.default_session();
+    session.wait_text("Files");
+    session.send(b"\r");
+    session.wait_text("+fn caller()");
+    assert_eq!(
+        token_color(&session, "+fn caller()", "fn"),
+        rgb(251, 73, 52)
+    );
+    session.send(b"\x1bp");
+    session.wait_text(" Command palette ");
+    session.wait_text(" enter run · esc cancel · ↑/↓ select ");
+    session.send(b"classic");
+    session.wait_text("> classic");
+    session.wait_text("set appearance.colorscheme=review-classic");
+    let (query_column, query_row) = locate(&session, "> classic");
+    assert_eq!(
+        cursor(&session),
+        (query_row as i64, (query_column + "> classic".len()) as i64)
+    );
+    session.send(b"\r");
+    session.wait_text("appearance.colorscheme=review-classic (this session only)");
+    assert!(
+        !session.text().contains(" Command palette "),
+        "{}",
+        session.text()
+    );
+    assert!(
+        status_row(&session)
+            .starts_with("appearance.colorscheme=review-classic (this session only)"),
+        "{}",
+        session.text()
+    );
+    assert_eq!(
+        token_color(&session, "+fn caller()", "fn"),
+        idx(5),
+        "{}",
+        session.text()
+    );
+    let before_cancel = session.text();
+    session.send(b"\x1bp");
+    session.wait_text(" Command palette ");
+    session.send(b"dark");
+    session.wait_text("> dark");
+    session.send(b"\x1b");
+    assert!(
+        !session.text().contains(" Command palette "),
+        "{}",
+        session.text()
+    );
+    assert_eq!(session.text(), before_cancel);
+    assert!(
+        session.text().contains("┌Diff"),
+        "Escape in the palette closed the diff"
+    );
+    assert_eq!(token_color(&session, "+fn caller()", "fn"), idx(5));
+    session.send(b",q");
+    session.finish(0);
+    let mut session = ctx.session(&["--keymap", "emacs", "--", "HEAD"]);
+    session.wait_text("Files");
+    session.send(b"\r");
+    session.wait_text("+fn caller()");
+    session.send(b"\x1bp");
+    session.wait_text(" Command palette ");
+    session.send(b"appearance");
+    session.wait_text("set appearance.colorscheme=1337");
+    assert!(
+        !session.text().contains("│colorscheme "),
+        "{}",
+        session.text()
+    );
+    // Esc cancels once without running anything.
+    session.send(b"\x1b");
+    assert!(
+        !session.text().contains(" Command palette "),
+        "{}",
+        session.text()
+    );
+    session.send(b"\x1bp");
+    session.wait_text(" Command palette ");
+    session.send(b"appearance classic");
+    session.wait_text("set appearance.colorscheme=review-classic");
+    // Ctrl-N is clamped on the single match.
+    session.send(b"\x0e\r");
+    session.wait_text("appearance.colorscheme=review-classic (this session only)");
+    assert_eq!(token_color(&session, "+fn caller()", "fn"), idx(5));
+    session.send(b"\x1bp");
+    session.wait_text(" Command palette ");
+    session.send(b"\x03");
+    session.finish(0);
+    assert_same(
+        &palette_state,
+        &ctx.state_snapshot(),
+        "command palette changed review state",
+    );
+    assert_same(
+        &palette_repo,
+        &ctx.repo_snapshot(),
+        "command palette changed repository bytes",
+    );
+    pty_passed("command palette");
     // Default-theme Rust captured source view and YAML/TOML diffs and source.
     assert_same(
         &ctx.before,

@@ -1,5 +1,11 @@
 use crate::keybindings::{Action, Bindings, Keymap, Resolution};
-use crate::{commands::CommandLine, git::Capture, preview::Preview, state::Store, theme::Theme};
+use crate::{
+    commands::{CommandLine, Palette},
+    git::Capture,
+    preview::Preview,
+    state::Store,
+    theme::Theme,
+};
 use crate::{
     navigation::{Candidate, Operation, Request, Worker},
     source::ComparedSide,
@@ -45,6 +51,7 @@ pub struct App {
     pub bindings: Bindings,
     pub theme: Theme,
     pub command: Option<CommandLine>,
+    pub palette: Option<Palette>,
     pub comments: crate::comments::Store,
     /// Display row where an active line-range selection started.
     pub selection: Option<usize>,
@@ -136,6 +143,7 @@ impl App {
             bindings: Bindings::default(),
             theme,
             command: None,
+            palette: None,
             comments,
             selection: None,
             editor: None,
@@ -237,8 +245,9 @@ impl App {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
-        // The comment editor is modal; the mouse never acts behind it.
-        if self.editor.is_some() {
+        // The comment editor and the command palette are modal; the mouse
+        // never acts behind them.
+        if self.editor.is_some() || self.palette.is_some() {
             return;
         }
         let point = ratatui::layout::Position::new(mouse.column, mouse.row);
@@ -323,6 +332,9 @@ impl App {
         }
         if self.command.is_some() {
             return self.command_key(key);
+        }
+        if self.palette.is_some() {
+            return self.palette_key(key);
         }
         if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
             let held = self.bindings.pending_keys().to_vec();
@@ -427,6 +439,10 @@ impl App {
             CommandLine => {
                 self.bindings.clear();
                 self.command = Some(crate::commands::CommandLine::default());
+            }
+            CommandPalette => {
+                self.bindings.clear();
+                self.palette = Some(Palette::default());
             }
             CloseOrQuit
                 if self.documentation
@@ -681,6 +697,56 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 command.push(c);
+            }
+            _ => {}
+        }
+        false
+    }
+
+    /// Route a key to the open command palette; returns true to quit.
+    fn palette_key(&mut self, key: KeyEvent) -> bool {
+        let held = self.bindings.pending_keys().to_vec();
+        match self.bindings.resolve_quit(key) {
+            Resolution::Action(Action::Quit) => return true,
+            Resolution::Pending => return false,
+            _ => {}
+        }
+        let Some(palette) = &mut self.palette else {
+            return false;
+        };
+        // A failed global quit prefix remains literal query text.
+        for held_key in held {
+            if let KeyCode::Char(c) = held_key.code
+                && !held_key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                palette.push(c);
+            }
+        }
+        self.motion_count = 0;
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Char('g') if control => self.palette = None,
+            KeyCode::Enter => {
+                // Without a match the palette stays open.
+                if let Some(text) = palette.selected_text() {
+                    self.palette = None;
+                    crate::commands::execute(self, &text);
+                }
+            }
+            KeyCode::Backspace => palette.pop(),
+            KeyCode::Up => palette.move_selection(-1),
+            KeyCode::Down => palette.move_selection(1),
+            KeyCode::Char('p') if control => palette.move_selection(-1),
+            KeyCode::Char('n') if control => palette.move_selection(1),
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                palette.push(c);
             }
             _ => {}
         }

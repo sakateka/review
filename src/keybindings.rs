@@ -44,7 +44,7 @@ actions! {
     PreviewDefinition => "preview_definition",
     ToggleAfterChanges => "toggle_after_changes",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
-    CommandLine => "command_line",
+    CommandLine => "command_line", CommandPalette => "command_palette",
     Comment => "comment", SelectRange => "select_range", DeleteComment => "delete_comment",
 }
 #[derive(Clone)]
@@ -130,6 +130,7 @@ impl Bindings {
             (PageUp, &["ctrl-b"]),
             (PageDown, &["ctrl-f"]),
             (CommandLine, &[":"]),
+            (CommandPalette, &["alt-p"]),
             (SelectRange, &["v"]),
         ];
         let emacs: &[(Action, &[&str])] = &[
@@ -149,6 +150,7 @@ impl Bindings {
             (PageDown, &["ctrl-v"]),
             (PageUp, &["alt-v"]),
             (CommandLine, &["alt-x"]),
+            (CommandPalette, &["alt-p"]),
             (SelectRange, &["ctrl-space"]),
         ];
         for (action, labels) in
