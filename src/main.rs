@@ -4,6 +4,7 @@ mod comments;
 mod config;
 mod git;
 mod keybindings;
+mod layouts;
 mod motion;
 mod navigation;
 mod preview;
@@ -19,7 +20,7 @@ mod ui;
 use anyhow::{Result, bail};
 use std::{ffi::OsString, io::IsTerminal};
 
-const HELP: &str = "review [--help | --version] [--keymap vim|emacs] [--config PATH] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\nConfigure [features] keymap/readline, [appearance] colorscheme and [keybindings]\naction=\"key\" in --config or $XDG_CONFIG_HOME/review/config.toml (fallback $HOME/.config/review/config.toml).\nCLI keymap overrides config. Overrides replace all defaults; \"\" disables an action.\nKeys: characters, named keys (enter, esc, space, down), ctrl-/alt- chords, sequences (gd).\n\n";
+const HELP: &str = "review [--help | --version] [--keymap vim|emacs] [--config PATH] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\nConfigure [features] keymap/readline, [appearance] colorscheme, [keyboard] layouts/langmap\nand [keybindings] action=\"key\" in --config or $XDG_CONFIG_HOME/review/config.toml (fallback $HOME/.config/review/config.toml).\nCLI keymap overrides config. Overrides replace all defaults; \"\" disables an action.\nKeys: characters, named keys (enter, esc, space, down), ctrl-/alt- chords, sequences (gd).\n\n";
 
 fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -> Result<String> {
     let loaded = config::Config::load(config)?;
@@ -33,6 +34,10 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
     if bindings.keymap == keybindings::Keymap::Vim {
         text.push_str("Vim counts repeat configured motions and line jumps.\n");
     }
+    text.push_str(&format!(
+        "\nKeyboard layouts: an unbound non-ASCII shortcut key acts as the US English key at the same\nposition (like Vim langmap), e.g. Russian о is j and бй is ,q; text inputs stay verbatim.\n[keyboard] layouts = [\"ru\", \"uk\", \"be\"] (default; [] disables; available: {}) and\n[keyboard] langmap = \"оj,лk\" or \"ОЛ;jk\" (Vim syntax, overrides built-ins).\nKeys that already type ASCII are not translated (ЙЦУКЕН's / key types .); bind\nsearch_symbols = \".\" yourself if wanted (it replaces /). Labels show the configured\nkeys and are never translated.\n",
+        layouts::NAMES.join(", ")
+    ));
     text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nLocal startup and go-to-definition/references timings (no paths or names) are appended to\ntelemetry.jsonl there; [telemetry] enabled = false in the config turns them off.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nReviewing requires system Git and an interactive terminal.\n");
     text.push_str(
         "\nCommand line (command_line): Enter runs, Escape cancels, Tab/Shift-Tab complete.\n",

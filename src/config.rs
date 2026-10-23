@@ -14,6 +14,24 @@ pub struct Config {
     pub appearance: Appearance,
     pub keybindings: BTreeMap<String, String>,
     pub telemetry: Telemetry,
+    pub keyboard: Keyboard,
+}
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Keyboard {
+    pub layouts: Vec<String>,
+    pub langmap: String,
+}
+impl Default for Keyboard {
+    fn default() -> Self {
+        Self {
+            layouts: crate::layouts::DEFAULT
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            langmap: String::new(),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -82,10 +100,12 @@ impl Config {
         })
     }
     pub fn bindings(&self, cli: Option<Keymap>) -> Result<Bindings> {
+        let langmap = crate::layouts::langmap(&self.keyboard.layouts, &self.keyboard.langmap)?;
         Bindings::new(
             cli.unwrap_or(self.features.keymap),
             self.features.readline,
             &self.keybindings,
         )
+        .map(|bindings| bindings.with_langmap(langmap))
     }
 }

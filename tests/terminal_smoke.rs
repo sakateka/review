@@ -286,6 +286,7 @@ fn terminal_smoke() {
     comments(&ctx);
     switch_file_diffs(&ctx);
     local_telemetry(&ctx);
+    keyboard_layouts(&ctx);
 
     let suffix = if ctx.test_binary.is_some() {
         ", injected panic/I/O failure"
@@ -2921,4 +2922,141 @@ fn local_telemetry(ctx: &Ctx) {
     session.finish(0);
     assert_same(&repo_before, &snapshot(&repo), "telemetry repository bytes");
     pty_passed("local telemetry");
+}
+
+fn keyboard_layouts(ctx: &Ctx) {
+    // Story 28: Cyrillic shortcut keys act as the US keys at the same position.
+    let repo = ctx.root.join("layouts");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |words: &[&str]| ctx.git_in(&repo, words);
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Layout acceptance"]);
+    git(&["config", "user.email", "layout@example.invalid"]);
+    write(
+        &repo.join("alpha.rs"),
+        "fn layout_target() {\n    let value = 1;\n}\n",
+    );
+    write(
+        &repo.join("beta.rs"),
+        "fn beta() {\n    layout_target();\n}\n",
+    );
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    write(
+        &repo.join("alpha.rs"),
+        "fn layout_target() {\n    let value = 2;\n}\n",
+    );
+    write(
+        &repo.join("beta.rs"),
+        "fn beta() {\n    layout_target();\n    let beta_changed = 2;\n}\n",
+    );
+    let repo_before = snapshot(&repo);
+    let state_before = ctx.state_snapshot();
+    let comments_file = repo.join("review-HEAD.comments");
+    let config = ctx.root.join("layouts.toml");
+    write(&config, CLASSIC_CONFIG);
+    let config = path_str(&config);
+    let help = ctx.help(&["--config", config, "--help"]);
+    assert!(help.contains("[keyboard] layouts"), "{help}");
+    // An unknown layout is a configuration error before the terminal opens.
+    let bad = ctx.root.join("layouts-bad.toml");
+    write(&bad, "[keyboard]\nlayouts = [\"xx\"]\n");
+    let output = ctx.run(&["--config", path_str(&bad), "--", "HEAD"], Some(&repo));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("\"xx\"") && stderr.contains("ru, uk, be"),
+        "{stderr}"
+    );
+
+    let mut session = ctx.session_in(&repo, &["--config", config, "--", "HEAD"]);
+    closed(&mut session);
+    // о is j: move to beta.rs; ь is m: mark it.
+    session.send("о".as_bytes());
+    session.send("ь".as_bytes());
+    marks(&mut session, &[("alpha.rs", false), ("beta.rs", true)]);
+    // л is k, then Enter opens alpha.rs; о moves inside the diff.
+    session.send("л".as_bytes());
+    session.send(b"\r");
+    session.wait_text("let value = 2;");
+    assert!(
+        !session.text().contains("beta_changed"),
+        "{}",
+        session.text()
+    );
+    let top = cursor(&session);
+    session.send("3о".as_bytes());
+    assert_eq!(cursor(&session).0, top.0 + 3, "{}", session.text());
+    // с is c: the comment editor keeps Cyrillic text verbatim.
+    session.send("с".as_bytes());
+    session.wait_text("Comment · alpha.rs");
+    session.send("привет бй ж".as_bytes());
+    session.wait_text("привет бй ж");
+    session.send(b"\r");
+    session.wait_text("Comment saved");
+    let text = read(&comments_file);
+    assert!(text.contains("привет бй ж"), "{text}");
+    // Ж is the command line; Latin command text runs as usual.
+    session.send("Ж".as_bytes());
+    assert!(status_row(&session).starts_with(':'), "{}", session.text());
+    session.send(b"colorscheme review-classic\r");
+    session.wait_text("appearance.colorscheme=review-classic");
+    // Cyrillic command text stays text; бй typed there does not quit.
+    session.send("Ж".as_bytes());
+    session.send("бй".as_bytes());
+    assert!(
+        status_row(&session).starts_with(":бй"),
+        "{}",
+        session.text()
+    );
+    assert!(session.poll().is_none(), "бй in the command line quit");
+    session.send(b"\x1b");
+    // Escape closes the diff; пв / пк are gd / gr.
+    session.send(b"\x1b");
+    closed(&mut session);
+    session.send(b"/layout_target\r");
+    session.wait_text("results");
+    session.send(b"\r");
+    session.wait_text("Captured old");
+    session.send("пв".as_bytes());
+    session.wait_text("Definitions candidates");
+    session.send(b"\x0f");
+    session.send("пк".as_bytes());
+    session.wait_text("References candidates");
+    session.send(b"\x1b");
+    closed(&mut session);
+    // бй is ,q.
+    session.send("бй".as_bytes());
+    session.finish(0);
+
+    let mut session = ctx.session_in(
+        &repo,
+        &["--config", config, "--keymap", "emacs", "--", "HEAD"],
+    );
+    marks(&mut session, &[("alpha.rs", false), ("beta.rs", true)]);
+    // Alt+ч is Alt-X.
+    session.send("\x1bч".as_bytes());
+    assert!(status_row(&session).starts_with(':'), "{}", session.text());
+    session.send(b"colorscheme\r");
+    session.wait_text("appearance.colorscheme=review-classic");
+    // ь is m in both keymaps.
+    session.send("ь".as_bytes());
+    marks(&mut session, &[("alpha.rs", true), ("beta.rs", true)]);
+    session.send("ь".as_bytes());
+    marks(&mut session, &[("alpha.rs", false), ("beta.rs", true)]);
+    session.send("бй".as_bytes());
+    session.finish(0);
+
+    std::fs::remove_file(&comments_file).unwrap();
+    assert_same(&repo_before, &snapshot(&repo), "keyboard layout repository");
+    let state_after = ctx.state_snapshot();
+    let added: Vec<&String> = state_after
+        .keys()
+        .filter(|path| !state_before.contains_key(*path))
+        .collect();
+    assert_eq!(added.len(), 1, "{added:?}");
+    let mut kept = state_after.clone();
+    kept.remove(added[0]);
+    assert_same(&state_before, &kept, "keyboard layout review state");
+    pty_passed("keyboard layout mapping");
 }

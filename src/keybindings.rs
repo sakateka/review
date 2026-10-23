@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +61,7 @@ pub struct Bindings {
     bindings: Vec<Binding>,
     pending: Vec<KeyEvent>,
     bound_digits: Vec<char>,
+    langmap: HashMap<char, char>,
 }
 pub enum Resolution {
     Action(Action),
@@ -69,7 +70,11 @@ pub enum Resolution {
 }
 impl Default for Bindings {
     fn default() -> Self {
-        Self::new(Keymap::Vim, true, &BTreeMap::new()).expect("valid defaults")
+        Self::new(Keymap::Vim, true, &BTreeMap::new())
+            .expect("valid defaults")
+            .with_langmap(
+                crate::layouts::langmap(crate::layouts::DEFAULT, "").expect("valid layouts"),
+            )
     }
 }
 impl Bindings {
@@ -245,6 +250,7 @@ impl Bindings {
             bindings,
             pending: Vec::new(),
             bound_digits,
+            langmap: HashMap::new(),
         })
     }
     pub fn count_digit(&self, digit: char) -> bool {
@@ -265,8 +271,35 @@ impl Bindings {
     pub fn resolve_quit(&mut self, key: KeyEvent) -> Resolution {
         self.resolve_filtered(key, false, true)
     }
+    /// Translate non-ASCII shortcut characters by physical key position to
+    /// US English; a raw key that matches a binding is never translated.
+    pub fn with_langmap(mut self, langmap: HashMap<char, char>) -> Self {
+        self.langmap = langmap;
+        self
+    }
     fn resolve_filtered(&mut self, key: KeyEvent, buffer: bool, only_quit: bool) -> Resolution {
         self.pending.push(normalize(key));
+        if let Some(resolution) = self.match_pending(buffer, only_quit) {
+            return resolution;
+        }
+        // Typed text (only_quit) stays verbatim; shortcuts fall back to the
+        // US key at the same position when the raw key is unbound.
+        if !only_quit
+            && let KeyCode::Char(c) = key.code
+            && !c.is_ascii()
+            && let Some(&translated) = self.langmap.get(&c)
+        {
+            let mut key = key;
+            key.code = KeyCode::Char(translated);
+            *self.pending.last_mut().expect("pushed key") = normalize(key);
+            if let Some(resolution) = self.match_pending(buffer, only_quit) {
+                return resolution;
+            }
+        }
+        self.pending.clear();
+        Resolution::Unbound
+    }
+    fn match_pending(&mut self, buffer: bool, only_quit: bool) -> Option<Resolution> {
         for binding in &self.bindings {
             if (binding.supplemental && !buffer) || (only_quit && binding.action != Action::Quit) {
                 continue;
@@ -275,13 +308,12 @@ impl Bindings {
                 if binding.keys.len() == self.pending.len() {
                     let action = binding.action;
                     self.pending.clear();
-                    return Resolution::Action(action);
+                    return Some(Resolution::Action(action));
                 }
-                return Resolution::Pending;
+                return Some(Resolution::Pending);
             }
         }
-        self.pending.clear();
-        Resolution::Unbound
+        None
     }
     pub fn label(&self, action: Action) -> String {
         self.bindings

@@ -9876,3 +9876,280 @@ fn telemetry_side_switch_does_not_record_navigation() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["operation"], "definitions");
 }
+
+mod keyboard_layouts {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use keybindings::{Action, Bindings, Keymap, Resolution};
+
+    fn bindings(toml: &str) -> Bindings {
+        config::Config::parse(toml).unwrap().bindings(None).unwrap()
+    }
+
+    fn press(bindings: &mut Bindings, c: char, modifiers: KeyModifiers) -> Resolution {
+        bindings.resolve(KeyEvent::new(KeyCode::Char(c), modifiers), false)
+    }
+
+    /// Resolve every character of `keys`; the last one must produce `expected`.
+    fn sequence(bindings: &mut Bindings, keys: &str) -> Option<Action> {
+        let mut last = None;
+        for c in keys.chars() {
+            last = match press(bindings, c, KeyModifiers::NONE) {
+                Resolution::Action(action) => Some(action),
+                _ => None,
+            };
+        }
+        last
+    }
+
+    #[test]
+    fn russian_table_is_vim_russian_jcukenwin() {
+        let expected: Vec<(char, char)> = [
+            ("йцукенгшщзхъ", "qwertyuiop[]"),
+            ("фывапролджэ", "asdfghjkl;'"),
+            ("ячсмитьбю", "zxcvbnm,."),
+            ("ё", "`"),
+            ("ЙЦУКЕНГШЩЗХЪ", "QWERTYUIOP{}"),
+            ("ФЫВАПРОЛДЖЭ", "ASDFGHJKL:\""),
+            ("ЯЧСМИТЬБЮ", "ZXCVBNM<>"),
+            ("Ё", "~"),
+            ("№", "#"),
+        ]
+        .iter()
+        .flat_map(|(from, to)| {
+            assert_eq!(from.chars().count(), to.chars().count());
+            from.chars().zip(to.chars())
+        })
+        .collect();
+        assert_eq!(layouts::pairs("ru").unwrap(), expected);
+        for name in layouts::NAMES {
+            let pairs = layouts::pairs(name).unwrap();
+            assert!(pairs.iter().all(|(from, _)| !from.is_ascii()), "{name}");
+            assert!(pairs.iter().all(|(_, to)| to.is_ascii()), "{name}");
+            let mut sources: Vec<_> = pairs.iter().map(|(from, _)| *from).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            assert_eq!(sources.len(), pairs.len(), "{name} maps a character twice");
+        }
+        let ukrainian = layouts::pairs("uk").unwrap();
+        for pair in [
+            ('і', 's'),
+            ('ї', ']'),
+            ('є', '\''),
+            ('ґ', '\\'),
+            ('Ї', '}'),
+            ('\u{2bc}', '~'),
+        ] {
+            assert!(ukrainian.contains(&pair), "{pair:?}");
+        }
+        let belarusian = layouts::pairs("be").unwrap();
+        for pair in [('ў', 'o'), ('і', 'b'), ('ы', 's'), ('Ў', 'O')] {
+            assert!(belarusian.contains(&pair), "{pair:?}");
+        }
+        assert!(layouts::pairs("xx").is_none());
+    }
+
+    #[test]
+    fn non_ascii_keys_resolve_as_us_keys() {
+        let mut vim = bindings("");
+        assert!(matches!(
+            press(&mut vim, 'о', KeyModifiers::NONE),
+            Resolution::Action(Action::CursorDown)
+        ));
+        assert_eq!(sequence(&mut vim, "пв"), Some(Action::GoToDefinition));
+        assert_eq!(sequence(&mut vim, "пк"), Some(Action::GoToReferences));
+        assert_eq!(sequence(&mut vim, "пп"), Some(Action::FirstLine));
+        assert_eq!(sequence(&mut vim, "бй"), Some(Action::Quit));
+        assert_eq!(sequence(&mut vim, "ь"), Some(Action::ToggleMark));
+        // Mixed raw and translated keys inside one sequence.
+        assert_eq!(sequence(&mut vim, "gв"), Some(Action::GoToDefinition));
+        assert_eq!(sequence(&mut vim, ",й"), Some(Action::Quit));
+        // Shifted Cyrillic acts as the shifted US key.
+        assert!(matches!(
+            press(&mut vim, 'Ж', KeyModifiers::SHIFT),
+            Resolution::Action(Action::CommandLine)
+        ));
+        assert!(matches!(
+            press(&mut vim, 'Л', KeyModifiers::SHIFT),
+            Resolution::Action(Action::ShowDocumentation)
+        ));
+        // Modifiers are kept.
+        assert!(matches!(
+            press(&mut vim, 'о', KeyModifiers::CONTROL),
+            Resolution::Action(Action::NextFileDiff)
+        ));
+        assert!(matches!(
+            press(&mut vim, 'з', KeyModifiers::ALT),
+            Resolution::Action(Action::CommandPalette)
+        ));
+        // Ukrainian і is s (unbound); ї is ].
+        assert!(matches!(
+            press(&mut vim, 'і', KeyModifiers::NONE),
+            Resolution::Unbound
+        ));
+        assert!(!vim.pending());
+        assert_eq!(sequence(&mut vim, "ї"), Some(Action::NewSide));
+        // Unmapped non-ASCII keys stay unbound and clear the sequence.
+        assert!(matches!(
+            press(&mut vim, 'g', KeyModifiers::NONE),
+            Resolution::Pending
+        ));
+        assert!(matches!(
+            press(&mut vim, 'ä', KeyModifiers::NONE),
+            Resolution::Unbound
+        ));
+        assert!(!vim.pending());
+        // Typed text never translates: the quit path only accepts the raw keys.
+        assert!(matches!(
+            vim.resolve_quit(KeyEvent::new(KeyCode::Char('б'), KeyModifiers::NONE)),
+            Resolution::Unbound
+        ));
+        assert!(!vim.pending());
+
+        let mut emacs = bindings("[features]\nkeymap = 'emacs'");
+        assert!(matches!(
+            press(&mut emacs, 'ч', KeyModifiers::ALT),
+            Resolution::Action(Action::CommandLine)
+        ));
+        assert!(matches!(
+            press(&mut emacs, 'т', KeyModifiers::CONTROL),
+            Resolution::Action(Action::CursorDown)
+        ));
+        // The default Bindings carry the default tables too.
+        assert_eq!(
+            sequence(&mut Bindings::default(), "о"),
+            Some(Action::CursorDown)
+        );
+        assert_eq!(Keymap::Vim, Bindings::default().keymap);
+    }
+
+    #[test]
+    fn layout_configuration_selects_overrides_and_validates() {
+        // A binding on the non-ASCII key itself beats translation.
+        let mut direct = bindings("[keybindings]\ntoggle_mark = 'о'");
+        assert_eq!(sequence(&mut direct, "о"), Some(Action::ToggleMark));
+        assert_eq!(sequence(&mut direct, "j"), Some(Action::CursorDown));
+        assert!(direct.help().contains("toggle_mark: о"));
+        // Disabled built-ins.
+        let mut disabled = bindings("[keyboard]\nlayouts = []");
+        assert_eq!(sequence(&mut disabled, "о"), None);
+        assert_eq!(sequence(&mut disabled, "бй"), None);
+        // Custom pairs and lists.
+        let mut custom = bindings("[keyboard]\nlayouts = []\nlangmap = 'оj'");
+        assert_eq!(sequence(&mut custom, "о"), Some(Action::CursorDown));
+        let mut lists = bindings("[keyboard]\nlayouts = []\nlangmap = 'ОЛ;jk'");
+        assert_eq!(sequence(&mut lists, "О"), Some(Action::CursorDown));
+        assert_eq!(sequence(&mut lists, "Л"), Some(Action::CursorUp));
+        // Escaped separators are literal targets; custom pairs beat built-ins.
+        let mut escaped = bindings("[keyboard]\nlangmap = 'ж\\,,оk'");
+        assert_eq!(sequence(&mut escaped, "жй"), Some(Action::Quit));
+        assert_eq!(sequence(&mut escaped, "о"), Some(Action::CursorUp));
+        // Among built-ins the first listed layout wins.
+        let mut belarusian_first = bindings("[keyboard]\nlayouts = ['be', 'uk']");
+        assert_eq!(
+            sequence(&mut belarusian_first, "і"),
+            Some(Action::WordBackward)
+        );
+        let mut ukrainian_first = bindings("[keyboard]\nlayouts = ['uk', 'be']");
+        assert_eq!(sequence(&mut ukrainian_first, "і"), None);
+        assert_eq!(sequence(&mut ukrainian_first, "ў"), None);
+
+        let error = |toml: &str| {
+            format!(
+                "{:#}",
+                config::Config::parse(toml)
+                    .and_then(|c| c.bindings(None))
+                    .err()
+                    .unwrap_or_else(|| panic!("accepted {toml}"))
+            )
+        };
+        let unknown = error("[keyboard]\nlayouts = ['ru', 'xx']");
+        assert!(
+            unknown.contains("\"xx\"") && unknown.contains("ru, uk, be"),
+            "{unknown}"
+        );
+        for langmap in ["оjk", "о", "ОЛ;j", "ОЛ;jk;x", ";", "оj,", "aб", "о\\"] {
+            let message = error(&format!("[keyboard]\nlangmap = '{langmap}'"));
+            assert!(
+                message.contains("[keyboard] langmap"),
+                "{langmap}: {message}"
+            );
+        }
+        error("[keyboard]\nunknown = true");
+        error("[keyboard]\nlayouts = 'ru'");
+    }
+
+    #[test]
+    fn application_acts_on_cyrillic_shortcuts_and_keeps_text_verbatim() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        assert_eq!(app.selected, 0);
+        app.key(KeyCode::Char('о'));
+        assert_eq!(app.selected, 1);
+        app.key(KeyCode::Char('л'));
+        assert_eq!(app.selected, 0);
+        // A count followed by a translated motion.
+        app.key(KeyCode::Char('3'));
+        app.key(KeyCode::Char('о'));
+        assert_eq!(app.selected, 1);
+        app.key(KeyCode::Char('ь'));
+        assert_eq!(app.marks, [false, true]);
+        assert_eq!(
+            application(directory.path(), state.path()).marks,
+            [false, true]
+        );
+        app.key(KeyCode::Char('ь'));
+        assert_eq!(app.marks, [false, false]);
+        let store = std::fs::read(&app.store.path).unwrap();
+
+        // Command line: Cyrillic is text, and бй does not quit.
+        app.key(KeyCode::Char('Ж'));
+        assert!(app.command.is_some());
+        for c in "привет бй".chars() {
+            assert!(!app.key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.command.as_ref().unwrap().text, "привет бй");
+        app.key(KeyCode::Esc);
+        // Palette filter.
+        app.key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(app.palette.is_some());
+        for c in "привет бй".chars() {
+            assert!(!app.key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.palette.as_ref().unwrap().query, "привет бй");
+        app.key(KeyCode::Esc);
+        // Symbol query.
+        app.key(KeyCode::Char('/'));
+        for c in "привет бй".chars() {
+            assert!(!app.key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.navigation.as_ref().unwrap().query, "привет бй");
+        app.key(KeyCode::Esc);
+        assert!(app.navigation.is_none());
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.marks, [false, false]);
+        assert_eq!(std::fs::read(&app.store.path).unwrap(), store);
+
+        // Comment editor in the diff opened through a translated key.
+        app.key(KeyCode::Char('0'));
+        app.key(KeyCode::Char('л'));
+        app.key(KeyCode::Enter);
+        assert!(app.preview.is_some());
+        app.key(KeyCode::Char('о'));
+        assert_eq!(app.cursor.0, 1);
+        app.key(KeyCode::Char('с'));
+        assert!(app.editor.is_some(), "{}", app.status);
+        for c in "привет бй".chars() {
+            assert!(!app.key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.editor.as_ref().unwrap().text(), "привет бй");
+        app.key(KeyCode::Esc);
+        assert!(app.editor.is_none());
+        assert_eq!(app.marks, [false, false]);
+        // The leader quit sequence quits from Cyrillic.
+        assert!(!app.key(KeyCode::Char('б')));
+        assert!(app.key(KeyCode::Char('й')));
+    }
+}
