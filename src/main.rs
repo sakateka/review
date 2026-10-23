@@ -12,6 +12,7 @@ mod source;
 mod state;
 mod symbols;
 mod syntect;
+mod telemetry;
 mod theme;
 mod ui;
 
@@ -32,7 +33,7 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
     if bindings.keymap == keybindings::Keymap::Vim {
         text.push_str("Vim counts repeat configured motions and line jumps.\n");
     }
-    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nReviewing requires system Git and an interactive terminal.\n");
+    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nLocal startup and go-to-definition/references timings (no paths or names) are appended to\ntelemetry.jsonl there; [telemetry] enabled = false in the config turns them off.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nReviewing requires system Git and an interactive terminal.\n");
     text.push_str(
         "\nCommand line (command_line): Enter runs, Escape cancels, Tab/Shift-Tab complete.\n",
     );
@@ -121,6 +122,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
 }
 
 fn run() -> Result<i32> {
+    telemetry::start();
     let (args, keymap, config) = match parse_args(std::env::args_os().skip(1))? {
         Cli::Help { keymap, config } => {
             print!("{}", help(keymap, config.as_deref())?);
@@ -136,18 +138,34 @@ fn run() -> Result<i32> {
             config,
         } => (args, keymap, config),
     };
+    let phase = std::time::Instant::now();
     let loaded = config::Config::load(config.as_deref())?;
     let bindings = loaded.bindings(keymap)?;
     let theme = loaded.theme()?;
+    let config_time = phase.elapsed();
+    telemetry::init(loaded.telemetry.enabled);
     let cwd = std::env::current_dir()?;
+    let phase = std::time::Instant::now();
     let capture = git::capture(&cwd, &args)?;
+    let capture_time = phase.elapsed();
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("review requires an interactive terminal (use git diff for piped output)");
     }
+    let phase = std::time::Instant::now();
     let store = state::Store::for_session(&capture.cwd, &capture.args)?;
     let mut app = app::App::new(capture, store);
+    let keymap = match bindings.keymap {
+        keybindings::Keymap::Vim => "vim",
+        keybindings::Keymap::Emacs => "emacs",
+    };
     app.bindings = bindings;
     app.set_theme(theme);
+    app.startup = Some(telemetry::Startup {
+        config: config_time,
+        capture: capture_time,
+        app: phase.elapsed(),
+        keymap,
+    });
     ui::run(&mut app)?;
     Ok(app.capture.status.code().unwrap_or(1))
 }

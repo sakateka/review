@@ -156,6 +156,8 @@ pub struct Capture {
     pub cwd: PathBuf,
     pub args: Vec<OsString>,
     pub catalog: crate::source::Catalog,
+    /// Wall time of the single `git diff` comparison command.
+    pub git_diff: std::time::Duration,
 }
 
 pub(crate) fn command(cwd: &Path) -> Command {
@@ -806,11 +808,13 @@ pub(crate) fn capture_with_hook(
     let refs_before = revision_snapshot(cwd, &analysis);
     // Exactly one comparison. Its bytes, diagnostics and actual status survive
     // even when there is no provable mapping, or Git reports findings/errors.
+    let diff_started = std::time::Instant::now();
     let result = command(cwd)
         .args(["--no-pager", "diff"])
         .args(args)
         .output()
         .context("cannot execute system Git")?;
+    let git_diff = diff_started.elapsed();
     after_comparison();
     let refs_after = revision_snapshot(cwd, &analysis);
     let refs_stable = refs_before.is_some() && refs_before == refs_after;
@@ -996,6 +1000,7 @@ pub(crate) fn capture_with_hook(
         diagnostic,
         cwd: cwd.into(),
         args: args.to_vec(),
+        git_diff,
     })
 }
 

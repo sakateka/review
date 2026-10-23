@@ -2,8 +2,12 @@
 use crate::source::{Catalog, ComparedSide};
 use riptags::{FileTags, OccKind, SymKind, SymbolIndex, Tag};
 use std::{
-    sync::mpsc::{self, Receiver, SyncSender},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
+    },
+    time::{Duration, Instant},
 };
 
 pub const MAX_FILE_BYTES: usize = 1024 * 1024;
@@ -32,6 +36,8 @@ pub struct Results {
     pub candidates: Vec<Candidate>,
     pub coverage: String,
     pub documentation: Option<String>,
+    /// Worker time spent on this query alone.
+    pub elapsed: Duration,
 }
 pub struct Request {
     pub generation: u64,
@@ -43,12 +49,16 @@ pub struct Request {
 pub struct Worker {
     sender: SyncSender<Request>,
     receiver: Receiver<Results>,
+    ready: Arc<AtomicBool>,
 }
 impl Worker {
     pub fn start(catalog: Catalog) -> Self {
         let (sender, requests) = mpsc::sync_channel::<Request>(1);
         let (answers, receiver) = mpsc::sync_channel(1);
+        let ready = Arc::new(AtomicBool::new(false));
+        let built = ready.clone();
         std::thread::spawn(move || {
+            let started = Instant::now();
             let analyzed = std::panic::catch_unwind(|| {
                 #[cfg(test)]
                 if std::env::var("REVIEW_TERMINAL_SCENARIO").as_deref() == Ok("worker-panic") {
@@ -56,11 +66,28 @@ impl Worker {
                 }
                 Analysis::build(&catalog)
             });
+            let build = started.elapsed();
+            built.store(true, Ordering::Release);
+            if crate::telemetry::enabled() {
+                let tags = analyzed.as_ref().map_or(0, |analysis| {
+                    analysis
+                        .index
+                        .fresh_files()
+                        .iter()
+                        .map(|file| file.tags.len())
+                        .sum()
+                });
+                crate::telemetry::record(
+                    "analysis",
+                    crate::telemetry::analysis_fields(&catalog, build, tags, analyzed.is_err()),
+                );
+            }
             while let Ok(mut request) = requests.recv() {
                 while let Ok(newer) = requests.try_recv() {
                     request = newer;
                 }
-                let answer = match &analyzed {
+                let started = Instant::now();
+                let mut answer = match &analyzed {
                     Ok(index) => index.query(&catalog, request),
                     Err(_) => Results {
                         generation: request.generation,
@@ -69,14 +96,24 @@ impl Worker {
                         documentation: None,
                         coverage: "Analysis failed (worker panic); basic diff remains available"
                             .into(),
+                        elapsed: Duration::ZERO,
                     },
                 };
+                answer.elapsed = started.elapsed();
                 if answers.send(answer).is_err() {
                     break;
                 }
             }
         });
-        Self { sender, receiver }
+        Self {
+            sender,
+            receiver,
+            ready,
+        }
+    }
+    /// Whether the analysis build has finished (successfully or not).
+    pub fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
     pub fn request(&self, request: Request) -> Result<(), Request> {
         self.sender.try_send(request).map_err(|error| match error {
@@ -301,6 +338,7 @@ impl Analysis {
                 candidates,
                 coverage: format!("{prefix}{}", self.coverage),
                 documentation: None,
+                elapsed: Duration::ZERO,
             };
         }
         if request.operation == Operation::Documentation {
@@ -356,6 +394,7 @@ impl Analysis {
                     .collect(),
                 coverage,
                 documentation,
+                elapsed: Duration::ZERO,
             };
         }
         let mut candidates = Vec::new();
@@ -423,6 +462,7 @@ impl Analysis {
             query: request.query,
             candidates,
             documentation: None,
+            elapsed: Duration::ZERO,
             coverage: format!(
                 "{}{}{}",
                 if unavailable {

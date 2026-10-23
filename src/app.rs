@@ -58,6 +58,10 @@ pub struct App {
     /// Display row where an active line-range selection started.
     pub selection: Option<usize>,
     pub editor: Option<crate::comments::Editor>,
+    /// Startup phase timings, taken by the UI once the first frame is drawn.
+    pub startup: Option<crate::telemetry::Startup>,
+    /// The Definitions/References request whose latency is being measured.
+    timed_navigation: Option<crate::telemetry::PendingNavigation>,
 }
 
 #[derive(Clone)]
@@ -151,6 +155,8 @@ impl App {
             comments,
             selection: None,
             editor: None,
+            startup: None,
+            timed_navigation: None,
             history: Vec::new(),
             capture,
             store,
@@ -1034,6 +1040,23 @@ impl App {
                 "Navigation unavailable: cursor has no mapped captured source position".into();
             return;
         }
+        // Only gd/gr requests are timed, and only when telemetry records them.
+        let timed = match operation {
+            Operation::Definitions => Some("definitions"),
+            Operation::References => Some("references"),
+            _ => None,
+        }
+        .filter(|_| crate::telemetry::enabled() || cfg!(test));
+        let language = timed.and_then(|_| {
+            let origin = position.map(|(source, _, _)| source).or_else(|| {
+                self.navigation
+                    .as_ref()
+                    .and_then(|nav| nav.candidates.get(nav.selected))
+                    .map(|candidate| candidate.source)
+                    .or(self.source)
+            })?;
+            crate::telemetry::source_language(self.capture.catalog.sources.get(origin)?)
+        });
         let target_side = self.side;
         self.side = origin_side;
         self.save_view();
@@ -1052,6 +1075,13 @@ impl App {
         });
         self.focus = Focus::Preview;
         if operation != Operation::Search {
+            self.timed_navigation = timed.map(|operation| crate::telemetry::PendingNavigation {
+                generation: self.generation.wrapping_add(1),
+                operation,
+                submitted: Instant::now(),
+                waited_for_index: !self.worker.ready(),
+                language,
+            });
             self.submit();
         }
     }
@@ -1137,11 +1167,21 @@ impl App {
                 }
             }
             if let Some(nav) = &mut self.navigation {
+                let candidates = results.candidates.len();
                 nav.query = results.query;
                 nav.candidates = results.candidates;
                 nav.coverage = results.coverage;
                 nav.selected = 0;
                 self.render_candidates();
+                if let Some(pending) = self
+                    .timed_navigation
+                    .take_if(|pending| pending.generation == results.generation)
+                {
+                    crate::telemetry::record(
+                        "navigation",
+                        crate::telemetry::navigation_fields(&pending, results.elapsed, candidates),
+                    );
+                }
             }
         }
         if let Some(request) = self.pending.take() {

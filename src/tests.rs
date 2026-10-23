@@ -9629,3 +9629,250 @@ mod switch_file_diffs {
         assert_eq!(app.status, "Wrapped to first file");
     }
 }
+
+fn telemetry_app(directory: &Path, state: &Path) -> App {
+    std::fs::write(directory.join("one.rs"), "fn first() {} fn second() {}\n").unwrap();
+    let mut app = application(directory, state);
+    app.key(KeyCode::Char('/'));
+    for ch in "first".chars() {
+        app.key(KeyCode::Char(ch));
+    }
+    app.key(KeyCode::Enter);
+    await_navigation(&mut app);
+    app.key(KeyCode::Enter);
+    app
+}
+
+fn telemetry_events(name: &str) -> Vec<serde_json::Value> {
+    telemetry::take_captured()
+        .into_iter()
+        .filter(|event| event["event"] == name)
+        .collect()
+}
+
+#[test]
+fn telemetry_records_only_definitions_and_references_navigation() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = telemetry_app(directory.path(), state_dir.path());
+    assert!(telemetry_events("navigation").is_empty(), "search recorded");
+    app.viewport = (1, 1);
+    for _ in 0..14 {
+        app.key(KeyCode::Right);
+    }
+    for (keys, operation) in [("gd", "definitions"), ("gr", "references")] {
+        for ch in keys.chars() {
+            app.key(KeyCode::Char(ch));
+        }
+        await_navigation(&mut app);
+        let candidates = app.navigation.as_ref().unwrap().candidates.len();
+        let events = telemetry_events("navigation");
+        assert_eq!(events.len(), 1, "{keys}: {events:?}");
+        let event = &events[0];
+        assert_eq!(event["v"], 1);
+        assert_eq!(event["operation"], operation);
+        assert_eq!(event["candidates"], candidates);
+        assert_eq!(event["language"], "rust");
+        assert!(event["latency_ms"].as_f64().unwrap() >= 0.0);
+        assert!(event["query_ms"].as_f64().unwrap() >= 0.0);
+        assert!(event["waited_for_index"].is_boolean());
+        let text = event.to_string();
+        for private in ["one.rs", "second", "first", "HEAD"] {
+            assert!(!text.contains(private), "{private} leaked: {text}");
+        }
+        assert!(
+            !text.contains(directory.path().to_str().unwrap()),
+            "path leaked"
+        );
+    }
+    for key in ['K', 'P'] {
+        let mut app = telemetry_app(directory.path(), state_dir.path());
+        app.key(KeyCode::Char(key));
+        await_navigation(&mut app);
+        for _ in 0..100 {
+            app.poll_analysis();
+            std::thread::yield_now();
+        }
+        assert!(telemetry_events("navigation").is_empty(), "{key} recorded");
+    }
+}
+
+#[test]
+fn telemetry_ignores_superseded_navigation_results() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = telemetry_app(directory.path(), state_dir.path());
+    telemetry::take_captured();
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('d'));
+    // Abandon the request before its results arrive.
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Esc);
+    for _ in 0..1000 {
+        app.poll_analysis();
+        std::thread::yield_now();
+    }
+    let events = telemetry_events("navigation");
+    assert!(events.is_empty(), "stale results recorded: {events:?}");
+}
+
+#[test]
+fn telemetry_startup_and_analysis_fields_hold_sizes_only() {
+    let directory = fixture();
+    change(directory.path());
+    let captured = capture(directory.path(), &["HEAD"]);
+    let startup = telemetry::Startup {
+        config: std::time::Duration::from_micros(1500),
+        capture: std::time::Duration::from_millis(3),
+        app: std::time::Duration::from_millis(2),
+        keymap: "vim",
+    };
+    let fields = telemetry::startup_fields(
+        &startup,
+        std::time::Duration::from_millis(1),
+        std::time::Duration::from_millis(9),
+        &captured,
+    );
+    assert_eq!(fields["config_ms"], 1.5);
+    assert_eq!(fields["files"], 2);
+    assert_eq!(fields["added_lines"], 2);
+    assert_eq!(fields["removed_lines"], 2);
+    assert_eq!(fields["patch_bytes"], captured.original.len());
+    assert_eq!(fields["sources"], captured.catalog.sources.len());
+    assert_eq!(fields["structured"], true);
+    assert_eq!(fields["keymap"], "vim");
+    for key in [
+        "capture_ms",
+        "git_diff_ms",
+        "app_ms",
+        "terminal_ms",
+        "first_frame_ms",
+    ] {
+        assert!(fields[key].as_f64().unwrap() >= 0.0, "{key}");
+    }
+    let analysis = telemetry::analysis_fields(
+        &captured.catalog,
+        std::time::Duration::from_millis(4),
+        7,
+        false,
+    );
+    assert_eq!(analysis["tags"], 7);
+    assert_eq!(analysis["panicked"], false);
+    assert_eq!(
+        analysis["languages"]["rust"],
+        captured.catalog.sources.len()
+    );
+    let text = format!(
+        "{}{}",
+        telemetry::record_value("abc", "startup", fields),
+        analysis
+    );
+    for private in [
+        "one.rs",
+        "two.rs",
+        "HEAD",
+        directory.path().to_str().unwrap(),
+    ] {
+        assert!(!text.contains(private), "{private} leaked: {text}");
+    }
+    let original = capture(directory.path(), &["HEAD", "--stat"]);
+    let fields = telemetry::startup_fields(
+        &startup,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        &original,
+    );
+    assert_eq!(fields["structured"], false);
+    assert!(!fields.to_string().contains("--stat"));
+}
+
+#[test]
+fn telemetry_sink_appends_rotates_and_ignores_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("review/telemetry.jsonl");
+    let sink = telemetry::Sink::at(path.clone());
+    sink.append("analysis", serde_json::json!({"tags": 1}))
+        .unwrap();
+    sink.append("analysis", serde_json::json!({"tags": 2}))
+        .unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["tags"], 2);
+    assert_eq!(lines[0]["event"], "analysis");
+    assert_eq!(lines[0]["session"], lines[1]["session"]);
+    assert!(lines[0]["ts"].as_u64().unwrap() > 0);
+    // Rotation: a full log moves to `.1`, replacing an older one.
+    let rotated = directory.path().join("review/telemetry.jsonl.1");
+    std::fs::write(&rotated, "old").unwrap();
+    std::fs::write(&path, vec![b'x'; telemetry::MAX_FILE_BYTES as usize]).unwrap();
+    sink.append("analysis", serde_json::json!({"tags": 3}))
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&rotated).unwrap().len(),
+        telemetry::MAX_FILE_BYTES
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    // Unwritable locations fail without panicking.
+    let blocker = directory.path().join("file");
+    std::fs::write(&blocker, "").unwrap();
+    assert!(
+        telemetry::Sink::at(blocker.join("review/telemetry.jsonl"))
+            .append("analysis", serde_json::json!({}))
+            .is_err()
+    );
+    // Relative or missing state homes resolve to no sink at all.
+    assert_eq!(
+        telemetry::Sink::path_from(Some("relative".into()), Some("/home/x".into())),
+        None
+    );
+    assert_eq!(telemetry::Sink::path_from(None, None), None);
+    assert_eq!(
+        telemetry::Sink::path_from(Some("".into()), Some("/home/x".into())),
+        Some("/home/x/.local/state/review/telemetry.jsonl".into())
+    );
+    assert_eq!(
+        telemetry::Sink::path_from(Some("/state".into()), Some("/home/x".into())),
+        Some("/state/review/telemetry.jsonl".into())
+    );
+    // Without `init` nothing is installed; `init(false)` installs nothing.
+    telemetry::init(false);
+    assert!(!telemetry::enabled());
+}
+
+#[test]
+fn telemetry_config_switch() {
+    assert!(config::Config::parse("").unwrap().telemetry.enabled);
+    assert!(
+        !config::Config::parse("[telemetry]\nenabled = false\n")
+            .unwrap()
+            .telemetry
+            .enabled
+    );
+    assert!(config::Config::parse("[telemetry]\nunknown = 1\n").is_err());
+}
+
+#[test]
+fn telemetry_side_switch_does_not_record_navigation() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let mut app = telemetry_app(directory.path(), state_dir.path());
+    telemetry::take_captured();
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    for side in [']', '['] {
+        app.key(KeyCode::Char(side));
+        await_navigation(&mut app);
+        for _ in 0..100 {
+            app.poll_analysis();
+            std::thread::yield_now();
+        }
+    }
+    let events = telemetry_events("navigation");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["operation"], "definitions");
+}

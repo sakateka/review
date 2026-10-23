@@ -187,9 +187,15 @@ impl Ctx {
         snapshot(&self.repo)
     }
 
+    /// Review state files; local telemetry logs are not review state.
     fn state_snapshot(&self) -> Snapshot {
-        snapshot(&self.state)
+        without_telemetry(snapshot(&self.state))
     }
+}
+
+fn without_telemetry(mut files: Snapshot) -> Snapshot {
+    files.retain(|path, _| !path.starts_with("review/telemetry.jsonl"));
+    files
 }
 
 /// Compare two snapshots, naming only the added, removed and changed paths.
@@ -279,6 +285,7 @@ fn terminal_smoke() {
     marks_invalidation_and_compatibility(&ctx, &acceptance, left, right);
     comments(&ctx);
     switch_file_diffs(&ctx);
+    local_telemetry(&ctx);
 
     let suffix = if ctx.test_binary.is_some() {
         ", injected panic/I/O failure"
@@ -410,7 +417,10 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     }
     session.send(b",q");
     session.finish(0);
-    assert!(!root.join("state").exists(), "YAML viewing changed marks");
+    assert!(
+        ctx.state_snapshot().is_empty(),
+        "YAML viewing changed marks"
+    );
     assert_same(
         &yaml_before,
         &ctx.repo_snapshot(),
@@ -456,7 +466,10 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     session.wait_text("Files");
     session.send(b",q");
     session.finish(0);
-    assert!(!root.join("state").exists(), "TOML viewing changed marks");
+    assert!(
+        ctx.state_snapshot().is_empty(),
+        "TOML viewing changed marks"
+    );
     assert_same(
         &toml_before,
         &ctx.repo_snapshot(),
@@ -758,7 +771,10 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     }
     ctx.git_run(&["commit", "-qm", "remove theme fixtures"]);
     ctx.before = ctx.repo_snapshot();
-    assert!(!root.join("state").exists(), "theme commands changed marks");
+    assert!(
+        ctx.state_snapshot().is_empty(),
+        "theme commands changed marks"
+    );
     assert!(
         !ctx.config_file.exists(),
         "theme commands wrote configuration"
@@ -862,7 +878,6 @@ fn syntect_fallback(ctx: &mut Ctx) {
 }
 
 fn navigation_and_lifecycle(ctx: &mut Ctx) {
-    let root = &ctx.root;
     // Installed captured-context toggle: reversible, explicit marks unchanged,
     // source bytes immutable, and ordinary mode restored on reopen/restart.
     let mut session = ctx.default_session();
@@ -881,7 +896,7 @@ fn navigation_and_lifecycle(ctx: &mut Ctx) {
     );
     assert!(session.text().contains("@@"));
     assert!(
-        !root.join("state").exists(),
+        ctx.state_snapshot().is_empty(),
         "toggle must not save review state"
     );
     session.send(b"a");
@@ -2706,4 +2721,204 @@ fn switch_file_diffs(ctx: &Ctx) {
         "file switching review state",
     );
     pty_passed("switch file diffs with Ctrl-J/Ctrl-K");
+}
+
+/// Parsed JSON lines of a telemetry log.
+fn telemetry_lines(path: &Path) -> Vec<serde_json::Value> {
+    read(path)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}")))
+        .collect()
+}
+
+fn local_telemetry(ctx: &Ctx) {
+    // Story 27: local startup/navigation timings; sizes only, never names.
+    let repo = ctx.root.join("telemetry-zqxrepo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |words: &[&str]| ctx.git_in(&repo, words);
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Telemetry acceptance"]);
+    git(&["config", "user.email", "telemetry@example.invalid"]);
+    let file = "zqxfile_unique.rs";
+    let other = "zqxother_unique.rs";
+    let source =
+        "/// zqxdoc text.\nfn zqxsymbol_unique() {}\nfn zqxcaller() { zqxsymbol_unique(); }\n";
+    write(&repo.join(file), source);
+    write(&repo.join(other), "fn zqxother() {}\n");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    write(&repo.join(file), source.replace("{}\nfn", "{ }\nfn"));
+    write(&repo.join(other), "fn zqxother() { }\n");
+    let args = ["--", "-U7", "HEAD", "--", file, other];
+    let repo_before = snapshot(&repo);
+
+    let session_in = |state: &Path, words: &[&str]| {
+        let mut env = ctx.env.clone();
+        for (key, value) in &mut env.vars {
+            if key == "XDG_STATE_HOME" {
+                *value = state.as_os_str().to_owned();
+            }
+        }
+        Session::new(&ctx.binary, words, &repo, &env, None, false)
+    };
+    let session_with = |state: &Path, config: Option<&Path>| {
+        let mut words: Vec<&str> = Vec::new();
+        if let Some(config) = config {
+            words.extend(["--config", path_str(config)]);
+        }
+        words.extend(args);
+        session_in(state, &words)
+    };
+    // gd/gr plus search, documentation and definition preview, then a mark.
+    let workflow = |session: &mut Session| {
+        session.wait_text("Files");
+        session.send(b"/zqxsymbol_unique\r");
+        session.wait_text("Search candidates");
+        session.send(b"\r");
+        session.wait_text(&format!("Captured old {file}"));
+        session.send(b"K");
+        session.wait_text("Function documentation");
+        session.send(b"\x0f");
+        session.wait_text(&format!("Captured old {file}"));
+        session.send(b"P");
+        session.wait_text("Definition preview");
+        session.send(b"\x0f");
+        session.wait_text(&format!("Captured old {file}"));
+        session.send(b"gd");
+        session.wait_text("Definitions candidates");
+        session.send(b"\x0fgr");
+        session.wait_text("References candidates");
+        session.wait_text("1 results");
+        session.send(b"\x1b");
+        session.send(b"\x1b");
+        session.wait_text("Files");
+        session.send(b"m");
+        session.wait_text("Review mark saved");
+        session.send(b",q");
+        session.finish(0);
+    };
+
+    let enabled_state = ctx.root.join("telemetry-state-on");
+    let log = enabled_state.join("review/telemetry.jsonl");
+    let mut session = session_with(&enabled_state, None);
+    workflow(&mut session);
+    let text = read(&log);
+    let lines = telemetry_lines(&log);
+    let events = |name: &str| -> Vec<&serde_json::Value> {
+        lines.iter().filter(|line| line["event"] == name).collect()
+    };
+    assert_eq!(events("startup").len(), 1, "{text}");
+    assert_eq!(events("analysis").len(), 1, "{text}");
+    let navigation = events("navigation");
+    assert_eq!(
+        navigation
+            .iter()
+            .map(|line| line["operation"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["definitions", "references"],
+        "only gd/gr are recorded\n{text}"
+    );
+    assert_eq!(lines.len(), 4, "{text}");
+    for line in &lines {
+        assert_eq!(line["v"], 1);
+        assert!(line["session"].is_string() && line["ts"].is_u64(), "{line}");
+        assert_eq!(line["session"], lines[0]["session"]);
+    }
+    let startup = events("startup")[0];
+    for key in [
+        "config_ms",
+        "capture_ms",
+        "git_diff_ms",
+        "app_ms",
+        "terminal_ms",
+        "first_frame_ms",
+    ] {
+        assert!(startup[key].as_f64().unwrap() >= 0.0, "{key}: {startup}");
+    }
+    assert_eq!(startup["files"], 2, "{startup}");
+    assert_eq!(startup["added_lines"], 2, "{startup}");
+    assert_eq!(startup["removed_lines"], 2, "{startup}");
+    assert_eq!(startup["structured"], true);
+    assert_eq!(startup["keymap"], "vim");
+    for key in ["patch_bytes", "sources", "source_bytes"] {
+        assert!(startup[key].as_u64().unwrap() > 0, "{key}: {startup}");
+    }
+    let analysis = events("analysis")[0];
+    assert_eq!(analysis["panicked"], false);
+    assert_eq!(analysis["languages"]["rust"], startup["sources"]);
+    for key in ["build_ms", "sources", "source_bytes", "tags"] {
+        assert!(analysis[key].is_number(), "{key}: {analysis}");
+    }
+    for line in &navigation {
+        assert_eq!(line["language"], "rust");
+        assert!(line["latency_ms"].as_f64().unwrap() >= 0.0);
+        assert!(line["query_ms"].as_f64().unwrap() >= 0.0);
+        assert!(line["waited_for_index"].is_boolean());
+        assert!(line["candidates"].as_u64().unwrap() >= 1, "{line}");
+    }
+    for private in ["zqx", "-U7", "HEAD", path_str(&repo), path_str(&ctx.root)] {
+        assert!(
+            !text.contains(private),
+            "telemetry leaked {private:?}\n{text}"
+        );
+    }
+    assert_same(&repo_before, &snapshot(&repo), "telemetry repository bytes");
+
+    // Disabled: no file, and review state identical to the enabled run.
+    let disabled_state = ctx.root.join("telemetry-state-off");
+    let config = ctx.root.join("telemetry-off.toml");
+    write(&config, "[telemetry]\nenabled = false\n");
+    let mut session = session_with(&disabled_state, Some(&config));
+    workflow(&mut session);
+    assert!(
+        !disabled_state.join("review/telemetry.jsonl").exists(),
+        "disabled telemetry wrote a log"
+    );
+    let marks = snapshot(&disabled_state);
+    assert!(!marks.is_empty(), "the disabled run saved no mark");
+    assert_same(
+        &without_telemetry(snapshot(&enabled_state)),
+        &marks,
+        "telemetry changed review state",
+    );
+
+    // Original-output mode records an unstructured startup.
+    let mut words = args.to_vec();
+    words.insert(1, "--stat");
+    let mut session = session_in(&enabled_state, &words);
+    session.wait_text("Original Git output");
+    session.send(b",q");
+    session.finish(0);
+    let lines = telemetry_lines(&log);
+    let last = lines
+        .iter()
+        .rfind(|line| line["event"] == "startup")
+        .unwrap();
+    assert_ne!(last["session"], startup["session"]);
+    assert_eq!(last["structured"], false, "{last}");
+    assert!(!read(&log).contains("--stat"));
+
+    // Rotation: a full log moves to `.1` and the new file holds new lines.
+    write(&log, vec![b'x'; 5 * 1024 * 1024]);
+    let mut session = session_with(&enabled_state, None);
+    session.wait_text("Files");
+    session.send(b",q");
+    session.finish(0);
+    let rotated = enabled_state.join("review/telemetry.jsonl.1");
+    assert_eq!(std::fs::metadata(&rotated).unwrap().len(), 5 * 1024 * 1024);
+    assert!(
+        telemetry_lines(&log)
+            .iter()
+            .any(|line| line["event"] == "startup")
+    );
+
+    // Unwritable state home: review still runs and exits normally.
+    let blocked = ctx.root.join("telemetry-blocked");
+    write(&blocked, "");
+    let mut session = session_with(&blocked.join("state"), None);
+    session.wait_text("Files");
+    session.send(b",q");
+    session.finish(0);
+    assert_same(&repo_before, &snapshot(&repo), "telemetry repository bytes");
+    pty_passed("local telemetry");
 }

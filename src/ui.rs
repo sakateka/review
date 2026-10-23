@@ -597,6 +597,7 @@ pub fn run(app: &mut App) -> Result<()> {
         hook: old_hook.clone(),
         signals: Vec::new(),
     };
+    let terminal_started = Instant::now();
     enable_raw_mode()?;
     execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     // Disambiguated key codes distinguish Ctrl+Enter/Shift+Enter from Enter in
@@ -631,9 +632,22 @@ pub fn run(app: &mut App) -> Result<()> {
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let terminal_setup = terminal_started.elapsed();
         loop {
             app.poll_analysis();
             terminal.draw(|frame| draw(frame, app))?;
+            if let Some(startup) = app.startup.take() {
+                let first_frame = crate::telemetry::since_start();
+                crate::telemetry::record(
+                    "startup",
+                    crate::telemetry::startup_fields(
+                        &startup,
+                        terminal_setup,
+                        first_frame,
+                        &app.capture,
+                    ),
+                );
+            }
             #[cfg(test)]
             match std::env::var("REVIEW_TERMINAL_SCENARIO").as_deref() {
                 Ok("panic") => panic!("injected UI panic"),

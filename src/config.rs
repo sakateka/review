@@ -13,6 +13,7 @@ pub struct Config {
     pub features: Features,
     pub appearance: Appearance,
     pub keybindings: BTreeMap<String, String>,
+    pub telemetry: Telemetry,
 }
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -24,6 +25,16 @@ pub struct Features {
 #[serde(default, deny_unknown_fields)]
 pub struct Appearance {
     pub colorscheme: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Telemetry {
+    pub enabled: bool,
+}
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 impl Default for Features {
     fn default() -> Self {
