@@ -33,3 +33,6 @@ tree-sitter-go = "=0.25.0"
 tree-sitter-python = "=0.25.0"
 tree-sitter-zig = "=1.1.2"
 two-face = { version = "=0.5.2", default-features = false, features = ["syntect-fancy"] }
+
+[dev-dependencies]
+libc = "=0.2.191"
