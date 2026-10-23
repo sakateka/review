@@ -8978,3 +8978,315 @@ fn gruvbox_baby_is_the_default_with_orange_black_search_matches() {
             .all(|style| style.fg != Some(Color::Rgb(0, 0, 0)))
     );
 }
+
+fn fallback_fg(view: &preview::Preview, token: &str) -> Option<Color> {
+    let line = view
+        .lines
+        .iter()
+        .find(|line| line.to_string().contains(token))
+        .unwrap_or_else(|| panic!("{token}"));
+    let start = line.to_string().find(token).unwrap();
+    let mut offset = 0;
+    line.spans
+        .iter()
+        .find_map(|span| {
+            let contains = offset <= start && start < offset + span.content.len();
+            offset += span.content.len();
+            contains.then_some(span.style.fg)
+        })
+        .unwrap()
+}
+
+fn fallback_source(name: &str, text: &str, theme: &theme::Theme) -> preview::Preview {
+    let mut catalog = source::Catalog::default();
+    catalog.insert(
+        source::ComparedSide::New,
+        name.as_bytes().to_vec(),
+        text.as_bytes().to_vec(),
+    );
+    preview::Preview::source(&catalog.sources[0], theme)
+}
+
+#[test]
+fn syntect_scope_mapping_prefers_innermost_scope_and_longest_prefix() {
+    use two_face::re_exports::syntect::parsing::Scope;
+    let scopes = |names: &[&str]| -> Vec<Scope> {
+        names.iter().map(|name| Scope::new(name).unwrap()).collect()
+    };
+    let capture = |name| theme::capture(name);
+    for (stack, expected) in [
+        (
+            &["source.js", "comment.line.double-slash.js"][..],
+            capture("comment"),
+        ),
+        (&["source.js", "storage.type.js"], capture("type")),
+        (
+            &["source.js", "storage.type.function.js"],
+            capture("keyword"),
+        ),
+        (&["source.js", "storage.type.class.js"], capture("keyword")),
+        (&["source.js", "storage.modifier.js"], capture("keyword")),
+        (&["source.js", "storage.js"], capture("keyword")),
+        (&["source.js", "keyword.operator.js"], capture("operator")),
+        (&["source.js", "keyword.control.js"], capture("keyword")),
+        (
+            &["source.js", "constant.language.boolean.true.js"],
+            capture("boolean"),
+        ),
+        (
+            &["source.js", "constant.language.null.js"],
+            capture("constant"),
+        ),
+        (
+            &["source.js", "constant.numeric.integer.js"],
+            capture("number"),
+        ),
+        (
+            &["source.js", "variable.other.property.js"],
+            capture("property"),
+        ),
+        (&["source.js", "variable.function.js"], capture("function")),
+        (
+            &["source.js", "variable.other.readwrite.js"],
+            capture("variable"),
+        ),
+        (
+            &["text.html.markdown", "markup.heading.1.markdown"],
+            capture("keyword"),
+        ),
+        (
+            &["text.html.markdown", "markup.underline.link.markdown"],
+            capture("string.special"),
+        ),
+        (
+            &["text.html.markdown", "markup.raw.inline.markdown"],
+            capture("string"),
+        ),
+        // Innermost matching scope wins over an outer, longer prefix match.
+        (
+            &[
+                "source.js",
+                "constant.numeric.integer.js",
+                "punctuation.separator.js",
+            ],
+            capture("punctuation"),
+        ),
+        // Within one scope the longest prefix wins: string delimiters keep the
+        // string color, other punctuation inside a string does not.
+        (
+            &[
+                "source.js",
+                "string.quoted.double.js",
+                "punctuation.definition.string.begin.js",
+            ],
+            capture("string"),
+        ),
+        (
+            &[
+                "source.js",
+                "string.quoted.double.js",
+                "punctuation.separator.js",
+            ],
+            capture("punctuation"),
+        ),
+        // Unmatched inner scopes fall through to the next matching outer scope.
+        (
+            &["source.js", "comment.block.js", "meta.unknown.js"],
+            capture("comment"),
+        ),
+        (&["source.js", "meta.block.js"], None),
+        (&[], None),
+    ] {
+        assert_eq!(syntect::capture(&scopes(stack)), expected, "{stack:?}");
+    }
+}
+
+#[test]
+fn syntect_fallback_colors_js_diff_source_view_and_theme_switch() {
+    let directory = fixture();
+    let old = "// note\nfunction hello() { return \"hi\"; }\n";
+    let new = "// note\nfunction hello() { return \"hi\"; } // added\nconst ok = true;\n";
+    std::fs::write(directory.path().join("app.js"), old).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "js"]);
+    std::fs::write(directory.path().join("app.js"), new).unwrap();
+    let captured = capture(directory.path(), &["HEAD"]);
+    assert_eq!(captured.items.len(), 1);
+    let classic = theme::Theme::classic();
+    let diff = preview::Preview::item(directory.path(), &captured.items[0], &classic);
+    assert_eq!(diff.reason, None);
+    for (token, color) in [
+        ("function", Color::Magenta),
+        ("\"hi\"", Color::Green),
+        ("// note", Color::DarkGray),
+        ("// added", Color::DarkGray),
+        ("hello", Color::Blue),
+        ("true", Color::Magenta),
+    ] {
+        assert_eq!(fallback_fg(&diff, token), Some(color), "{token}");
+    }
+    let added = diff
+        .lines
+        .iter()
+        .find(|line| line.to_string().contains("// added"))
+        .unwrap();
+    assert!(added.spans.iter().all(|span| span.style.bg.is_some()));
+    let source = fallback_source("app.js", new, &classic);
+    for (token, color) in [
+        ("function", Color::Magenta),
+        ("\"hi\"", Color::Green),
+        ("// note", Color::DarkGray),
+    ] {
+        assert_eq!(fallback_fg(&source, token), Some(color), "{token}");
+    }
+    for view in [&source, &diff] {
+        for (row, cells) in view.cells.iter().enumerate() {
+            assert_eq!(cells.len(), view.lines[row].width());
+        }
+    }
+
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    assert_eq!(app.theme.name, theme::GRUVBOX_BABY);
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let view = app.preview.as_ref().unwrap();
+    assert_eq!(
+        fallback_fg(view, "function"),
+        Some(Color::Rgb(0xfb, 0x49, 0x34))
+    );
+    assert_eq!(
+        fallback_fg(view, "\"hi\""),
+        Some(Color::Rgb(0x98, 0x97, 0x1a))
+    );
+    assert_eq!(
+        fallback_fg(view, "// note"),
+        Some(Color::Rgb(0x66, 0x5c, 0x54))
+    );
+    run_command(&mut app, "colorscheme review-classic");
+    let view = app.preview.as_ref().unwrap();
+    assert_eq!(fallback_fg(view, "function"), Some(Color::Magenta));
+    assert_eq!(fallback_fg(view, "\"hi\""), Some(Color::Green));
+    assert_eq!(fallback_fg(view, "// note"), Some(Color::DarkGray));
+    assert_eq!(view.lines, diff.lines);
+}
+
+#[test]
+fn syntect_fallback_detects_names_shebangs_and_rejects_plain_text() {
+    let classic = theme::Theme::classic();
+    let makefile = fallback_source("Makefile", "# build\nall:\n\tcc -o app app.c\n", &classic);
+    assert_eq!(fallback_fg(&makefile, "# build"), Some(Color::DarkGray));
+    let dockerfile = fallback_source("Dockerfile", "FROM alpine:3\nRUN true\n", &classic);
+    assert_eq!(fallback_fg(&dockerfile, "FROM"), Some(Color::Magenta));
+    let ruby = fallback_source(
+        "tool",
+        "#!/usr/bin/env ruby\ndef greet\n  puts \"hi\"\nend\n",
+        &classic,
+    );
+    assert_eq!(fallback_fg(&ruby, "def"), Some(Color::Magenta));
+    assert_eq!(fallback_fg(&ruby, "\"hi\""), Some(Color::Green));
+    for name in ["notes.txt", "x.zzz", "tool"] {
+        let view = fallback_source(name, "plain words \"here\" # not code\n", &classic);
+        for token in ["plain", "\"here\"", "# not code"] {
+            assert_eq!(
+                fallback_fg(&view, token),
+                classic.default_fg,
+                "{name} {token}"
+            );
+        }
+    }
+}
+
+#[test]
+fn syntect_fallback_diff_reasons_for_plain_text_and_oversized_sources() {
+    let directory = fixture();
+    let big = format!("// big\n{}", "let value = 1;\n".repeat(20_000));
+    assert!(big.len() > syntect::LIMIT && big.len() < 1024 * 1024);
+    std::fs::write(directory.path().join("notes.txt"), "old\n").unwrap();
+    std::fs::write(directory.path().join("x.zzz"), "old\n").unwrap();
+    std::fs::write(directory.path().join("big.js"), &big).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "plain"]);
+    std::fs::write(directory.path().join("notes.txt"), "new\n").unwrap();
+    std::fs::write(directory.path().join("x.zzz"), "new\n").unwrap();
+    std::fs::write(
+        directory.path().join("big.js"),
+        big.replacen("big", "huge", 1),
+    )
+    .unwrap();
+    let captured = capture(directory.path(), &["HEAD"]);
+    for (name, reason) in [
+        (
+            "notes.txt",
+            "syntax highlighting unavailable for this file type",
+        ),
+        (
+            "x.zzz",
+            "syntax highlighting unavailable for this file type",
+        ),
+        ("big.js", "source exceeds highlighting limit"),
+    ] {
+        let item = captured
+            .items
+            .iter()
+            .find(|item| item.new_path == name.as_bytes())
+            .unwrap();
+        let diff = preview::Preview::item(directory.path(), item, &theme::Theme::classic());
+        assert!(
+            diff.reason
+                .as_deref()
+                .is_some_and(|text| text.contains(reason)),
+            "{name}: {:?}",
+            diff.reason
+        );
+    }
+}
+
+#[test]
+fn syntect_fallback_colors_name_and_shebang_diffs_including_added_files() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("Makefile"),
+        "# build\nall:\n\tcc -o app app.c\n",
+    )
+    .unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "makefile"]);
+    std::fs::write(
+        directory.path().join("Makefile"),
+        "# build\nall:\n\tcc -O2 -o app app.c\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("tool"),
+        "#!/usr/bin/env ruby\ndef greet\n  puts \"hi\"\nend\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("notes.txt"), "plain words\n").unwrap();
+    git_run(directory.path(), &["add", "-N", "tool", "notes.txt"]);
+    let captured = capture(directory.path(), &["HEAD"]);
+    let classic = theme::Theme::classic();
+    let item = |name: &str| {
+        captured
+            .items
+            .iter()
+            .find(|item| item.new_path == name.as_bytes())
+            .unwrap_or_else(|| panic!("{name}"))
+    };
+    let makefile = preview::Preview::item(directory.path(), item("Makefile"), &classic);
+    assert_eq!(makefile.reason, None);
+    assert_eq!(fallback_fg(&makefile, "# build"), Some(Color::DarkGray));
+    let tool = preview::Preview::item(directory.path(), item("tool"), &classic);
+    assert_eq!(tool.reason, None);
+    assert_eq!(fallback_fg(&tool, "def"), Some(Color::Magenta));
+    assert_eq!(fallback_fg(&tool, "\"hi\""), Some(Color::Green));
+    let notes = preview::Preview::item(directory.path(), item("notes.txt"), &classic);
+    assert!(
+        notes
+            .reason
+            .as_deref()
+            .is_some_and(|text| text.contains("syntax highlighting unavailable for this file type")),
+        "{:?}",
+        notes.reason
+    );
+}

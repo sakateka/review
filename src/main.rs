@@ -11,6 +11,7 @@ mod search;
 mod source;
 mod state;
 mod symbols;
+mod syntect;
 mod theme;
 mod ui;
 

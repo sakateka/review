@@ -85,7 +85,8 @@ fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
             tree_sitter_json::LANGUAGE,
             tree_sitter_json::HIGHLIGHTS_QUERY.to_owned(),
         ),
-        _ => anyhow::bail!("syntax highlighting unavailable for this file type"),
+        // Tree-sitter stays authoritative; syntect covers the remaining languages.
+        _ => return crate::syntect::highlight(path, &side.content),
     };
     anyhow::ensure!(
         side.content.len() <= 1024 * 1024,

@@ -265,6 +265,7 @@ fn terminal_smoke() {
     let mut ctx = setup(binary, test_binary, git, root);
 
     colors_themes_and_command_line(&mut ctx);
+    syntect_fallback(&mut ctx);
     navigation_and_lifecycle(&mut ctx);
     config_and_keymaps(&ctx);
     documentation(&ctx);
@@ -782,6 +783,81 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     pty_passed(
         "default theme, command line, completion, runtime theme switching and invalid themes",
     );
+}
+
+fn syntect_fallback(ctx: &mut Ctx) {
+    let repo = ctx.repo.clone();
+    let state = ctx.state.clone();
+    // JavaScript has no embedded tree-sitter grammar: the syntect fallback colors
+    // it through the active theme's capture table. Default theme, no config.
+    std::fs::remove_file(&ctx.config_file).unwrap();
+    let fixture = read(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/js-colors.js"));
+    write(&repo.join("app.js"), &fixture);
+    ctx.git_run(&["add", "app.js"]);
+    ctx.git_run(&["commit", "-qm", "js colors"]);
+    write(&repo.join("app.js"), fixture.replace("\"hi\"", "\"hey\""));
+    let args = ["--", "HEAD", "--", "app.js"];
+    let mut session = ctx.session(&args);
+    session.wait_text("- app.js");
+    session.send(b"m");
+    session.wait_text("Review mark saved");
+    session.wait_text("+ app.js");
+    session.send(b",q");
+    session.finish(0);
+    let repo_before = ctx.repo_snapshot();
+    let state_before = ctx.state_snapshot();
+    let mut session = ctx.session(&args);
+    session.wait_text("+ app.js");
+    session.send(b"\r");
+    let added = "+function hello() { return \"hey\"; } // note";
+    session.wait_text(added);
+    for (token, color) in [
+        ("function", rgb(0xfb, 0x49, 0x34)),
+        ("\"hey\"", rgb(0x98, 0x97, 0x1a)),
+        ("// note", rgb(0x66, 0x5c, 0x54)),
+    ] {
+        assert_eq!(
+            token_color(&session, added, token),
+            color,
+            "{token}\n{}",
+            session.text()
+        );
+    }
+    assert_eq!(
+        token_color(&session, "-function hello() { return \"hi\"; }", "\"hi\""),
+        rgb(0x98, 0x97, 0x1a)
+    );
+    session.send(b":colorscheme review-classic\r");
+    session.wait_text("appearance.colorscheme=review-classic");
+    for (token, color) in [("function", 5), ("\"hey\"", 2), ("// note", 8)] {
+        assert_eq!(
+            token_color(&session, added, token),
+            idx(color),
+            "{token}\n{}",
+            session.text()
+        );
+    }
+    session.send(b"\x1b");
+    session.wait_text("+ app.js");
+    session.send(b",q");
+    session.finish(0);
+    assert_same(
+        &repo_before,
+        &ctx.repo_snapshot(),
+        "JS viewing changed repository bytes",
+    );
+    assert_same(
+        &state_before,
+        &ctx.state_snapshot(),
+        "JS viewing changed review marks",
+    );
+    std::fs::remove_file(repo.join("app.js")).unwrap();
+    ctx.git_run(&["rm", "-q", "--cached", "app.js"]);
+    ctx.git_run(&["commit", "-qm", "remove js fixture"]);
+    ctx.before = ctx.repo_snapshot();
+    std::fs::remove_dir_all(&state).unwrap();
+    write(&ctx.config_file, CLASSIC_CONFIG);
+    pty_passed("syntect fallback highlighting");
 }
 
 fn navigation_and_lifecycle(ctx: &mut Ctx) {
