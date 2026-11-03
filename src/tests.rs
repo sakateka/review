@@ -3799,12 +3799,16 @@ fn source_targets_highlight_every_supported_language_without_changing_cell_maps(
 }
 
 #[test]
-fn vim_definition_jump_is_highlighted_and_footer_keeps_analysis_details_on_demand() {
+fn vim_definition_jump_has_general_help_and_on_demand_analysis_details() {
     use crossterm::event::{KeyEvent, KeyModifiers};
     let directory = fixture();
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.bindings = config::Config::parse("[keybindings]\nanalysis_details = 'D'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
     app.key(KeyCode::Char('/'));
     for ch in "two".chars() {
         app.key(KeyCode::Char(ch));
@@ -3849,6 +3853,12 @@ fn vim_definition_jump_is_highlighted_and_footer_keeps_analysis_details_on_deman
         navigation::Operation::References
     );
     app.key(KeyCode::Char('?'));
+    assert!(app.help.is_some());
+    assert!(app.navigation.is_some());
+    assert!(screen_text(&screen(&mut app, 120, 24)).contains("show_help: ?"));
+    app.key(KeyCode::Esc);
+    assert!(app.help.is_none() && app.navigation.is_some());
+    app.key(KeyCode::Char('D'));
     assert!(screen_text(&screen(&mut app, 120, 24)).contains("Partial name/syntax"));
     assert!(!app.key(KeyCode::Esc));
     assert!(app.preview.is_none());
@@ -4021,6 +4031,12 @@ fn configurable_keymaps_validate_and_replace_every_default() {
         }
         assert!(defaults.help().contains("open_diff_view: enter, space"));
         assert!(defaults.help().contains("toggle_mark: m"));
+        assert!(defaults.help().contains("show_help: ?\n"));
+        assert!(defaults.help().contains("analysis_details: (disabled)\n"));
+        assert!(matches!(
+            defaults.resolve(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), false),
+            Resolution::Action(Action::ShowHelp)
+        ));
         let mut custom =
             config::Config::parse("[keybindings]\nopen_diff_view='o'\ntoggle_mark='space'")
                 .unwrap()
@@ -7493,6 +7509,243 @@ fn ctrl(character: char) -> crossterm::event::KeyEvent {
         KeyCode::Char(character),
         crossterm::event::KeyModifiers::CONTROL,
     )
+}
+
+#[test]
+fn help_defaults_both_keymaps_overrides_and_layout_translation() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    for keymap in ["vim", "emacs"] {
+        app.bindings = config::Config::parse(&format!("[features]\nkeymap = '{keymap}'"))
+            .unwrap()
+            .bindings(None)
+            .unwrap();
+        for dismiss in [
+            crossterm::event::KeyEvent::from(KeyCode::Esc),
+            crossterm::event::KeyEvent::from(KeyCode::Char('q')),
+            crossterm::event::KeyEvent::from(KeyCode::Char('?')),
+        ] {
+            assert!(!app.key(KeyCode::Char('?')));
+            assert!(app.help.is_some());
+            let text = screen_text(&screen(&mut app, 100, 24));
+            assert!(text.contains(" Help "), "{text}");
+            assert!(text.contains("show_help: ?"), "{text}");
+            assert!(text.contains("cursor_down:"), "{text}");
+            assert!(
+                !app.key_event(dismiss),
+                "{keymap} help dismissed the review"
+            );
+            assert!(app.help.is_none() && app.preview.is_none());
+        }
+    }
+
+    app.bindings = config::Config::parse(
+        "[keybindings]\nshow_help = 'H'\ntoggle_mark = 'M'\nanalysis_details = 'D'\ntoggle_after_changes = ''",
+    )
+    .unwrap()
+    .bindings(None)
+    .unwrap();
+    app.key(KeyCode::Char('?'));
+    assert!(
+        app.help.is_none(),
+        "replaced default help key remained active"
+    );
+    app.key(KeyCode::Char('H'));
+    assert!(app.help.is_some());
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(text.contains("show_help: H"), "{text}");
+    let effective = app.bindings.help();
+    assert!(effective.contains("toggle_mark: M\n"), "{effective}");
+    assert!(effective.contains("analysis_details: D\n"), "{effective}");
+    assert!(
+        effective.contains("toggle_after_changes: (disabled)\n"),
+        "{effective}"
+    );
+    app.key(KeyCode::Char('H'));
+    assert!(
+        app.help.is_none(),
+        "configured help key did not toggle help"
+    );
+
+    app.bindings = config::Config::parse("[keyboard]\nlayouts = []\nlangmap = 'ж?'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('ж'));
+    assert!(app.help.is_some(), "layout translation did not open help");
+    app.key(KeyCode::Esc);
+    app.bindings = config::Config::parse("[keybindings]\nshow_help = ''")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    assert!(app.bindings.help().contains("show_help: (disabled)\n"));
+    app.key(KeyCode::Char('?'));
+    assert!(app.help.is_none(), "disabled help action remained active");
+}
+
+#[test]
+fn help_dismissal_clears_pending_quit_and_escape_can_quit() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    for (key, sequence) in [(KeyCode::Char('q'), "q x"), (KeyCode::Char('?'), "? x")] {
+        app.bindings = config::Config::parse(&format!(
+            "[keybindings]\nshow_help = 'H'\nquit = '{sequence}'\nclose_or_quit = ''"
+        ))
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+        app.key(KeyCode::Char('H'));
+        assert!(app.help.is_some());
+        assert!(!app.key(key));
+        assert!(app.help.is_none());
+        assert!(!app.bindings.pending());
+    }
+
+    app.bindings = config::Config::parse("[keybindings]\nquit = 'esc'\nclose_diff_view = ''")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('?'));
+    assert!(app.help.is_some());
+    assert!(app.key(KeyCode::Esc));
+}
+
+#[test]
+fn help_is_modal_and_restores_the_exact_review() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('m'));
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Enter);
+    app.cursor = (2, 1);
+    app.selection = Some(1);
+    let before = screen(&mut app, 100, 24);
+    let review = (
+        app.marks.clone(),
+        app.selected,
+        app.focus,
+        app.cursor,
+        app.top,
+        app.left,
+        app.selection,
+        app.status.clone(),
+        app.preview.as_ref().unwrap().lines.clone(),
+        std::fs::read(&app.store.path).unwrap(),
+    );
+    app.key(KeyCode::Char('?'));
+    assert!(app.help.is_some());
+    let text = screen_text(&screen(&mut app, 100, 24));
+    assert!(text.contains(" Help "), "{text}");
+    for key in [
+        KeyCode::Char('m'),
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::Char(':'),
+        KeyCode::Char('x'),
+    ] {
+        assert!(!app.key(key));
+    }
+    let now = std::time::Instant::now();
+    app.mouse(
+        mouse_event(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            app.file_area.x,
+            app.file_area.y,
+        ),
+        now,
+    );
+    app.mouse(
+        mouse_event(crossterm::event::MouseEventKind::ScrollRight, 2, 2),
+        now,
+    );
+    assert_eq!(app.help.unwrap().scroll, 0);
+    app.mouse(
+        mouse_event(crossterm::event::MouseEventKind::ScrollDown, 2, 2),
+        now,
+    );
+    assert_eq!(app.help.unwrap().scroll, 3);
+    assert_eq!(
+        (
+            app.marks.clone(),
+            app.selected,
+            app.focus,
+            app.cursor,
+            app.top,
+            app.left,
+            app.selection,
+            app.status.clone(),
+            app.preview.as_ref().unwrap().lines.clone(),
+            std::fs::read(&app.store.path).unwrap(),
+        ),
+        review
+    );
+    app.key(KeyCode::Esc);
+    assert!(app.help.is_none());
+    assert_eq!(screen(&mut app, 100, 24), before);
+}
+
+#[test]
+fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    let before = screen(&mut app, 100, 12);
+    app.key(KeyCode::Char('?'));
+    let initial = screen_text(&screen(&mut app, 100, 12));
+    assert!(initial.contains("show_help: ?"), "{initial}");
+    assert!(!initial.contains("arrows/paging"), "{initial}");
+    assert!(!initial.contains("previous_file_diff:"), "{initial}");
+    let viewport = app.help.unwrap().viewport;
+    assert!(viewport > 0 && viewport < app.bindings.help().lines().count());
+    app.key(KeyCode::Char('G'));
+    let bottom = app.bindings.help().lines().count() - viewport;
+    assert_eq!(app.help.unwrap().scroll, bottom);
+    let text = screen_text(&screen(&mut app, 100, 12));
+    assert!(text.contains("previous_file_diff:"), "{text}");
+    app.key(KeyCode::Down);
+    app.mouse(
+        mouse_event(crossterm::event::MouseEventKind::ScrollDown, 50, 5),
+        std::time::Instant::now(),
+    );
+    assert_eq!(app.help.unwrap().scroll, bottom);
+    app.key(KeyCode::Up);
+    assert_eq!(app.help.unwrap().scroll, bottom - 1);
+    for key in [KeyCode::Char('g'), KeyCode::Char('g')] {
+        app.key(key);
+    }
+    assert_eq!(app.help.unwrap().scroll, 0);
+    app.key(KeyCode::PageDown);
+    assert_eq!(app.help.unwrap().scroll, viewport);
+    for size in [(0, 0), (1, 1), (7, 7), (6, 6)] {
+        screen(&mut app, size.0, size.1);
+    }
+    assert_eq!(app.help.unwrap().viewport, 0);
+    screen(&mut app, 100, 12);
+    assert_eq!(app.help.unwrap().viewport, viewport);
+    app.key(KeyCode::Char('?'));
+    assert!(app.help.is_none());
+    assert_eq!(screen(&mut app, 100, 12), before);
+
+    app.bindings = config::Config::parse("[features]\nkeymap = 'emacs'")
+        .unwrap()
+        .bindings(None)
+        .unwrap();
+    app.key(KeyCode::Char('?'));
+    screen(&mut app, 100, 12);
+    app.key_event(ctrl('n'));
+    assert_eq!(app.help.unwrap().scroll, 1);
+    app.key_event(ctrl('p'));
+    assert_eq!(app.help.unwrap().scroll, 0);
+    app.key(KeyCode::Char('q'));
+    assert!(app.help.is_none() && app.preview.is_some());
 }
 
 fn palette_texts(app: &App) -> Vec<String> {

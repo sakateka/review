@@ -274,6 +274,7 @@ fn terminal_smoke() {
     syntect_fallback(&mut ctx);
     navigation_and_lifecycle(&mut ctx);
     config_and_keymaps(&ctx);
+    help_popup(&ctx);
     documentation(&ctx);
     previews(&ctx);
     quitting(&ctx);
@@ -1219,6 +1220,104 @@ fn config_and_keymaps(ctx: &Ctx) {
     );
 }
 
+fn help_popup(ctx: &Ctx) {
+    let repo_before = ctx.repo_snapshot();
+    let state_before = ctx.state_snapshot();
+    for style in ["vim", "emacs"] {
+        let mut session = ctx.session(&["--keymap", style, "--", "HEAD"]);
+        session.wait_text("Files");
+        let origin = session.text();
+        for (index, dismiss) in [b"?".as_slice(), b"q", b"\x1b"].into_iter().enumerate() {
+            session.send(b"?");
+            session.wait_text(" Help ");
+            session.wait_text("show_help: ?");
+            let (help_column, help_row) = locate(&session, " Help ");
+            assert!(help_column > 0 && help_row > 0, "help was not centered");
+            if index == 0 {
+                session.send(b"\x1b[6~\x1b[6~");
+                session.wait_text("previous_file_diff:");
+                for (rows, columns) in [(1, 1), (3, 8), (30, 140)] {
+                    session.resize(rows, columns);
+                }
+                session.wait_text(" Help ");
+            } else {
+                // Actions, clicks and horizontal wheel input never pass through.
+                session.send(b"m\r\t");
+                session.send(&click(2, 2));
+                session.send(&pointer(66, 2, 2, false));
+            }
+            session.send(dismiss);
+            assert_eq!(session.text(), origin, "{style} help lost its origin");
+            assert!(session.poll().is_none(), "help dismissal exited review");
+        }
+        session.send(b"\r");
+        session.wait_text("+fn caller() { main_target(); main_target(); }");
+        session.pump(0.1);
+        let diff_origin = view(&session);
+        session.send(b"?");
+        session.wait_text(" Help ");
+        session.send(b"q");
+        assert_eq!(view(&session), diff_origin, "diff changed behind help");
+        session.send(b"?");
+        session.wait_text(" Help ");
+        session.send(b",q");
+        session.finish(0);
+    }
+
+    let config = ctx.root.join("help.toml");
+    write(
+        &config,
+        "[features]\nkeymap = \"vim\"\n[keybindings]\nshow_help = \"H\"\ntoggle_mark = \"M\"\nanalysis_details = \"D\"\ntoggle_after_changes = \"\"\n",
+    );
+    let config_arg = path_str(&config);
+    let cli_help = ctx.help(&["--config", config_arg, "--help"]);
+    assert!(cli_help.contains("show_help: H\n"));
+    assert!(cli_help.contains("analysis_details: D\n"));
+    let mut session = ctx.session(&["--config", config_arg, "--", "HEAD"]);
+    session.wait_text("Files");
+    let origin = session.text();
+    session.send(b"?");
+    assert_eq!(
+        session.text(),
+        origin,
+        "replaced default help key stayed active"
+    );
+    session.send(b"H");
+    session.wait_text(" Help ");
+    session.wait_text("show_help: H");
+    session.send(b"G");
+    session.wait_text("analysis_details: D");
+    session.wait_text("toggle_after_changes: (disabled)");
+    session.send(b"?");
+    assert_eq!(session.text(), origin, "custom help changed the file list");
+    session.send(b",q");
+    session.finish(0);
+
+    write(&config, "[keybindings]\nshow_help = \"\"\n");
+    let cli_help = ctx.help(&["--config", config_arg, "--help"]);
+    assert!(cli_help.contains("show_help: (disabled)\n"));
+    assert!(cli_help.contains("analysis_details: (disabled)\n"));
+    let mut session = ctx.session(&["--config", config_arg, "--", "HEAD"]);
+    session.wait_text("Files");
+    let origin = session.text();
+    session.send(b"?H");
+    assert_eq!(session.text(), origin, "disabled help action opened");
+    session.send(b",q");
+    session.finish(0);
+    std::fs::remove_file(&config).unwrap();
+    assert_same(
+        &repo_before,
+        &ctx.repo_snapshot(),
+        "help changed repository bytes",
+    );
+    assert_same(
+        &state_before,
+        &ctx.state_snapshot(),
+        "help changed review state",
+    );
+    pty_passed("effective scrollable help popup, dismissal, remapping and read-only state");
+}
+
 fn documentation(ctx: &Ctx) {
     // Captured documentation preserves candidate origin and never writes marks.
     let docs_before = ctx.repo_snapshot();
@@ -1516,7 +1615,15 @@ fn quitting(ctx: &Ctx) {
         session.send(b"q");
         session.finish(0);
     }
-    for context in ["files", "diff", "candidates", "source", "query", "original"] {
+    for context in [
+        "files",
+        "diff",
+        "candidates",
+        "source",
+        "query",
+        "help",
+        "original",
+    ] {
         let mut session = if context == "original" {
             ctx.session(&["--", "--stat", "HEAD"])
         } else {
@@ -1544,13 +1651,17 @@ fn quitting(ctx: &Ctx) {
                 session.send(b"/main");
                 session.wait_text("Search/outline: main");
             }
+            "help" => {
+                session.send(b"?");
+                session.wait_text(" Help ");
+            }
             _ => {}
         }
         session.send(b",q");
         session.finish(0);
     }
     pty_passed(
-        "q closes then exits; leader-q quits from files, diff, candidates, source, query and original output",
+        "q closes then exits; leader-q quits from files, diff, candidates, source, query, help and original output",
     );
 }
 

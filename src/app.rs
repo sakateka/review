@@ -20,6 +20,12 @@ pub enum Focus {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Help {
+    pub scroll: usize,
+    pub viewport: usize,
+}
+
 pub struct App {
     pub capture: Capture,
     pub store: Store,
@@ -54,6 +60,7 @@ pub struct App {
     pub theme: Theme,
     pub command: Option<CommandLine>,
     pub palette: Option<Palette>,
+    pub help: Option<Help>,
     pub comments: crate::comments::Store,
     /// Display row where an active line-range selection started.
     pub selection: Option<usize>,
@@ -152,6 +159,7 @@ impl App {
             theme,
             command: None,
             palette: None,
+            help: None,
             comments,
             selection: None,
             editor: None,
@@ -254,9 +262,34 @@ impl App {
         self.keep_cursor_visible();
     }
 
+    pub fn layout_help(&mut self, viewport: usize, lines: usize) {
+        if let Some(help) = &mut self.help {
+            help.viewport = viewport;
+            help.scroll = help.scroll.min(lines.saturating_sub(viewport));
+        }
+    }
+
+    fn scroll_help(&mut self, rows: isize) {
+        let lines = self.bindings.help().lines().count();
+        if let Some(help) = &mut self.help {
+            help.scroll = help
+                .scroll
+                .saturating_add_signed(rows)
+                .min(lines.saturating_sub(help.viewport));
+        }
+    }
+
     pub fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
-        // The comment editor and the command palette are modal; the mouse
-        // never acts behind them.
+        // Modal surfaces never let the mouse act on the review underneath.
+        if self.help.is_some() {
+            self.last_click = None;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_help(-3),
+                MouseEventKind::ScrollDown => self.scroll_help(3),
+                _ => {}
+            }
+            return;
+        }
         if self.editor.is_some() || self.palette.is_some() {
             return;
         }
@@ -345,6 +378,9 @@ impl App {
         }
         if self.palette.is_some() {
             return self.palette_key(key);
+        }
+        if self.help.is_some() {
+            return self.help_key(key);
         }
         if self.navigation.as_ref().is_some_and(|nav| nav.editing) {
             let held = self.bindings.pending_keys().to_vec();
@@ -446,6 +482,11 @@ impl App {
         let buffer = self.focus == Focus::Preview && self.navigation.is_none();
         match action {
             Quit => return true,
+            ShowHelp => {
+                self.help = Some(Help::default());
+                self.bindings.clear();
+                return false;
+            }
             CommandLine => {
                 self.bindings.clear();
                 self.command = Some(crate::commands::CommandLine::default());
@@ -669,6 +710,73 @@ impl App {
             _ => {}
         }
         self.clamp_scroll();
+        false
+    }
+
+    /// Route a key to the open help popup without dispatching to the review.
+    fn help_key(&mut self, key: KeyEvent) -> bool {
+        self.motion_count = 0;
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let dismissal = plain && matches!(key.code, KeyCode::Char('q' | '?'));
+        let held = self.bindings.pending_keys().to_vec();
+        match self.bindings.resolve_quit(key) {
+            Resolution::Action(Action::Quit) => return true,
+            Resolution::Pending if !dismissal => return false,
+            _ => {}
+        }
+        if key.code == KeyCode::Esc || dismissal {
+            self.help = None;
+            self.bindings.clear();
+            return false;
+        }
+        // A failed quit lookup must not discard an ordinary pending sequence.
+        for held_key in held {
+            self.bindings.resolve(held_key, false);
+        }
+        let resolution = self.bindings.resolve(key, false);
+        if matches!(resolution, Resolution::Pending) {
+            return false;
+        }
+        if matches!(resolution, Resolution::Action(Action::Quit)) {
+            return true;
+        }
+        let Resolution::Action(action) = resolution else {
+            return false;
+        };
+        match action {
+            Action::ShowHelp => {
+                self.help = None;
+            }
+            Action::CursorDown => self.scroll_help(1),
+            Action::CursorUp => self.scroll_help(-1),
+            Action::PageDown | Action::HalfPageDown => {
+                let viewport = self.help.map_or(1, |help| help.viewport.max(1));
+                let rows = if action == Action::HalfPageDown {
+                    (viewport / 2).max(1)
+                } else {
+                    viewport
+                };
+                self.scroll_help(rows as isize);
+            }
+            Action::PageUp | Action::HalfPageUp => {
+                let viewport = self.help.map_or(1, |help| help.viewport.max(1));
+                let rows = if action == Action::HalfPageUp {
+                    (viewport / 2).max(1)
+                } else {
+                    viewport
+                };
+                self.scroll_help(-(rows as isize));
+            }
+            Action::FirstLine => {
+                if let Some(help) = &mut self.help {
+                    help.scroll = 0;
+                }
+            }
+            Action::LastLine => self.scroll_help(isize::MAX),
+            _ => {}
+        }
         false
     }
 
@@ -1223,10 +1331,12 @@ impl App {
         self.left = 0;
         self.cursor = (nav.selected + 2, 0);
         self.status = if nav.coverage.contains("Analysis failed") {
-            format!(
-                "Analysis failed; {} for details",
-                self.bindings.label(Action::AnalysisDetails)
-            )
+            let details = self.bindings.label(Action::AnalysisDetails);
+            if details.is_empty() {
+                "Analysis failed".into()
+            } else {
+                format!("Analysis failed; {details} for details")
+            }
         } else if matches!(
             nav.operation,
             Operation::Documentation | Operation::PreviewDefinition

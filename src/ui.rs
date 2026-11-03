@@ -375,7 +375,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .style(Style::default().fg(app.theme.metrics)),
             status_area,
         );
-        if app.focus == Focus::Preview && total > 0 && app.viewport.0 > 0 && app.viewport.1 > 0 {
+        if app.help.is_none()
+            && app.focus == Focus::Preview
+            && total > 0
+            && app.viewport.0 > 0
+            && app.viewport.1 > 0
+        {
             frame.set_cursor_position((
                 app.preview_area.x + (app.cursor.1 - app.left) as u16,
                 app.preview_area.y + (app.cursor.0 - app.top) as u16,
@@ -426,6 +431,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(editor) = &app.editor {
         draw_editor(frame, editor, &app.theme);
+    }
+    if app.help.is_some() {
+        draw_help(frame, app);
     }
 }
 
@@ -506,6 +514,42 @@ fn draw_palette(
             Rect::new(inner.x, inner.y + 1 + (offset - top) as u16, inner.width, 1),
         );
     }
+}
+
+/// Centered floating help; the active bindings are its only content source.
+fn draw_help(frame: &mut Frame, app: &mut App) {
+    let screen = frame.area();
+    let text = app.bindings.help();
+    let lines = text.lines().count();
+    let width = screen.width.saturating_sub(4).min(90);
+    let height = screen.height.saturating_sub(4).min(24);
+    if width < 3 || height < 3 {
+        app.layout_help(0, lines);
+        return;
+    }
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_focused))
+        .title(" Help ")
+        .title_bottom(" esc/q/? close ");
+    let inner = block.inner(area);
+    app.layout_help(inner.height as usize, lines);
+    let scroll = app.help.expect("help is open").scroll;
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(text).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
 }
 
 /// Centered floating comment editor; owns the terminal cursor while open.

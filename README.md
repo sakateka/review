@@ -63,6 +63,7 @@ Vim keymap (default):
 | `[` / `]` | Old / new side |
 | `:` | Command line, e.g. `:colorscheme Dracula` |
 | `Alt-P` | Command palette |
+| `?` | Scrollable in-app help with the active bindings; `Esc`, `q` or `?` closes it |
 | `Esc` / `q` | Close the view; `q` in the file list quits |
 | `,q` | Quit from anywhere |
 

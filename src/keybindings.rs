@@ -31,6 +31,7 @@ macro_rules! actions {
     }
 }
 actions! {
+    ShowHelp => "show_help",
     CursorDown => "cursor_down", CursorUp => "cursor_up", CursorLeft => "cursor_left", CursorRight => "cursor_right",
     WordForward => "word_forward", WordBackward => "word_backward", WordEnd => "word_end",
     BigWordForward => "big_word_forward", BigWordBackward => "big_word_backward", BigWordEnd => "big_word_end",
@@ -86,6 +87,7 @@ impl Bindings {
         use Action::*;
         let mut bindings = Vec::new();
         let defaults: &[(Action, &[&str])] = &[
+            (ShowHelp, &["?"]),
             (CursorDown, &["down"]),
             (CursorUp, &["up"]),
             (CursorLeft, &["left"]),
@@ -100,7 +102,6 @@ impl Bindings {
             (SearchSymbols, &["/"]),
             (OldSide, &["["]),
             (NewSide, &["]"]),
-            (AnalysisDetails, &["?"]),
             (ShowDocumentation, &["K"]),
             (PreviewDefinition, &["P"]),
             (ToggleMark, &["m"]),

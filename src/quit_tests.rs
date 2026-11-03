@@ -38,21 +38,25 @@ fn q_closes_each_view_before_exiting_in_both_styles() {
 }
 
 #[test]
-fn leader_quit_exits_from_files_preview_candidates_and_query() {
+fn leader_quit_exits_from_files_preview_candidates_query_and_help() {
     let directory = fixture();
     change(directory.path());
-    for context in 0..4 {
+    for context in 0..5 {
         let state = tempfile::tempdir().unwrap();
         let mut app = application(directory.path(), state.path());
         if context >= 1 {
             app.key(KeyCode::Enter);
         }
-        if context >= 2 {
+        if (2..=3).contains(&context) {
             app.key(KeyCode::Char('/'));
         }
         if context == 3 {
             app.key(KeyCode::Enter);
             await_navigation(&mut app);
+        }
+        if context == 4 {
+            app.key(KeyCode::Char('?'));
+            assert!(app.help.is_some());
         }
         let had_preview = app.preview.is_some();
         assert!(!app.key(KeyCode::Char(',')));

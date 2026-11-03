@@ -689,7 +689,8 @@ fn policy_depth(cwd: &Path, analysis: &Analysis, depth: usize) -> Result<()> {
         .stdout
         .split(|byte| *byte == 0)
         .collect::<Vec<_>>()
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
     {
         let attr = triple[1];
         let driver = triple[2];

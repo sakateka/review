@@ -388,6 +388,10 @@ impl Session {
                 let width = ch.width().unwrap_or(1) as i64;
                 self.cells.insert((self.row, self.col), ch);
                 self.colors.insert((self.row, self.col), self.foreground);
+                for offset in 1..width {
+                    self.cells.remove(&(self.row, self.col + offset));
+                    self.colors.remove(&(self.row, self.col + offset));
+                }
                 self.col += width;
             }
         }
