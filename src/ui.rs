@@ -813,7 +813,7 @@ fn draw_notes(frame: &mut Frame, popup: &mut crate::app::NotesPopup, theme: &cra
 /// Centered floating help; the active bindings are its only content source.
 fn draw_help(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let entries = app.bindings.help_entries();
+    let entries = app.filtered_help();
     let lines = entries.len();
     let width = screen.width.saturating_sub(4).min(90);
     let height = (u32::from(screen.height) * 90 / 100) as u16;
@@ -831,13 +831,36 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_focused))
         .title(" Help ")
-        .title_bottom(" esc/q/? close · :set nowrap toggle wrap ");
+        .title_bottom(" type to filter · ↑/↓ select · esc close ");
     let inner = block.inner(area);
-    app.layout_help(inner.height.saturating_sub(1) as usize, lines);
-    let scroll = app.help.expect("help is open").scroll;
+    app.layout_help(inner.height.saturating_sub(2) as usize, lines);
+    let help = app.help.expect("help is open");
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let prompt = format!("Filter: {}", app.help_query);
+    let skip = prompt
+        .width()
+        .saturating_sub((inner.width as usize).saturating_sub(1));
+    let shown: String = prompt
+        .graphemes(true)
+        .scan(0, |cells, grapheme| {
+            let start = *cells;
+            *cells += grapheme.width();
+            Some(if start >= skip { grapheme } else { "" })
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(shown.clone()),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    frame.set_cursor_position((
+        inner.x + shown.width().min(inner.width.saturating_sub(1) as usize) as u16,
+        inner.y,
+    ));
+    if inner.height < 2 {
         return;
     }
     let key_width = entries
@@ -849,8 +872,26 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         .min(u16::MAX as usize) as u16;
     let rows = entries
         .into_iter()
-        .skip(scroll)
-        .map(|(action, keys)| Row::new(vec![keys, action.description()]));
+        .enumerate()
+        .skip(help.scroll)
+        .map(|(index, (action, keys))| {
+            let description = action.description();
+            let positions =
+                crate::app::fuzzy_positions(&format!("{keys}  {description}"), &app.help_query)
+                    .unwrap_or_default();
+            let keys_len = keys.chars().count();
+            let style = if index == help.selected {
+                app.theme.selection
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                help_matches(&keys, 0, &positions, &app.theme),
+                help_matches(&description, keys_len + 2, &positions, &app.theme),
+            ])
+            .style(style)
+        });
+    let table_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
     frame.render_widget(
         Table::new(rows, [Constraint::Length(key_width), Constraint::Min(0)])
             .header(
@@ -858,8 +899,37 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
                     .style(Style::default().add_modifier(Modifier::BOLD)),
             )
             .column_spacing(2),
-        inner,
+        table_area,
     );
+    if lines == 0 && table_area.height > 1 {
+        frame.render_widget(
+            Paragraph::new("No matches").style(Style::default().fg(app.theme.metrics)),
+            Rect::new(table_area.x, table_area.y + 1, table_area.width, 1),
+        );
+    }
+}
+
+fn help_matches(
+    text: &str,
+    offset: usize,
+    positions: &[usize],
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
+    Line::from(
+        text.chars()
+            .enumerate()
+            .map(|(index, c)| {
+                let style = if positions.contains(&(index + offset)) {
+                    Style::default()
+                        .fg(theme.stat_plus)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Span::styled(c.to_string(), style)
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 /// Centered floating comment editor; owns the terminal cursor while open.

@@ -24,12 +24,24 @@ pub enum Focus {
 pub struct Help {
     pub scroll: usize,
     pub viewport: usize,
+    pub selected: usize,
 }
 
 pub struct NotesPopup {
     pub text: String,
     pub scroll: u16,
     pub max_scroll: u16,
+}
+
+/// Case-insensitive subsequence positions, in Unicode scalar indices.
+pub fn fuzzy_positions(text: &str, query: &str) -> Option<Vec<usize>> {
+    let mut input = text.chars().enumerate();
+    let mut positions = Vec::new();
+    for wanted in query.chars() {
+        let (index, _) = input.find(|(_, c)| c.to_lowercase().eq(wanted.to_lowercase()))?;
+        positions.push(index);
+    }
+    Some(positions)
 }
 
 pub struct App {
@@ -74,6 +86,7 @@ pub struct App {
     pub command: Option<CommandLine>,
     pub palette: Option<Palette>,
     pub help: Option<Help>,
+    pub help_query: String,
     pub comments: crate::comments::Store,
     pub notes: crate::notes::Notes,
     pub notes_popup: Option<NotesPopup>,
@@ -190,6 +203,7 @@ impl App {
             command: None,
             palette: None,
             help: None,
+            help_query: String::new(),
             comments,
             notes,
             notes_popup: None,
@@ -421,18 +435,45 @@ impl App {
     pub fn layout_help(&mut self, viewport: usize, lines: usize) {
         if let Some(help) = &mut self.help {
             help.viewport = viewport;
+            help.selected = help.selected.min(lines.saturating_sub(1));
             help.scroll = help.scroll.min(lines.saturating_sub(viewport));
+            if viewport > 0 {
+                help.scroll = help.scroll.min(help.selected);
+                help.scroll = help
+                    .scroll
+                    .max((help.selected + 1).saturating_sub(viewport));
+            }
         }
     }
 
     fn scroll_help(&mut self, rows: isize) {
-        let lines = self.bindings.help_entries().len();
+        let lines = self.filtered_help().len();
         if let Some(help) = &mut self.help {
-            help.scroll = help
-                .scroll
+            help.selected = help
+                .selected
                 .saturating_add_signed(rows)
-                .min(lines.saturating_sub(help.viewport));
+                .min(lines.saturating_sub(1));
+            if help.viewport > 0 {
+                help.scroll = help.scroll.min(help.selected);
+                help.scroll = help
+                    .scroll
+                    .max((help.selected + 1).saturating_sub(help.viewport));
+            }
         }
+    }
+
+    pub fn filtered_help(&self) -> Vec<(Action, String)> {
+        self.bindings
+            .help_entries()
+            .into_iter()
+            .filter(|(action, keys)| {
+                fuzzy_positions(
+                    &format!("{}  {}", keys, action.description()),
+                    &self.help_query,
+                )
+                .is_some()
+            })
+            .collect()
     }
 
     pub fn popup_navigation(&self) -> bool {
@@ -724,6 +765,7 @@ impl App {
             Quit => return true,
             ShowHelp => {
                 self.help = Some(Help::default());
+                self.help_query.clear();
                 self.bindings.clear();
                 return false;
             }
@@ -969,69 +1011,66 @@ impl App {
         false
     }
 
-    /// Route a key to the open help popup without dispatching to the review.
+    /// Search and navigate help without dispatching keys to the review underneath.
     fn help_key(&mut self, key: KeyEvent) -> bool {
         self.motion_count = 0;
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
-        let dismissal = plain && matches!(key.code, KeyCode::Char('q' | '?'));
-        let held = self.bindings.pending_keys().to_vec();
-        match self.bindings.resolve_quit(key) {
-            Resolution::Action(Action::Quit) => return true,
-            Resolution::Pending if !dismissal => return false,
-            _ => {}
-        }
-        if key.code == KeyCode::Esc || dismissal {
+        if key.code == KeyCode::Esc {
             self.help = None;
+            self.help_query.clear();
             self.bindings.clear();
             return false;
         }
-        // A failed quit lookup must not discard an ordinary pending sequence.
-        for held_key in held {
-            self.bindings.resolve(held_key, false);
-        }
-        let resolution = self.bindings.resolve(key, false);
-        if matches!(resolution, Resolution::Pending) {
-            return false;
-        }
-        if matches!(resolution, Resolution::Action(Action::Quit)) {
-            return true;
-        }
-        let Resolution::Action(action) = resolution else {
-            return false;
-        };
-        match action {
-            Action::ShowHelp => {
-                self.help = None;
-            }
-            Action::CursorDown => self.scroll_help(1),
-            Action::CursorUp => self.scroll_help(-1),
-            Action::PageDown | Action::HalfPageDown => {
-                let viewport = self.help.map_or(1, |help| help.viewport.max(1));
-                let rows = if action == Action::HalfPageDown {
-                    (viewport / 2).max(1)
-                } else {
-                    viewport
-                };
-                self.scroll_help(rows as isize);
-            }
-            Action::PageUp | Action::HalfPageUp => {
-                let viewport = self.help.map_or(1, |help| help.viewport.max(1));
-                let rows = if action == Action::HalfPageUp {
-                    (viewport / 2).max(1)
-                } else {
-                    viewport
-                };
-                self.scroll_help(-(rows as isize));
-            }
-            Action::FirstLine => {
-                if let Some(help) = &mut self.help {
-                    help.scroll = 0;
+        // Keep the default global quit sequence available while the filter is empty.
+        if self.help_query.is_empty() && (self.bindings.pending() || key.code == KeyCode::Char(','))
+        {
+            let held = self.bindings.pending_keys().to_vec();
+            match self.bindings.resolve_quit(key) {
+                Resolution::Action(Action::Quit) => return true,
+                Resolution::Pending => return false,
+                _ => {
+                    for held_key in held {
+                        if let KeyCode::Char(c) = held_key.code {
+                            self.help_query.push(c);
+                        }
+                    }
                 }
             }
-            Action::LastLine => self.scroll_help(isize::MAX),
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let modified = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let mut changed = false;
+        match key.code {
+            KeyCode::Up => self.scroll_help(-1),
+            KeyCode::Down => self.scroll_help(1),
+            KeyCode::PageUp => {
+                self.scroll_help(-(self.help.map_or(1, |h| h.viewport.max(1)) as isize))
+            }
+            KeyCode::PageDown => {
+                self.scroll_help(self.help.map_or(1, |h| h.viewport.max(1)) as isize)
+            }
+            KeyCode::Home => self.scroll_help(isize::MIN),
+            KeyCode::End => self.scroll_help(isize::MAX),
+            KeyCode::Char('p') if control => self.scroll_help(-1),
+            KeyCode::Char('n') if control => self.scroll_help(1),
+            KeyCode::Char('u') if control => {
+                self.help_query.clear();
+                changed = true;
+            }
+            KeyCode::Backspace => {
+                self.help_query.pop();
+                changed = true;
+            }
+            KeyCode::Char(c) if !modified && self.help_query.chars().count() < 256 => {
+                self.help_query.push(c);
+                changed = true;
+            }
             _ => {}
+        }
+        if changed && let Some(help) = &mut self.help {
+            help.scroll = 0;
+            help.selected = 0;
         }
         false
     }

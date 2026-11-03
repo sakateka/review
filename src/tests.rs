@@ -4223,7 +4223,7 @@ fn keymap_regression_help_retains_options_and_prints_effective_bindings() {
         assert!(text.contains("go_to_definition: gD\n"));
         assert!(text.contains("cursor_left: left, ctrl-b\n"));
         assert!(!text.contains("Ctrl-N/P/B/F move"));
-        assert!(!text.contains("Escape closes"));
+        assert!(text.contains("Escape closes"));
         assert!(!text.contains("ctrl-n"));
     }
     let Cli::Help { keymap, config } = parse_args([
@@ -7426,11 +7426,8 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
             .unwrap()
             .bindings(None)
             .unwrap();
-        for dismiss in [
-            crossterm::event::KeyEvent::from(KeyCode::Esc),
-            crossterm::event::KeyEvent::from(KeyCode::Char('q')),
-            crossterm::event::KeyEvent::from(KeyCode::Char('?')),
-        ] {
+        {
+            let dismiss = crossterm::event::KeyEvent::from(KeyCode::Esc);
             assert!(!app.key(KeyCode::Char('?')));
             assert!(app.help.is_some());
             let rendered = screen(&mut app, 100, 24);
@@ -7441,9 +7438,9 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
             assert!(text.contains("Show help"), "{text}");
             assert!(text.contains("Cursor down"), "{text}");
             assert!(!text.contains("show_help:"), "{text}");
-            let header = row_text(&rendered, 2);
+            let header = row_text(&rendered, 3);
             assert!(header.find("Keybinding") < header.find("Description"));
-            let first_entry = row_text(&rendered, 3);
+            let first_entry = row_text(&rendered, 4);
             assert!(first_entry.find('?') < first_entry.find("Show help"));
             assert!(
                 !app.key_event(dismiss),
@@ -7476,11 +7473,8 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
         effective.contains("toggle_after_changes: (disabled)\n"),
         "{effective}"
     );
-    app.key(KeyCode::Char('H'));
-    assert!(
-        app.help.is_none(),
-        "configured help key did not toggle help"
-    );
+    app.key(KeyCode::Esc);
+    assert!(app.help.is_none(), "escape did not close help");
 
     app.bindings = config::Config::parse("[keyboard]\nlayouts = []\nlangmap = 'ж?'")
         .unwrap()
@@ -7499,7 +7493,7 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
 }
 
 #[test]
-fn help_dismissal_clears_pending_quit_and_escape_can_quit() {
+fn help_search_accepts_quit_keys_and_escape_closes() {
     let directory = fixture();
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
@@ -7514,6 +7508,9 @@ fn help_dismissal_clears_pending_quit_and_escape_can_quit() {
         app.key(KeyCode::Char('H'));
         assert!(app.help.is_some());
         assert!(!app.key(key));
+        assert!(app.help.is_some());
+        assert_eq!(app.help_query, key.to_string());
+        app.key(KeyCode::Esc);
         assert!(app.help.is_none());
         assert!(!app.bindings.pending());
     }
@@ -7524,7 +7521,8 @@ fn help_dismissal_clears_pending_quit_and_escape_can_quit() {
         .unwrap();
     app.key(KeyCode::Char('?'));
     assert!(app.help.is_some());
-    assert!(app.key(KeyCode::Esc));
+    assert!(!app.key(KeyCode::Esc));
+    assert!(app.help.is_none());
 }
 
 #[test]
@@ -7564,6 +7562,8 @@ fn help_is_modal_and_restores_the_exact_review() {
     ] {
         assert!(!app.key(key));
     }
+    assert_eq!(app.help_query, "m:x");
+    app.key_event(ctrl('u'));
     let now = std::time::Instant::now();
     app.mouse(
         mouse_event(
@@ -7582,7 +7582,7 @@ fn help_is_modal_and_restores_the_exact_review() {
         mouse_event(crossterm::event::MouseEventKind::ScrollDown, 2, 2),
         now,
     );
-    assert_eq!(app.help.unwrap().scroll, 3);
+    assert_eq!(app.help.unwrap().selected, 3);
     assert_eq!(
         (
             app.marks.clone(),
@@ -7620,7 +7620,7 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
     assert!(!initial.contains("Previous file diff"), "{initial}");
     let viewport = app.help.unwrap().viewport;
     assert!(viewport > 0 && viewport < app.bindings.help_entries().len());
-    app.key(KeyCode::Char('G'));
+    app.key(KeyCode::End);
     let bottom = app.bindings.help_entries().len() - viewport;
     assert_eq!(app.help.unwrap().scroll, bottom);
     let text = screen_text(&screen(&mut app, 100, 12));
@@ -7632,24 +7632,25 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
     );
     assert_eq!(app.help.unwrap().scroll, bottom);
     app.key(KeyCode::Up);
-    assert_eq!(app.help.unwrap().scroll, bottom - 1);
-    for key in [KeyCode::Char('g'), KeyCode::Char('g')] {
-        app.key(key);
-    }
+    assert_eq!(
+        app.help.unwrap().selected,
+        app.bindings.help_entries().len() - 2
+    );
+    app.key(KeyCode::Home);
     assert_eq!(app.help.unwrap().scroll, 0);
     app.key(KeyCode::PageDown);
-    assert_eq!(app.help.unwrap().scroll, viewport);
+    assert_eq!(app.help.unwrap().selected, viewport);
     for size in [(0, 0), (1, 1), (7, 7), (6, 6)] {
         screen(&mut app, size.0, size.1);
     }
     assert_eq!(app.help.unwrap().viewport, 0);
     for height in [20, 40, 100] {
         screen(&mut app, 100, height);
-        assert_eq!(app.help.unwrap().viewport, (height as usize * 90 / 100) - 3);
+        assert_eq!(app.help.unwrap().viewport, (height as usize * 90 / 100) - 4);
     }
     screen(&mut app, 100, 12);
     assert_eq!(app.help.unwrap().viewport, viewport);
-    app.key(KeyCode::Char('?'));
+    app.key(KeyCode::Esc);
     assert!(app.help.is_none());
     assert_eq!(screen(&mut app, 100, 12), before);
 
@@ -7660,11 +7661,58 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
     app.key(KeyCode::Char('?'));
     screen(&mut app, 100, 12);
     app.key_event(ctrl('n'));
-    assert_eq!(app.help.unwrap().scroll, 1);
+    assert_eq!(app.help.unwrap().selected, 1);
     app.key_event(ctrl('p'));
-    assert_eq!(app.help.unwrap().scroll, 0);
-    app.key(KeyCode::Char('q'));
+    assert_eq!(app.help.unwrap().selected, 0);
+    app.key(KeyCode::Esc);
     assert!(app.help.is_none() && app.preview.is_some());
+}
+
+#[test]
+fn help_fuzzy_filters_highlights_matches_and_selects_results() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Char('?'));
+    for c in "shwnts".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    let rendered = screen(&mut app, 100, 24);
+    let text = screen_text(&rendered);
+    assert!(text.contains("Filter: shwnts"), "{text}");
+    assert!(text.contains("Show notes"), "{text}");
+    assert!(!text.contains("Toggle mark"), "{text}");
+    let row = (0..rendered.area.height)
+        .find(|row| row_text(&rendered, *row).contains("Show notes"))
+        .unwrap();
+    assert!(
+        (0..rendered.area.width).any(|x| rendered[(x, row)].fg == app.theme.stat_plus
+            && rendered[(x, row)].modifier.contains(Modifier::BOLD))
+    );
+    assert!(
+        (0..rendered.area.width).any(|x| rendered[(x, row)].modifier.contains(Modifier::REVERSED))
+    );
+    app.key(KeyCode::Backspace);
+    assert_eq!(app.help_query, "shwnt");
+    app.key_event(ctrl('u'));
+    assert!(app.help_query.is_empty());
+    screen(&mut app, 100, 24);
+    app.key(KeyCode::Down);
+    assert_eq!(app.help.unwrap().selected, 1);
+    let rendered = screen(&mut app, 100, 24);
+    let row = (0..rendered.area.height)
+        .find(|row| row_text(&rendered, *row).contains("Cursor down"))
+        .unwrap();
+    assert!(
+        (0..rendered.area.width).any(|x| rendered[(x, row)].modifier.contains(Modifier::REVERSED))
+    );
+    for c in "zzzzzzzz".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    assert!(screen_text(&screen(&mut app, 100, 24)).contains("No matches"));
+    app.key(KeyCode::Esc);
+    assert!(app.help.is_none());
 }
 
 fn palette_texts(app: &App) -> Vec<String> {

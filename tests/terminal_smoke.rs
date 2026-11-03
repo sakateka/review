@@ -1235,7 +1235,7 @@ fn help_popup(ctx: &Ctx) {
         let mut session = ctx.session(&["--keymap", style, "--", "HEAD"]);
         session.wait_text("Files");
         let origin = session.text();
-        for (index, dismiss) in [b"?".as_slice(), b"q", b"\x1b"].into_iter().enumerate() {
+        for index in 0..3 {
             session.send(b"?");
             session.wait_text(" Help ");
             session.wait_text("Keybinding");
@@ -1244,7 +1244,10 @@ fn help_popup(ctx: &Ctx) {
             let (help_column, help_row) = locate(&session, " Help ");
             assert!(help_column > 0 && help_row > 0, "help was not centered");
             if index == 0 {
-                session.send(b"\x1b[6~\x1b[6~");
+                session.send(b"shwnts");
+                session.wait_text("Show notes");
+                session.send(b"\x15");
+                session.send(b"\x1b[F");
                 session.wait_text("Previous file diff");
                 for (rows, columns) in [(1, 1), (3, 8), (30, 140)] {
                     session.resize(rows, columns);
@@ -1256,7 +1259,7 @@ fn help_popup(ctx: &Ctx) {
                 session.send(&click(2, 2));
                 session.send(&pointer(66, 2, 2, false));
             }
-            session.send(dismiss);
+            session.send(b"\x1b");
             assert_eq!(session.text(), origin, "{style} help lost its origin");
             assert!(session.poll().is_none(), "help dismissal exited review");
         }
@@ -1266,10 +1269,11 @@ fn help_popup(ctx: &Ctx) {
         let diff_origin = view(&session);
         session.send(b"?");
         session.wait_text(" Help ");
-        session.send(b"q");
+        session.send(b"\x1b");
         assert_eq!(view(&session), diff_origin, "diff changed behind help");
         session.send(b"?");
         session.wait_text(" Help ");
+        session.send(b"\x1b");
         session.send(b",q");
         session.finish(0);
     }
@@ -1295,11 +1299,11 @@ fn help_popup(ctx: &Ctx) {
     session.send(b"H");
     session.wait_text(" Help ");
     session.wait_text("Show help");
-    session.send(b"G");
+    session.send(b"\x1b[F");
     session.wait_text("Analysis details");
     session.wait_text("Toggle after changes");
     session.wait_text("(disabled)");
-    session.send(b"?");
+    session.send(b"\x1b");
     assert_eq!(session.text(), origin, "custom help changed the file list");
     session.send(b",q");
     session.finish(0);
