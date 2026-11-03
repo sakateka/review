@@ -54,7 +54,7 @@ fn clip_name(name: &str, width: usize) -> String {
 
 fn file_row(
     item: &crate::git::Item,
-    reviewed: bool,
+    state: (bool, bool),
     width: usize,
     show_stats: bool,
     comment: Option<bool>,
@@ -62,6 +62,7 @@ fn file_row(
     theme: &crate::theme::Theme,
 ) -> Line<'static> {
     use crate::git::Statistics;
+    let (reviewed, selected) = state;
     let name = item.name();
     let show_comment = comment.is_some() && width >= 4;
     let show_note = note && width >= 4 + usize::from(show_comment) * 2;
@@ -144,11 +145,17 @@ fn file_row(
         ),
         Span::styled(
             displayed_name,
-            Style::default().fg(if reviewed {
-                theme.reviewed_name
-            } else {
-                theme.pending_name
-            }),
+            Style::default()
+                .fg(if reviewed {
+                    theme.reviewed_name
+                } else {
+                    theme.pending_name
+                })
+                .patch(if selected {
+                    theme.selection
+                } else {
+                    Style::default()
+                }),
         ),
     ];
     spans.push(Span::raw(" ".repeat(padding)));
@@ -296,7 +303,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let note = app.notes.for_item(item).next().is_some();
                 ListItem::new(file_row(
                     item,
-                    *reviewed,
+                    (*reviewed, index == app.selected),
                     panels[0]
                         .width
                         .saturating_sub(if comment.is_some() || note { 2 } else { 4 })
@@ -306,11 +313,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     note,
                     &app.theme,
                 ))
-                .style(if index == app.selected {
-                    app.theme.selection
-                } else {
-                    Style::default()
-                })
             })
             .collect();
         let block = Block::default()
@@ -406,29 +408,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             app.cursor.0
         };
-        let cursor_note = |offset: usize| {
+        let cursor_marker = |offset: usize| {
             app.focus == Focus::Preview
-                && rows.get(offset).is_some_and(|(row, _)| {
-                    *row == app.cursor.0
-                        && notes
-                            .as_ref()
-                            .and_then(|notes| notes.get(*row))
-                            .copied()
-                            .unwrap_or(false)
-                })
+                && rows
+                    .get(offset)
+                    .is_some_and(|(row, _)| *row == app.cursor.0)
                 && if app.wrap {
                     visual_top + offset == cursor_visual
                 } else {
                     true
                 }
         };
-        for (offset, line) in lines.iter_mut().enumerate() {
-            if cursor_note(offset) {
-                for span in &mut line.spans {
-                    span.style = span.style.patch(app.theme.selection);
-                }
-            }
-        }
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -456,7 +446,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         content.x + content.width - 2,
                         content.y + offset as u16,
                         "💬",
-                        comment_style(*outdated, &app.theme),
+                        if cursor_marker(offset) {
+                            comment_style(*outdated, &app.theme)
+                                .remove_modifier(Modifier::DIM)
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                        } else {
+                            comment_style(*outdated, &app.theme)
+                        },
                     );
                 }
             }
@@ -480,10 +476,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         content.x + content.width - right,
                         content.y + offset as u16,
                         "📝",
-                        if cursor_note(offset) {
+                        if cursor_marker(offset) {
                             Style::default()
                                 .fg(app.theme.comment)
-                                .patch(app.theme.selection)
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                         } else {
                             Style::default().fg(app.theme.comment)
                         },

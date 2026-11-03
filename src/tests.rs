@@ -8525,6 +8525,15 @@ mod review_comments {
         assert_eq!(opened[(27, 1)].symbol(), "💬", "{}", row_text(&opened, 1));
         assert_eq!(opened[(27, 1)].fg, app.theme.comment);
         assert_ne!(opened[(27, 2)].symbol(), "💬");
+        assert!(opened[(97, 8)].modifier.contains(Modifier::UNDERLINED));
+        assert!(!opened[(32, 8)].modifier.contains(Modifier::REVERSED));
+        app.key(KeyCode::Tab);
+        assert!(
+            !screen(&mut app, 100, 24)[(97, 8)]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        app.key(KeyCode::Tab);
         app.key(KeyCode::Esc);
         let closed = screen(&mut app, 100, 24);
         let icon = icon_x(&closed, 1, "💬").unwrap();
@@ -9202,6 +9211,8 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
     let list = screen(&mut app, 100, 24);
+    assert!(list[(3, 1)].modifier.contains(Modifier::REVERSED));
+    assert!(!list[(40, 1)].modifier.contains(Modifier::REVERSED));
     assert!(icon_x(&list, 1, "📝").is_some());
     assert!(icon_x(&list, 2, "📝").is_some());
     assert!(row_text(&list, 1).contains("2 +-"));
@@ -9226,9 +9237,9 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
         app.key(KeyCode::Char('j'));
     }
     let focused = screen(&mut app, 100, 24);
-    assert!(focused[(97, 8)].modifier.contains(Modifier::REVERSED));
-    assert!(focused[(32, 8)].modifier.contains(Modifier::REVERSED));
-    assert!(!focused[(97, 9)].modifier.contains(Modifier::REVERSED));
+    assert!(focused[(97, 8)].modifier.contains(Modifier::UNDERLINED));
+    assert!(!focused[(32, 8)].modifier.contains(Modifier::REVERSED));
+    assert!(!focused[(97, 9)].modifier.contains(Modifier::UNDERLINED));
     app.key_event(alt('n'));
     let popup = screen_text(&screen(&mut app, 100, 24));
     assert!(popup.contains("First note") && popup.contains("Second note"));
@@ -9244,6 +9255,8 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
     assert_eq!(both[(27, 1)].symbol(), "💬");
     assert_eq!(both[(95, 8)].symbol(), "📝");
     assert_eq!(both[(97, 8)].symbol(), "💬");
+    assert!(both[(95, 8)].modifier.contains(Modifier::UNDERLINED));
+    assert!(both[(97, 8)].modifier.contains(Modifier::UNDERLINED));
     assert_eq!(both[(97, 9)].symbol(), "📝");
     app.key(KeyCode::Esc);
     let both = screen(&mut app, 100, 24);
