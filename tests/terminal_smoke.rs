@@ -3153,6 +3153,8 @@ fn keyboard_layouts(ctx: &Ctx) {
     session.send("пк".as_bytes());
     session.wait_text("References candidates");
     session.send(b"\x1b");
+    session.wait_text("Captured old");
+    session.send(b"\x1b");
     closed(&mut session);
     // бй is ,q.
     session.send("бй".as_bytes());

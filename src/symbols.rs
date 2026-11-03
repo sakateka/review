@@ -221,6 +221,7 @@ pub fn extract_inventory(
             functions.push(Function {
                 tag: riptags::Tag {
                     line: name.start_position().row as u32 + 1,
+                    end_line: name.start_position().row as u32 + 1,
                     col: columns[name.start_byte()],
                     len: source[name.byte_range()].chars().count() as u32,
                     name: source[name.byte_range()].into(),
@@ -238,6 +239,7 @@ pub fn extract_inventory(
             functions.push(Function {
                 tag: riptags::Tag {
                     line: name.start_position().row as u32 + 1,
+                    end_line: name.start_position().row as u32 + 1,
                     col: columns[name.start_byte()],
                     len: source[name.byte_range()].chars().count() as u32,
                     name: source[name.byte_range()].into(),
@@ -254,6 +256,7 @@ pub fn extract_inventory(
         {
             let tag = riptags::Tag {
                 line: name.start_position().row as u32 + 1,
+                end_line: name.start_position().row as u32 + 1,
                 col: columns[name.start_byte()],
                 len: source[name.byte_range()].chars().count() as u32,
                 name: source[name.byte_range()].into(),
@@ -284,6 +287,7 @@ pub fn extract_inventory(
             };
             let tag = riptags::Tag {
                 line: key.0,
+                end_line: key.0,
                 col: key.1,
                 len: key.2,
                 name: name.into(),

@@ -23,7 +23,10 @@ pub fn digest(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
         hash.update((part.len() as u64).to_le_bytes());
         hash.update(part);
     }
-    format!("{:x}", hash.finalize())
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Debug)]

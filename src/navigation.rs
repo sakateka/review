@@ -491,6 +491,7 @@ fn make_tag(
     let start = node.start_position();
     Tag {
         line: start.row as u32 + 1,
+        end_line: start.row as u32 + 1,
         col: columns[node.start_byte()],
         len: source[node.byte_range()].chars().count() as u32,
         kind,
