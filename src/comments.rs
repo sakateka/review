@@ -14,6 +14,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub const HEADER: &str = "review-comments: v1";
 pub const INSTRUCTION: &str = "Address each comment below; excerpts show the code as reviewed.";
@@ -867,8 +869,16 @@ pub struct Editor {
     pub row: usize,
     /// Cursor position in Unicode scalars within `lines[row]`.
     pub column: usize,
+    pub wrap_width: Option<usize>,
     pub existing: Option<usize>,
     pub draft: Comment,
+}
+
+pub(crate) struct EditorVisualLine<'a> {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+    pub text: &'a str,
 }
 
 impl Editor {
@@ -881,6 +891,7 @@ impl Editor {
             lines,
             row,
             column,
+            wrap_width: None,
             existing,
             draft,
         }
@@ -1012,7 +1023,100 @@ impl Editor {
         self.column = self.lines[self.row][..start].chars().count();
     }
 
+    /// Display rows retain their original logical line and scalar offsets.
+    pub(crate) fn visual_lines(&self, width: usize) -> Vec<EditorVisualLine<'_>> {
+        let width = width.max(1);
+        let mut result = Vec::new();
+        for (row, line) in self.lines.iter().enumerate() {
+            let mut byte_start = 0;
+            let mut scalar_start = 0;
+            let mut scalars = 0;
+            let mut cells = 0;
+            for (byte, grapheme) in line.grapheme_indices(true) {
+                let size = grapheme.width();
+                if cells > 0 && cells + size > width {
+                    result.push(EditorVisualLine {
+                        row,
+                        start: scalar_start,
+                        end: scalars,
+                        text: &line[byte_start..byte],
+                    });
+                    byte_start = byte;
+                    scalar_start = scalars;
+                    cells = 0;
+                }
+                scalars += grapheme.chars().count();
+                cells += size;
+            }
+            result.push(EditorVisualLine {
+                row,
+                start: scalar_start,
+                end: scalars,
+                text: &line[byte_start..],
+            });
+            // Reserve a cursor cell after a completely filled current line.
+            if row == self.row && cells >= width && !line.is_empty() {
+                result.push(EditorVisualLine {
+                    row,
+                    start: scalars,
+                    end: scalars,
+                    text: "",
+                });
+            }
+        }
+        result
+    }
+
+    pub(crate) fn visual_cursor(
+        &self,
+        lines: &[EditorVisualLine<'_>],
+        width: usize,
+    ) -> (usize, usize) {
+        let index = lines
+            .iter()
+            .position(|line| {
+                line.row == self.row
+                    && self.column >= line.start
+                    && (self.column < line.end
+                        || line.end == self.column
+                            && (line.end == line.start
+                                || self.column == self.lines[self.row].chars().count()
+                                    && line.text.width() < width))
+            })
+            .unwrap_or_else(|| lines.len().saturating_sub(1));
+        let before: String = lines[index]
+            .text
+            .chars()
+            .take(self.column.saturating_sub(lines[index].start))
+            .collect();
+        (index, before.width().min(width.saturating_sub(1)))
+    }
+
     pub fn vertical(&mut self, down: bool) {
+        if let Some(width) = self.wrap_width.filter(|width| *width > 0) {
+            let lines = self.visual_lines(width);
+            let (current, column) = self.visual_cursor(&lines, width);
+            let target = if down {
+                current.saturating_add(1).min(lines.len().saturating_sub(1))
+            } else {
+                current.saturating_sub(1)
+            };
+            let line = &lines[target];
+            let mut cells = 0;
+            let mut scalar = line.start;
+            for grapheme in line.text.graphemes(true) {
+                let size = grapheme.width();
+                if cells + size > column {
+                    break;
+                }
+                cells += size;
+                scalar += grapheme.chars().count();
+            }
+            let row = line.row;
+            self.row = row;
+            self.column = scalar;
+            return;
+        }
         if down && self.row + 1 < self.lines.len() {
             self.row += 1;
         } else if !down && self.row > 0 {

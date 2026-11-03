@@ -8621,6 +8621,62 @@ mod review_comments {
     }
 
     #[test]
+    fn comment_editor_wraps_and_moves_cursor_without_changing_text() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 7);
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "abcdefghij界XY");
+
+        let mut terminal = Terminal::new(TestBackend::new(18, 12)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap(), (5, 4).into());
+        assert!(row_text(terminal.backend().buffer(), 3).contains("abcdefghij界"));
+        assert!(row_text(terminal.backend().buffer(), 4).contains("XY"));
+
+        app.key(KeyCode::Up);
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap(), (5, 3).into());
+        ctrl(&mut app, 'n');
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap(), (5, 4).into());
+
+        let mut narrow = Terminal::new(TestBackend::new(14, 12)).unwrap();
+        narrow.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(narrow.get_cursor_position().unwrap(), (9, 4).into());
+        assert_eq!(app.editor.as_ref().unwrap().text(), "abcdefghij界XY");
+        ctrl(&mut app, 's');
+        assert!(file(directory.path(), "review-HEAD.comments").contains("abcdefghij界XY\n"));
+    }
+
+    #[test]
+    fn comment_editor_scrolls_at_exact_wrap_boundary() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 7);
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "abcdefghijklmnopqrstuvwx012345678901");
+        let mut terminal = Terminal::new(TestBackend::new(18, 9)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.get_cursor_position().unwrap(), (3, 5).into());
+        assert!(row_text(terminal.backend().buffer(), 3).contains("mnopqrstuvwx"));
+        assert!(row_text(terminal.backend().buffer(), 4).contains("012345678901"));
+        app.key(KeyCode::Up);
+        assert_eq!(app.editor.as_ref().unwrap().column, 24);
+        app.key(KeyCode::Down);
+        assert_eq!(app.editor.as_ref().unwrap().column, 36);
+        type_text(&mut app, "Z");
+        assert_eq!(
+            app.editor.as_ref().unwrap().text(),
+            "abcdefghijklmnopqrstuvwx012345678901Z"
+        );
+    }
+
+    #[test]
     fn editor_readline_keys_edit_text_and_move_visible_cursor() {
         let directory = fixture();
         change(directory.path());

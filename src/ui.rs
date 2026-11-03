@@ -494,7 +494,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(palette) = &app.palette {
         draw_palette(frame, palette, &app.theme);
     }
-    if let Some(editor) = &app.editor {
+    if let Some(editor) = &mut app.editor {
         draw_editor(frame, editor, &app.theme);
     }
     if app.help.is_some() {
@@ -764,7 +764,11 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
 }
 
 /// Centered floating comment editor; owns the terminal cursor while open.
-fn draw_editor(frame: &mut Frame, editor: &crate::comments::Editor, theme: &crate::theme::Theme) {
+fn draw_editor(
+    frame: &mut Frame,
+    editor: &mut crate::comments::Editor,
+    theme: &crate::theme::Theme,
+) {
     let screen = frame.area();
     let width = screen.width.saturating_sub(4).min(90);
     let height = screen.height.saturating_sub(4).min(14);
@@ -790,25 +794,20 @@ fn draw_editor(frame: &mut Frame, editor: &crate::comments::Editor, theme: &crat
     if rows == 0 || columns == 0 {
         return;
     }
-    let top = (editor.row + 1).saturating_sub(rows);
-    let line = &editor.lines[editor.row];
-    let before: String = line.chars().take(editor.column).collect();
-    let cursor = before.width();
-    let left = (cursor + 1).saturating_sub(columns);
-    let text: Vec<Line> = editor
-        .lines
+    editor.wrap_width = Some(columns);
+    let lines = editor.visual_lines(columns);
+    let (cursor_row, cursor_column) = editor.visual_cursor(&lines, columns);
+    let top = (cursor_row + 1).saturating_sub(rows);
+    let text: Vec<Line> = lines
         .iter()
         .skip(top)
         .take(rows)
-        .map(|line| Line::raw(line.clone()))
+        .map(|line| Line::raw(line.text.to_owned()))
         .collect();
-    frame.render_widget(
-        Paragraph::new(text).scroll((0, left.min(u16::MAX as usize) as u16)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(text), inner);
     frame.set_cursor_position((
-        inner.x + (cursor - left) as u16,
-        inner.y + (editor.row - top) as u16,
+        inner.x + cursor_column as u16,
+        inner.y + (cursor_row - top) as u16,
     ));
 }
 
