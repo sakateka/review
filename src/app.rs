@@ -54,6 +54,7 @@ pub struct App {
     diff_views: std::collections::BTreeMap<usize, DiffView>,
     pub file_area: Rect,
     pub preview_area: Rect,
+    pub popup_area: Rect,
     pub file_offset: usize,
     last_click: Option<(usize, Instant)>,
     motion_count: usize,
@@ -80,6 +81,8 @@ pub struct Navigation {
     pub candidates: Vec<Candidate>,
     pub selected: usize,
     pub coverage: String,
+    pub scroll: usize,
+    pub viewport: usize,
     position: Option<(usize, usize, usize)>,
 }
 #[derive(Clone)]
@@ -152,6 +155,7 @@ impl App {
             cursor: (0, 0),
             file_area: Rect::default(),
             preview_area: Rect::default(),
+            popup_area: Rect::default(),
             file_offset: 0,
             last_click: None,
             motion_count: 0,
@@ -280,6 +284,15 @@ impl App {
         }
     }
 
+    pub fn popup_navigation(&self) -> bool {
+        self.navigation.as_ref().is_some_and(|nav| {
+            matches!(
+                nav.operation,
+                Operation::Definitions | Operation::References
+            )
+        })
+    }
+
     pub fn mouse(&mut self, mouse: MouseEvent, now: Instant) {
         // Modal surfaces never let the mouse act on the review underneath.
         if self.help.is_some() {
@@ -295,6 +308,47 @@ impl App {
             return;
         }
         let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if self.popup_navigation() {
+            if !self.popup_area.contains(point) {
+                self.last_click = None;
+                return;
+            }
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let direction = if mouse.kind == MouseEventKind::ScrollUp {
+                        -3
+                    } else {
+                        3
+                    };
+                    if let Some(nav) = &mut self.navigation {
+                        nav.selected = nav
+                            .selected
+                            .saturating_add_signed(direction)
+                            .min(nav.candidates.len().saturating_sub(1));
+                    }
+                    self.render_candidates();
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let nav = self.navigation.as_mut().expect("popup navigation");
+                    let index = nav.scroll + (mouse.row - self.popup_area.y) as usize;
+                    if index < nav.candidates.len() {
+                        let double = self.last_click.is_some_and(|(previous, time)| {
+                            previous == index
+                                && now.saturating_duration_since(time) <= Duration::from_millis(400)
+                        });
+                        nav.selected = index;
+                        self.last_click = if double { None } else { Some((index, now)) };
+                        if double {
+                            self.open_candidate();
+                        } else {
+                            self.render_candidates();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let files = self.file_area.contains(point);
         let preview = self.preview.is_some() && self.preview_area.contains(point);
         match mouse.kind {
@@ -497,7 +551,8 @@ impl App {
                 self.palette = Some(Palette::default());
             }
             CloseOrQuit
-                if self.documentation
+                if self.popup_navigation()
+                    || self.documentation
                     || self.definition_preview
                     || self.navigation.as_ref().is_some_and(|nav| {
                         matches!(
@@ -509,7 +564,8 @@ impl App {
                 self.back()
             }
             CloseDiffView
-                if self.documentation
+                if self.popup_navigation()
+                    || self.documentation
                     || self.definition_preview
                     || self.navigation.as_ref().is_some_and(|nav| {
                         matches!(
@@ -650,17 +706,28 @@ impl App {
             }
             PageUp | PageDown | HalfPageUp | HalfPageDown => {
                 let half = matches!(action, HalfPageUp | HalfPageDown);
-                let rows = if half {
-                    self.viewport.0 / 2
+                let height = if self.popup_navigation() {
+                    self.navigation.as_ref().unwrap().viewport
                 } else {
                     self.viewport.0
                 };
+                let rows = if half { height / 2 } else { height };
                 let direction = if matches!(action, PageUp | HalfPageUp) {
                     -1
                 } else {
                     1
                 };
-                self.scroll_preview(direction * rows.max(1).saturating_mul(count) as isize, 0);
+                let amount = direction * rows.max(1).saturating_mul(count) as isize;
+                if self.popup_navigation() {
+                    let nav = self.navigation.as_mut().unwrap();
+                    nav.selected = nav
+                        .selected
+                        .saturating_add_signed(amount)
+                        .min(nav.candidates.len().saturating_sub(1));
+                    self.render_candidates();
+                } else {
+                    self.scroll_preview(amount, 0);
+                }
             }
             WordForward | WordBackward | WordEnd | BigWordForward | BigWordBackward
             | BigWordEnd
@@ -1200,6 +1267,8 @@ impl App {
             candidates: Vec::new(),
             selected: 0,
             coverage: String::new(),
+            scroll: 0,
+            viewport: 0,
         });
         self.focus = Focus::Preview;
         if operation != Operation::Search {
@@ -1320,6 +1389,16 @@ impl App {
         let Some(nav) = &self.navigation else {
             return;
         };
+        if self.popup_navigation() {
+            self.status = if nav.coverage.is_empty() {
+                "Searching…".into()
+            } else if nav.coverage.contains("no tagged symbol") {
+                format!("No symbol at cursor · {}", nav.coverage)
+            } else {
+                format!("{} results · {}", nav.candidates.len(), nav.coverage)
+            };
+            return;
+        }
         let mut text = format!(
             "{:?} candidates for {:?} — {} results\n{} opens; {} returns; {} old / {} new\n",
             nav.operation,
@@ -1843,7 +1922,7 @@ impl App {
 }
 
 // Candidate selection/scrolling relies on exactly one display row per target.
-fn candidate_field(text: &str) -> String {
+pub(crate) fn candidate_field(text: &str) -> String {
     text.chars()
         .map(|ch| {
             if ch.is_control() {

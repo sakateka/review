@@ -10632,3 +10632,98 @@ fn new_file_additions_have_no_background_across_themes_and_large_patches() {
         }
     }
 }
+
+#[test]
+fn definitions_popup_preserves_origin_and_handles_selection_mouse_resize_and_empty_results() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let directory = tempfile::tempdir().unwrap();
+    git_run(directory.path(), &["init", "-q"]);
+    git_run(
+        directory.path(),
+        &["config", "user.email", "test@example.com"],
+    );
+    git_run(directory.path(), &["config", "user.name", "Test"]);
+    std::fs::write(directory.path().join("one.rs"), "fn target() {}\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "old"]);
+    let text = format!(
+        "{}fn caller() {{ target(); }}\n",
+        "fn target() {}\n".repeat(20)
+    );
+    std::fs::write(directory.path().join("one.rs"), text).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 100, 24);
+    let row = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .lines
+        .iter()
+        .position(|line| line.to_string().contains("fn target"))
+        .unwrap();
+    app.cursor = (row, 5);
+    let origin = (
+        app.cursor,
+        app.top,
+        app.left,
+        app.preview.as_ref().unwrap().lines.clone(),
+    );
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    assert!(app.navigation.as_ref().unwrap().candidates.len() > 2);
+    let buffer = screen(&mut app, 100, 24);
+    assert!(screen_text(&buffer).contains("Definitions candidates"));
+    assert_eq!(app.preview.as_ref().unwrap().lines, origin.3);
+    let outside = (app.selected, app.cursor);
+    app.mouse(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+        std::time::Instant::now(),
+    );
+    assert_eq!((app.selected, app.cursor), outside);
+    app.key(KeyCode::Down);
+    assert_eq!(app.navigation.as_ref().unwrap().selected, 1);
+    screen(&mut app, 40, 8);
+    let area = app.popup_area;
+    app.mouse(
+        mouse_event(MouseEventKind::ScrollDown, area.x, area.y),
+        std::time::Instant::now(),
+    );
+    assert_eq!(app.navigation.as_ref().unwrap().selected, 4);
+    screen(&mut app, 40, 8);
+    let nav = app.navigation.as_ref().unwrap();
+    assert!(nav.selected >= nav.scroll && nav.selected < nav.scroll + nav.viewport);
+    let selected = nav.selected;
+    app.key(KeyCode::Enter);
+    assert!(app.navigation.is_none());
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(app.navigation.as_ref().unwrap().selected, selected);
+    app.key(KeyCode::Esc);
+    assert!(app.navigation.is_none());
+    assert_eq!(
+        (app.cursor, app.top, app.left),
+        (origin.0, origin.1, origin.2)
+    );
+    assert_eq!(app.preview.as_ref().unwrap().lines, origin.3);
+    app.cursor = (row, 1);
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('r'));
+    await_navigation(&mut app);
+    assert!(app.navigation.as_ref().unwrap().candidates.is_empty());
+    assert!(app.status.contains("No symbol at cursor"));
+    app.preview.as_mut().unwrap().reason = Some("Display omitted: fixture".into());
+    app.navigation.as_mut().unwrap().coverage = "Coverage incomplete".into();
+    let empty = screen_text(&screen(&mut app, 40, 8));
+    assert!(empty.contains("Coverage incomplete"), "{empty}");
+    assert!(empty.contains("No results"), "{empty}");
+    let tiny = screen_text(&screen(&mut app, 4, 3));
+    assert!(tiny.contains("Cove"), "{tiny}");
+    screen(&mut app, 2, 2);
+    app.key(KeyCode::Esc);
+    assert!(app.navigation.is_none());
+}

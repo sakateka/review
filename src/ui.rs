@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
 };
 use std::{
     io,
@@ -217,6 +217,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let original = app.capture.unavailable.is_some();
     app.file_area = ratatui::layout::Rect::default();
     app.preview_area = ratatui::layout::Rect::default();
+    app.popup_area = Rect::default();
     let panels = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(if app.preview.is_some() && !original {
@@ -376,6 +377,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             status_area,
         );
         if app.help.is_none()
+            && !app.popup_navigation()
             && app.focus == Focus::Preview
             && total > 0
             && app.viewport.0 > 0
@@ -426,6 +428,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(status), areas[1]);
     }
     frame.render_widget(Paragraph::new(app.bindings.legend()), areas[2]);
+    if app.popup_navigation() {
+        draw_navigation_popup(frame, app);
+    }
     if let Some(palette) = &app.palette {
         draw_palette(frame, palette, &app.theme);
     }
@@ -434,6 +439,126 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.help.is_some() {
         draw_help(frame, app);
+    }
+}
+
+/// Definition and reference candidates overlay the retained review view.
+fn draw_navigation_popup(frame: &mut Frame, app: &mut App) {
+    let screen = frame.area();
+    let bordered = screen.width >= 5 && screen.height >= 5;
+    let width = if bordered {
+        screen.width.saturating_sub(2).min(100)
+    } else {
+        screen.width
+    };
+    let height = if bordered {
+        screen.height.saturating_sub(2).min(18)
+    } else {
+        screen.height
+    };
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let footer = format!(
+        " {} open · {} back · ↑/↓ select ",
+        app.bindings.label(crate::keybindings::Action::OpenDiffView),
+        app.bindings
+            .label(crate::keybindings::Action::CloseDiffView)
+    );
+    let nav = app.navigation.as_mut().expect("popup navigation");
+    let title = format!(
+        " {:?} candidates for {:?} — {} results ",
+        nav.operation,
+        nav.query,
+        nav.candidates.len()
+    );
+    let block = Block::default()
+        .borders(if bordered {
+            Borders::ALL
+        } else {
+            Borders::NONE
+        })
+        .border_style(Style::default().fg(app.theme.border_focused))
+        .title(if bordered { title } else { String::new() })
+        .title_bottom(if bordered { footer } else { String::new() });
+    let inner = block.inner(area);
+    // Reserve space for coverage even when there are no results. In a short
+    // popup retain one selectable row whenever there is room for both.
+    let coverage_rows = if inner.height <= 1 {
+        inner.height
+    } else if nav.candidates.is_empty() {
+        inner.height.min(2)
+    } else {
+        inner.height.saturating_sub(1).min(2)
+    };
+    let list_area = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(coverage_rows),
+    );
+    let coverage_area = Rect::new(inner.x, list_area.bottom(), inner.width, coverage_rows);
+    app.popup_area = list_area;
+    nav.viewport = list_area.height as usize;
+    if nav.selected < nav.scroll {
+        nav.scroll = nav.selected;
+    }
+    if nav.viewport > 0 && nav.selected >= nav.scroll + nav.viewport {
+        nav.scroll = nav.selected + 1 - nav.viewport;
+    }
+    nav.scroll = nav
+        .scroll
+        .min(nav.candidates.len().saturating_sub(nav.viewport.max(1)));
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let coverage = if nav.coverage.is_empty() {
+        "Searching…".to_owned()
+    } else if nav.candidates.is_empty() {
+        format!("{} · No results", nav.coverage)
+    } else {
+        nav.coverage.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(coverage)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(app.theme.metrics)),
+        coverage_area,
+    );
+    for (index, candidate) in nav
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(nav.scroll)
+        .take(nav.viewport)
+    {
+        let source = &app.capture.catalog.sources[candidate.source];
+        let text = format!(
+            "{} {} {}:{}:{} {} {}",
+            if index == nav.selected { ">" } else { " " },
+            source.side.label(),
+            crate::app::candidate_field(&crate::git::visible_bytes(&source.path)),
+            candidate.tag.line,
+            candidate.tag.col + 1,
+            crate::app::candidate_field(&candidate.tag.name),
+            crate::app::candidate_field(candidate.tag.context.as_deref().unwrap_or(""))
+        );
+        let style = if index == nav.selected {
+            app.theme.selection
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(text).style(style),
+            Rect::new(
+                inner.x,
+                list_area.y + (index - nav.scroll) as u16,
+                list_area.width,
+                1,
+            ),
+        );
     }
 }
 
