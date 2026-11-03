@@ -452,7 +452,17 @@ fn draw_navigation_popup(frame: &mut Frame, app: &mut App) {
         screen.width
     };
     let height = if bordered {
-        screen.height.saturating_sub(2).min(18)
+        let maximum = (u32::from(screen.height) * 70 / 100) as u16;
+        let minimum = (u32::from(screen.height) * 50 / 100) as u16;
+        let content = app
+            .navigation
+            .as_ref()
+            .unwrap()
+            .candidates
+            .len()
+            .saturating_add(4);
+        let desired = u16::try_from(content).unwrap_or(u16::MAX);
+        desired.max(minimum).min(maximum.max(3))
     } else {
         screen.height
     };

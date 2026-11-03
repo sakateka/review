@@ -410,7 +410,23 @@ impl Theme {
             style = style.fg(color);
         }
         if role.emphasis {
-            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            style = style.add_modifier(Modifier::BOLD);
+            let tint = match role.base {
+                Base::Added => Some((
+                    rgb_of(self.added_fg).unwrap_or(Color::Rgb(80, 160, 80)),
+                    self.added_bg,
+                )),
+                Base::Removed => Some((
+                    rgb_of(self.removed_fg).unwrap_or(Color::Rgb(220, 80, 80)),
+                    self.removed_bg,
+                )),
+                _ => None,
+            };
+            if let Some((color, background)) = tint
+                && let Some(background) = blend(color, background, 0.18)
+            {
+                style = style.bg(background);
+            }
         }
         style
     }

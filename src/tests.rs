@@ -208,7 +208,7 @@ fn mapped_source_and_styling_preserve_the_captured_lines() {
             .lines
             .iter()
             .flat_map(|line| &line.spans)
-            .any(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
     );
 }
 
@@ -553,9 +553,12 @@ fn preview_preserves_carriage_returns_in_structured_and_original_output() {
         .unwrap();
     assert!(!removed.to_string().ends_with("\\r"));
     assert!(added.to_string().ends_with("\\r"));
-    assert!(added.spans.iter().any(
-        |span| span.content == "\\r" && span.style.add_modifier.contains(Modifier::UNDERLINED)
-    ));
+    assert!(
+        added
+            .spans
+            .iter()
+            .any(|span| span.content == "\\r" && span.style.add_modifier.contains(Modifier::BOLD))
+    );
 }
 
 #[test]
@@ -612,7 +615,7 @@ fn preview_intraline_emphasizes_source_starting_with_header_like_dashes() {
         assert!(
             line.spans
                 .iter()
-                .any(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
         );
     }
     let header = preview
@@ -624,7 +627,7 @@ fn preview_intraline_emphasizes_source_starting_with_header_like_dashes() {
         header
             .spans
             .iter()
-            .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .all(|span| !span.style.add_modifier.contains(Modifier::BOLD))
     );
 }
 
@@ -6464,10 +6467,7 @@ fn yaml_colors_distinguish_tokens_in_captured_source_and_both_diff_sides() {
             assert!(style_at(&diff, token).bg.is_some());
             let changed_digit = diff.lines.iter().flat_map(|line| &line.spans).any(|span| {
                 span.content.contains(if token == "42" { '2' } else { '3' })
-                    && span
-                        .style
-                        .add_modifier
-                        .contains(Modifier::UNDERLINED | Modifier::BOLD)
+                    && span.style.add_modifier.contains(Modifier::BOLD)
             });
             assert!(changed_digit);
         }
@@ -6648,11 +6648,7 @@ fn toml_colors_preserve_captured_sources_coordinates_and_diff_emphasis() {
         assert_eq!(style_at(&diff, token).fg, Some(Color::Yellow));
         assert!(style_at(&diff, token).bg.is_some());
         assert!(diff.lines.iter().flat_map(|line| &line.spans).any(|span| {
-            span.content.contains(digit)
-                && span
-                    .style
-                    .add_modifier
-                    .contains(Modifier::UNDERLINED | Modifier::BOLD)
+            span.content.contains(digit) && span.style.add_modifier.contains(Modifier::BOLD)
         }));
     }
     assert_eq!(sources.old.content, old);
@@ -7035,17 +7031,18 @@ fn gruvbox_dark_distinguishes_code_tokens_keys_and_diff_sides() {
     let removed = fg_at(&diff, "-    let number", "1");
     assert!(added.bg.is_some() && removed.bg.is_some());
     assert_ne!(added.bg, removed.bg);
-    assert_eq!(added.bg, Some(theme.added_bg));
-    assert!(
-        added
-            .add_modifier
-            .contains(Modifier::BOLD | Modifier::UNDERLINED)
-    );
+    assert_ne!(added.bg, Some(theme.added_bg));
+    assert_ne!(removed.bg, Some(theme.removed_bg));
+    assert!(!added.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(!removed.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(added.add_modifier.contains(Modifier::BOLD));
     // The background of ordinary text is never painted.
     assert!(diff.lines.iter().flat_map(|line| &line.spans).all(|span| {
         span.style.bg.is_none()
             || span.style.bg == Some(theme.added_bg)
             || span.style.bg == Some(theme.removed_bg)
+            || span.style.bg == added.bg
+            || span.style.bg == removed.bg
     }));
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
@@ -10562,9 +10559,15 @@ fn addition_text_keeps_normal_foreground_and_marker_survives_retheme() {
             .find(|line| line.to_string() == "+new plain")
             .unwrap();
         assert_eq!(line.spans[0].style.fg, Some(theme.added_fg));
-        for span in &line.spans[1..] {
+        for (index, span) in line.spans[1..].iter().enumerate() {
             assert_eq!(span.style.fg, theme.default_fg);
-            assert_eq!(span.style.bg, Some(theme.added_bg));
+            assert!(!span.style.add_modifier.contains(Modifier::UNDERLINED));
+            if index < 3 {
+                assert_ne!(span.style.bg, Some(theme.added_bg));
+                assert!(span.style.bg.is_some());
+            } else {
+                assert_eq!(span.style.bg, Some(theme.added_bg));
+            }
         }
         let rendered = screen(&mut app, 100, 24);
         assert!(rendered.content.iter().any(|cell| cell.symbol() == "+"
