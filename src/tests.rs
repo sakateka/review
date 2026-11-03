@@ -113,7 +113,7 @@ fn outer_and_inner_argument_boundaries_are_native() {
 }
 
 #[test]
-fn native_argument_bytes_and_length_delimiters_do_not_alias() {
+fn native_arguments_are_preserved_but_do_not_scope_marks() {
     use std::os::unix::ffi::OsStringExt;
     let raw = OsString::from_vec(vec![b'p', 0xff]);
     assert_eq!(
@@ -126,7 +126,7 @@ fn native_argument_bytes_and_length_delimiters_do_not_alias() {
     );
     let one = state::Store::at(Path::new("/tmp"), Path::new("/repository"), &[raw]);
     let two = state::Store::at(Path::new("/tmp"), Path::new("/repository"), &["p�".into()]);
-    assert_ne!(one.path, two.path);
+    assert_eq!(one.path, two.path);
     assert_ne!(
         state::digest([b"a".as_slice(), b"bc"]),
         state::digest([b"ab".as_slice(), b"c"])
@@ -501,7 +501,7 @@ fn external_helpers_are_diagnosed_without_running() {
 }
 
 #[test]
-fn nominal_changed_patch_clears_only_its_mark_and_sessions_are_separate() {
+fn changed_patch_clears_only_its_mark_across_arguments() {
     let directory = fixture();
     let state = tempfile::tempdir().unwrap();
     change(directory.path());
@@ -522,7 +522,7 @@ fn nominal_changed_patch_clears_only_its_mark_and_sessions_are_separate() {
         capture(directory.path(), &[]),
         state::Store::at(state.path(), directory.path(), &[]),
     );
-    assert_eq!(distinct.marks, [false, false]);
+    assert_eq!(distinct.marks, [false, true]);
 }
 
 #[test]
@@ -832,7 +832,7 @@ fn no_index_marks_follow_captured_file_bytes_and_invalidate_on_change() {
 }
 
 #[test]
-fn identical_mode_only_patch_with_changed_sides_clears_mark() {
+fn identical_mode_only_patch_with_changed_sides_retains_mark() {
     use std::os::unix::fs::PermissionsExt;
     let directory = fixture();
     let state_dir = tempfile::tempdir().unwrap();
@@ -881,7 +881,7 @@ fn identical_mode_only_patch_with_changed_sides_clears_mark() {
             state::Store::at(state_dir.path(), directory.path(), &args)
         )
         .marks,
-        [false]
+        [true]
     );
 }
 
@@ -1012,8 +1012,8 @@ fn mutations_at_capture_boundary_disable_proof_but_post_capture_marks_stay_bound
         state::Store::at(state_dir.path(), directory.path(), &args),
     );
     app.key(KeyCode::Char('m'));
-    assert!(!app.marks[app.selected]);
-    assert!(app.status.contains("could not be proven"));
+    assert!(app.marks[app.selected]);
+    assert_eq!(app.status, "Review mark saved");
 
     std::fs::write(&changed_path, b"captured before later mutation\n").unwrap();
     let captured = git::capture(directory.path(), &args).unwrap();
@@ -1036,27 +1036,79 @@ fn mutations_at_capture_boundary_disable_proof_but_post_capture_marks_stay_bound
 }
 
 #[test]
-fn legacy_session_path_is_read_and_unproven_marks_stay_pending() {
+fn old_state_paths_are_ignored_and_untouched() {
     let directory = fixture();
     let base = tempfile::tempdir().unwrap();
     change(directory.path());
     let args = vec![OsString::from("HEAD")];
     let store = state::Store::at(base.path(), directory.path(), &args);
+    let context: std::collections::BTreeMap<_, _> = std::env::vars_os()
+        .filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_"))
+        .collect();
+    let mut parts = vec![
+        b"review-session-v1".as_slice(),
+        directory.path().as_os_str().as_encoded_bytes(),
+        b"git-environment",
+    ];
+    for (key, value) in &context {
+        parts.push(key.as_encoded_bytes());
+        parts.push(value.as_encoded_bytes());
+    }
+    parts.push(b"original-arguments");
+    parts.push(b"HEAD");
+    let old_path = base
+        .path()
+        .join("review")
+        .join(format!("{}.json", state::digest(parts)));
+    std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+    let bytes = b"invalid legacy state must be ignored";
+    std::fs::write(&old_path, bytes).unwrap();
+    assert_ne!(old_path, store.path);
     let captured = git::capture(directory.path(), &args).unwrap();
-    let legacy_marks: std::collections::BTreeMap<_, _> = captured
+    let mut repository_context = Vec::new();
+    for words in [
+        vec!["rev-parse", "--show-toplevel"],
+        vec!["rev-parse", "--git-common-dir"],
+        vec!["rev-parse", "--git-path", "index"],
+    ] {
+        let output = git_run(directory.path(), &words);
+        repository_context.extend_from_slice(output.strip_suffix(b"\n").unwrap());
+        repository_context.push(0);
+    }
+    let mut parts = vec![
+        b"review-session-v2".as_slice(),
+        directory.path().as_os_str().as_encoded_bytes(),
+        b"git-environment",
+        &repository_context,
+    ];
+    for (key, value) in &context {
+        parts.push(key.as_encoded_bytes());
+        parts.push(value.as_encoded_bytes());
+    }
+    parts.push(b"original-arguments");
+    parts.push(b"HEAD");
+    let old_v2 = base
+        .path()
+        .join("review")
+        .join(format!("{}.json", state::digest(parts)));
+    let marks: std::collections::BTreeMap<_, _> = captured
         .items
         .iter()
-        .map(|item| (state::digest([&item.new_path]), "unverifiable-legacy-mark"))
+        .map(|item| {
+            (
+                state::digest([&item.new_path]),
+                item.canonical_identity.clone().unwrap(),
+            )
+        })
         .collect();
-    std::fs::create_dir_all(store.legacy_path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &store.legacy_path,
-        serde_json::to_vec(&serde_json::json!({"version": 1, "marks": legacy_marks})).unwrap(),
-    )
-    .unwrap();
-    let loaded = store.load_report(&captured.items).unwrap();
-    assert_eq!(loaded.marks, [false, false]);
-    assert!(loaded.pending_legacy);
+    let v2_bytes = serde_json::to_vec(&serde_json::json!({"version": 2, "marks": marks})).unwrap();
+    std::fs::write(&old_v2, &v2_bytes).unwrap();
+    assert_ne!(old_v2, store.path);
+    assert_eq!(store.load(&captured.items).unwrap(), [false, false]);
+    store.save_mark(&captured.items[0], true).unwrap();
+    assert_eq!(std::fs::read(old_v2).unwrap(), v2_bytes);
+    assert_eq!(store.load(&captured.items).unwrap(), [true, false]);
+    assert_eq!(std::fs::read(old_path).unwrap(), bytes);
 }
 
 #[test]
@@ -1164,59 +1216,18 @@ fn invalid_native_bytes_have_distinct_visible_names_and_output() {
 }
 
 #[test]
-fn nominal_saved_marks_from_full_index_capture_are_restored() {
+fn unsupported_new_state_is_preserved() {
     let directory = fixture();
     let base = tempfile::tempdir().unwrap();
     change(directory.path());
-    let captured = capture(directory.path(), &["HEAD"]);
-    let output = Command::new("git")
-        .current_dir(directory.path())
-        .args([
-            "diff",
-            "--raw",
-            "-z",
-            "--patch",
-            "--full-index",
-            "--no-abbrev",
-            "--no-color",
-            "HEAD",
-        ])
-        .output()
-        .unwrap();
-    let mut bytes = output.stdout.as_slice();
-    let mut metadata = Vec::new();
-    while bytes.starts_with(b":") {
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap();
-        metadata.push(bytes[..end].to_vec());
-        bytes = &bytes[end + 1..];
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap();
-        bytes = &bytes[end + 1..];
-    }
-    bytes = &bytes[1..];
-    let second = bytes
-        .windows(11)
-        .position(|part| part == b"diff --git " && part.as_ptr() != bytes.as_ptr())
-        .unwrap();
-    let patches = [&bytes[..second], &bytes[second..]];
-    let store = state::Store::at(base.path(), directory.path(), &["HEAD".into()]);
-    let marks: std::collections::BTreeMap<_, _> = captured
-        .items
-        .iter()
-        .zip(metadata.iter().zip(patches))
-        .map(|(item, (metadata, patch))| {
-            (
-                state::digest([&item.new_path]),
-                state::digest([item.old_path.as_slice(), &item.new_path, metadata, patch]),
-            )
-        })
-        .collect();
+    let store = state::Store::at(base.path(), directory.path(), &[]);
     std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &store.path,
-        serde_json::to_vec(&serde_json::json!({"version": 1, "marks": marks})).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(store.load(&captured.items).unwrap(), [true, true]);
+    let bytes = br#"{"version":2,"marks":{}}"#;
+    std::fs::write(&store.path, bytes).unwrap();
+    let captured = capture(directory.path(), &["HEAD"]);
+    assert!(store.load(&captured.items).is_err());
+    assert!(store.save_mark(&captured.items[0], true).is_err());
+    assert_eq!(std::fs::read(store.path).unwrap(), bytes);
 }
 
 fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
@@ -1493,78 +1504,19 @@ fn empty_added_files_are_items_even_without_hunks() {
     assert!(source::load(directory.path(), &captured.items[0]).is_err());
 }
 
-// Write the exact v1 mark fingerprints that the original raw/full-index
-// capture produced. The compatibility oracle is Git's baseline byte stream,
-// independent of the new reconstruction and fingerprint implementation.
-fn save_baseline_marks(cwd: &Path, base: &Path, args: &[&str]) -> state::Store {
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args([
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--raw",
-            "-z",
-            "--patch",
-            "--full-index",
-            "--no-abbrev",
-            "--no-color",
-        ])
-        .args(args)
-        .output()
+// Save new-format marks while preserving independent source-proof coverage.
+fn save_displayed_marks(cwd: &Path, base: &Path, args: &[&str]) -> state::Store {
+    let args: Vec<_> = args.iter().map(OsString::from).collect();
+    let captured = git::capture(cwd, &args).unwrap();
+    let store = state::Store::at(base, cwd, &args);
+    store
+        .save(&captured.items, &vec![true; captured.items.len()])
         .unwrap();
-    assert!(output.status.success());
-    let mut bytes = output.stdout.as_slice();
-    let mut records = Vec::new();
-    while bytes.starts_with(b":") {
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap();
-        let metadata = bytes[..end].to_vec();
-        bytes = &bytes[end + 1..];
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap();
-        let path = bytes[..end].to_vec();
-        bytes = &bytes[end + 1..];
-        assert!(matches!(metadata.last(), Some(b'M' | b'A' | b'D' | b'T')));
-        records.push((metadata, path));
-    }
-    assert_eq!(bytes.first(), Some(&0));
-    bytes = &bytes[1..];
-    let mut starts: Vec<_> = bytes
-        .windows(11)
-        .enumerate()
-        .filter_map(|(index, part)| {
-            (part == b"diff --git " && (index == 0 || bytes[index - 1] == b'\n')).then_some(index)
-        })
-        .collect();
-    assert_eq!(starts.len(), records.len());
-    starts.push(bytes.len());
-    let marks: std::collections::BTreeMap<_, _> = records
-        .iter()
-        .zip(starts.windows(2))
-        .map(|((metadata, path), bounds)| {
-            let patch = &bytes[bounds[0]..bounds[1]];
-            assert!(patch.windows(3).any(|part| part == b"@@ "));
-            (
-                state::digest([path]),
-                state::digest([path.as_slice(), path, metadata, patch]),
-            )
-        })
-        .collect();
-    let store = state::Store::at(
-        base,
-        cwd,
-        &args.iter().map(OsString::from).collect::<Vec<_>>(),
-    );
-    std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &store.path,
-        serde_json::to_vec(&serde_json::json!({"version": 1, "marks": marks})).unwrap(),
-    )
-    .unwrap();
     store
 }
 
 #[test]
-fn legacy_marks_restore_non_utf8_and_missing_final_newline_sources() {
+fn displayed_marks_restore_non_utf8_and_missing_final_newline_sources() {
     for (old, new) in [
         (b"old\n".as_slice(), b"new".as_slice()),
         (b"old", b"new\n"),
@@ -1584,7 +1536,7 @@ fn legacy_marks_restore_non_utf8_and_missing_final_newline_sources() {
         git_run(directory.path(), &["commit", "-qm", "byte source"]);
         std::fs::write(directory.path().join("one.rs"), new).unwrap();
         let args = ["HEAD", "one.rs"];
-        let store = save_baseline_marks(directory.path(), base.path(), &args);
+        let store = save_displayed_marks(directory.path(), base.path(), &args);
         let captured = capture(directory.path(), &args);
         assert_eq!(captured.items.len(), 1, "{old:?} -> {new:?}");
         let item = &captured.items[0];
@@ -1608,7 +1560,7 @@ fn legacy_marks_restore_non_utf8_and_missing_final_newline_sources() {
 }
 
 #[test]
-fn legacy_byte_marks_restore_for_staged_refs_additions_and_deletions() {
+fn displayed_byte_marks_restore_for_staged_refs_additions_and_deletions() {
     let directory = fixture();
     let base = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("one.rs"), b"old-\xff").unwrap();
@@ -1618,25 +1570,25 @@ fn legacy_byte_marks_restore_for_staged_refs_additions_and_deletions() {
     std::fs::write(directory.path().join("added.rs"), b"added-\xff").unwrap();
     std::fs::remove_file(directory.path().join("two.rs")).unwrap();
     git_run(directory.path(), &["add", "."]);
-    let store = save_baseline_marks(directory.path(), base.path(), &["--cached"]);
+    let store = save_displayed_marks(directory.path(), base.path(), &["--cached"]);
     let captured = capture(directory.path(), &["--cached"]);
     assert_eq!(captured.items.len(), 3);
     assert_eq!(store.load(&captured.items).unwrap(), [true; 3]);
     // HEAD-to-worktree can reuse full index IDs in its raw records even
     // though the command is not --cached. Preserve that baseline form too.
-    let store = save_baseline_marks(directory.path(), base.path(), &["HEAD"]);
+    let store = save_displayed_marks(directory.path(), base.path(), &["HEAD"]);
     let captured = capture(directory.path(), &["HEAD"]);
     assert_eq!(store.load(&captured.items).unwrap(), [true; 3]);
     git_run(directory.path(), &["commit", "-qm", "new bytes"]);
     for args in [&["HEAD~", "HEAD"][..], &["HEAD~..HEAD"]] {
-        let store = save_baseline_marks(directory.path(), base.path(), args);
+        let store = save_displayed_marks(directory.path(), base.path(), args);
         let captured = capture(directory.path(), args);
         assert_eq!(store.load(&captured.items).unwrap(), [true; 3]);
     }
 }
 
 #[test]
-fn legacy_symlink_marks_restore_without_enabling_text_enrichment() {
+fn displayed_symlink_marks_restore_without_enabling_text_enrichment() {
     let directory = fixture();
     let base = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink("one.rs", directory.path().join("link.rs")).unwrap();
@@ -1644,7 +1596,7 @@ fn legacy_symlink_marks_restore_without_enabling_text_enrichment() {
     git_run(directory.path(), &["commit", "-qm", "link"]);
     std::fs::remove_file(directory.path().join("link.rs")).unwrap();
     std::os::unix::fs::symlink("two.rs", directory.path().join("link.rs")).unwrap();
-    let store = save_baseline_marks(directory.path(), base.path(), &["HEAD"]);
+    let store = save_displayed_marks(directory.path(), base.path(), &["HEAD"]);
     let captured = capture(directory.path(), &["HEAD"]);
     assert_eq!(captured.items.len(), 1);
     assert_eq!(store.load(&captured.items).unwrap(), [true]);
@@ -2244,7 +2196,7 @@ fn staged_metadata_marks_use_base_tree_and_index_for_modes_and_exact_renames() {
             state::Store::at(state_dir.path(), directory.path(), &args)
                 .load(&changed.items)
                 .unwrap(),
-            [false, true]
+            [true, true]
         );
     }
     let directory = fixture();
@@ -2319,69 +2271,24 @@ fn subdirectory_worktree_capture_uses_native_root_relative_paths() {
 }
 
 #[test]
-fn pending_legacy_survives_v2_saves_and_migrated_unmarks_never_resurrect() {
+fn changed_mark_updates_preserve_other_instances_decisions() {
     let directory = fixture();
     let state_dir = tempfile::tempdir().unwrap();
     change(directory.path());
-    let args = vec!["HEAD".into()];
-    let captured = git::capture(directory.path(), &args).unwrap();
-    let store = state::Store::at(state_dir.path(), directory.path(), &args);
-    let mut legacy = std::collections::BTreeMap::new();
-    for item in &captured.items {
-        legacy.insert(
-            state::digest([&item.new_path]),
-            item.legacy_fingerprints[0].clone(),
-        );
-    }
-    legacy.insert(
-        "absent-unverifiable-item".to_owned(),
-        "abbreviated-patch-only".to_owned(),
-    );
-    let bytes = serde_json::to_vec(&serde_json::json!({"version": 1, "marks": legacy})).unwrap();
-    std::fs::create_dir_all(store.legacy_path.parent().unwrap()).unwrap();
-    std::fs::write(&store.legacy_path, &bytes).unwrap();
-    git_run(directory.path(), &["restore", "two.rs"]);
-    let mut app = App::new(git::capture(directory.path(), &args).unwrap(), store);
-    assert_eq!(app.marks, [true]);
-    assert!(app.status.contains("pending"));
-    app.key(KeyCode::Char('m')); // Persist explicit unmark of migrated one.rs.
-    assert_eq!(app.marks, [false]);
-    assert!(app.store.path.exists());
-    let loaded = app
-        .store
-        .load_report(&git::capture(directory.path(), &args).unwrap().items)
-        .unwrap();
-    assert_eq!(loaded.marks, [false]);
-    assert!(loaded.pending_legacy);
-    change(directory.path()); // Previously absent two.rs can now prove its legacy identity.
-    let loaded = app
-        .store
-        .load_report(&git::capture(directory.path(), &args).unwrap().items)
-        .unwrap();
-    assert_eq!(loaded.marks, [false, true]);
-    assert!(loaded.pending_legacy);
-    assert_eq!(std::fs::read(&app.store.legacy_path).unwrap(), bytes);
-    app.store
-        .save(
-            &git::capture(directory.path(), &args).unwrap().items,
-            &[false, false],
-        )
-        .unwrap();
+    let mut first = application(directory.path(), state_dir.path());
+    let mut stale = application(directory.path(), state_dir.path());
+    first.key(KeyCode::Char('m'));
+    stale.key(KeyCode::Char('j'));
+    stale.key(KeyCode::Char('m'));
     assert_eq!(
-        app.store
-            .load(&git::capture(directory.path(), &args).unwrap().items)
-            .unwrap(),
+        application(directory.path(), state_dir.path()).marks,
+        [true, true]
+    );
+    first.key(KeyCode::Char('m'));
+    stale.key(KeyCode::Char('m'));
+    assert_eq!(
+        application(directory.path(), state_dir.path()).marks,
         [false, false]
-    );
-    // A corrupt legacy file is still a protected input after v2 exists.
-    let v2_bytes = std::fs::read(&app.store.path).unwrap();
-    std::fs::write(&app.store.legacy_path, b"unknown corrupt input").unwrap();
-    assert!(app.store.load_report(&captured.items).is_err());
-    assert!(app.store.save(&captured.items, &[true, true]).is_err());
-    assert_eq!(std::fs::read(&app.store.path).unwrap(), v2_bytes);
-    assert_eq!(
-        std::fs::read(&app.store.legacy_path).unwrap(),
-        b"unknown corrupt input"
     );
 }
 
@@ -7018,7 +6925,7 @@ fn gruvbox_baby_uses_the_upstream_tree_sitter_palette() {
     assert_eq!(theme, theme::Theme::gruvbox_baby());
     assert_eq!(theme.name, "gruvbox-baby");
     assert_eq!(theme.default_fg, Some(Color::Rgb(0xeb, 0xdb, 0xb2)));
-    assert_eq!(theme.added_bg, Color::Rgb(0x26, 0x33, 0x2c));
+    assert_eq!(theme.added_bg, Color::Rgb(0x2a, 0x2d, 0x27));
     assert_eq!(theme.removed_bg, Color::Rgb(0x57, 0x2e, 0x33));
     let mut catalog = source::Catalog::default();
     catalog.insert(
@@ -10416,4 +10323,268 @@ mod keyboard_layouts {
         assert!(!app.key(KeyCode::Char('б')));
         assert!(app.key(KeyCode::Char('й')));
     }
+}
+
+#[test]
+fn displayed_marks_cross_head_origin_main_but_not_worktrees() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    git_run(
+        directory.path(),
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    change(directory.path());
+    let args = ["-M".into(), "HEAD".into()];
+    let mut first = App::new(
+        git::capture(directory.path(), &args).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &args),
+    );
+    first.key(KeyCode::Char('m'));
+    first.key(KeyCode::Char('j'));
+    first.key(KeyCode::Char('m'));
+    let other = ["-M".into(), "origin/main".into()];
+    let mut reopened = App::new(
+        git::capture(directory.path(), &other).unwrap(),
+        state::Store::at(state_dir.path(), directory.path(), &other),
+    );
+    assert_eq!(reopened.marks, [true, true]);
+    assert!(screen_text(&screen(&mut reopened, 100, 24)).contains("+ one.rs"));
+    reopened.key(KeyCode::Char('m'));
+    assert_eq!(
+        application(directory.path(), state_dir.path()).marks,
+        [false, true]
+    );
+    std::fs::write(directory.path().join("two.rs"), "fn two() { changed(); }\n").unwrap();
+    assert_eq!(
+        application(directory.path(), state_dir.path()).marks,
+        [false, false]
+    );
+    change(directory.path());
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    git_run(
+        directory.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    change(&linked);
+    assert_eq!(application(&linked, state_dir.path()).marks, [false, false]);
+    let separate = fixture();
+    change(separate.path());
+    assert_eq!(
+        application(separate.path(), state_dir.path()).marks,
+        [false, false]
+    );
+    let sub = directory.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    assert_eq!(
+        state::Store::at(state_dir.path(), &sub, &[]).path,
+        first.store.path
+    );
+}
+
+#[test]
+fn displayed_identity_normalizes_only_metadata_and_hunk_coordinates() {
+    let directory = fixture();
+    change(directory.path());
+    let mut item = capture(directory.path(), &["HEAD"]).items.remove(0);
+    item.patch = b"diff --git a/one.rs b/one.rs\nold mode 100644\nnew mode 100755\nindex 1234567..abcdef0 100755\n--- a/one.rs\n+++ b/one.rs\n@@ -1,2 +1,2 @@ fn example()\n index hash-like context\n-old mode 100644\n+new mode 100755\n\\ No newline at end of file\n".to_vec();
+    let original = item.patch_identity();
+    let mut changed = item.clone();
+    changed.patch = String::from_utf8(changed.patch)
+        .unwrap()
+        .replace(
+            "old mode 100644\nnew mode 100755\nindex 1234567..abcdef0 100755\n",
+            "index fedcba0..7654321 100644\n",
+        )
+        .replace("@@ -1,2 +1,2 @@", "@@ -999,2 +1200,2 @@")
+        .into_bytes();
+    changed.old_mode = "100755".into();
+    changed.new_mode = "100644".into();
+    assert_eq!(original, changed.patch_identity());
+    for (from, to) in [
+        (" index hash-like context", " index changed context"),
+        ("-old mode 100644", "-old mode 100755"),
+        ("+new mode 100755", "+new mode 100644"),
+        ("+new mode", "+new  mode"),
+        ("fn example()", "fn different()"),
+        ("\\ No newline at end of file\n", ""),
+    ] {
+        let mut different = item.clone();
+        different.patch = String::from_utf8(different.patch)
+            .unwrap()
+            .replace(from, to)
+            .into_bytes();
+        assert_ne!(original, different.patch_identity(), "{from}");
+    }
+    changed = item.clone();
+    changed.new_path = b"another.rs".to_vec();
+    assert_ne!(original, changed.patch_identity());
+    changed = item.clone();
+    changed.patch = b"diff --git a/empty b/empty\nnew file mode 100644\n".to_vec();
+    changed.status = "A".into();
+    let addition = changed.patch_identity();
+    changed.patch = b"diff --git a/empty b/empty\ndeleted file mode 100644\n".to_vec();
+    changed.status = "D".into();
+    assert_ne!(addition, changed.patch_identity());
+}
+
+#[test]
+fn binary_marks_follow_notice_while_source_proof_tracks_hidden_bytes() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("one.rs"), b"old\0binary").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "binary base"]);
+    std::fs::write(directory.path().join("one.rs"), b"first\0binary").unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    let proof = app.capture.items[0].canonical_identity.clone();
+    let identity = app.capture.items[0].patch_identity();
+    app.key(KeyCode::Char('m'));
+    std::fs::write(directory.path().join("one.rs"), b"different\0binary").unwrap();
+    let reopened = application(directory.path(), state_dir.path());
+    assert_eq!(reopened.marks, [true]);
+    assert_eq!(reopened.capture.items[0].patch_identity(), identity);
+    assert_ne!(reopened.capture.items[0].canonical_identity, proof);
+}
+
+#[test]
+fn marks_survive_real_hunk_shift_but_not_changed_context() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let path = directory.path().join("notes.txt");
+    let old: String = (0..30).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(&path, &old).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "base text"]);
+    std::fs::write(&path, old.replace("line 15\n", "reviewed change\n")).unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Char('m'));
+    let proof = app.capture.items[0].canonical_identity.clone();
+    let patch = app.capture.items[0].patch.clone();
+
+    // Simulate a new base adding lines outside the reviewed hunk.
+    let shifted = format!("unrelated first line\n{old}");
+    std::fs::write(&path, &shifted).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "advance base"]);
+    let changed = shifted.replace("line 15\n", "reviewed change\n");
+    std::fs::write(&path, &changed).unwrap();
+    let reopened = application(directory.path(), state_dir.path());
+    assert_ne!(reopened.capture.items[0].patch, patch);
+    assert_ne!(reopened.capture.items[0].canonical_identity, proof);
+    assert_eq!(reopened.marks, [true]);
+
+    // A changed context line on both sides is still visible in the diff.
+    std::fs::write(&path, shifted.replace("line 14\n", "different context\n")).unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "change context"]);
+    std::fs::write(&path, changed.replace("line 14\n", "different context\n")).unwrap();
+    assert_eq!(
+        application(directory.path(), state_dir.path()).marks,
+        [false]
+    );
+}
+
+#[test]
+fn file_cycle_restores_cursor_both_offsets_and_after_changes_mode() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    let old: String = (0..100)
+        .map(|n| format!("line {n} {} old\n", "x".repeat(180)))
+        .collect();
+    let new = old.replace("old", "new");
+    for name in ["one.rs", "two.rs"] {
+        std::fs::write(directory.path().join(name), &old).unwrap();
+    }
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "long files"]);
+    for name in ["one.rs", "two.rs"] {
+        std::fs::write(directory.path().join(name), &new).unwrap();
+    }
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 80, 20);
+    app.cursor = (60, 140);
+    app.keep_cursor_visible();
+    let first = (app.cursor, app.top, app.left);
+    assert!(first.1 > 0 && first.2 > 0);
+    app.key_event(ctrl('j'));
+    app.key(KeyCode::Char('a'));
+    app.cursor = (35, 100);
+    app.keep_cursor_visible();
+    let second = (app.cursor, app.top, app.left);
+    let lines = app.preview.as_ref().unwrap().lines.clone();
+    app.key_event(ctrl('k'));
+    assert_eq!((app.cursor, app.top, app.left), first);
+    app.key_event(ctrl('j'));
+    assert_eq!((app.cursor, app.top, app.left), second);
+    assert_eq!(app.preview.as_ref().unwrap().lines, lines);
+    screen(&mut app, 40, 9);
+    assert!(app.top <= app.cursor.0 && app.cursor.0 < app.top + app.viewport.0);
+    assert!(app.left <= app.cursor.1 && app.cursor.1 < app.left + app.viewport.1);
+    assert_eq!(app.marks, [false, false]);
+    assert!(!app.store.path.exists());
+    let mut fresh = application(directory.path(), state_dir.path());
+    fresh.key(KeyCode::Enter);
+    assert_eq!((fresh.cursor, fresh.top, fresh.left), ((0, 0), 0, 0));
+}
+
+#[test]
+fn addition_text_keeps_normal_foreground_and_marker_survives_retheme() {
+    let directory = fixture();
+    let state_dir = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("notes.txt"), "old plain\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "plain file"]);
+    change(directory.path());
+    std::fs::write(directory.path().join("notes.txt"), "new plain\n").unwrap();
+    let mut app = application(directory.path(), state_dir.path());
+    app.key(KeyCode::Enter);
+    for theme in [
+        theme::Theme::gruvbox_baby(),
+        theme::Theme::classic(),
+        theme::Theme::gruvbox_baby(),
+    ] {
+        app.set_theme(theme);
+        let line = app
+            .preview
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .find(|line| line.to_string() == "+new plain")
+            .unwrap();
+        assert_eq!(line.spans[0].style.fg, Some(theme.added_fg));
+        for span in &line.spans[1..] {
+            assert_eq!(span.style.fg, theme.default_fg);
+            assert_eq!(span.style.bg, Some(theme.added_bg));
+        }
+        let rendered = screen(&mut app, 100, 24);
+        assert!(rendered.content.iter().any(|cell| cell.symbol() == "+"
+            && cell.fg == theme.added_fg
+            && cell.bg == theme.added_bg));
+    }
+    app.key_event(ctrl('j'));
+    let line = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .lines
+        .iter()
+        .find(|line| line.to_string().starts_with("+    let"))
+        .unwrap();
+    assert_eq!(line.spans[0].style.fg, Some(app.theme.added_fg));
+    assert!(
+        line.spans[1..]
+            .iter()
+            .any(|span| span.style.fg != Some(app.theme.added_fg)
+                && span.style.fg != app.theme.default_fg)
+    );
 }

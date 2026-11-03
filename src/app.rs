@@ -51,6 +51,7 @@ pub struct App {
     center_preview_on_layout: Option<(usize, usize)>,
     pub cursor: (usize, usize),
     history: Vec<View>,
+    diff_views: std::collections::BTreeMap<usize, DiffView>,
     pub file_area: Rect,
     pub preview_area: Rect,
     pub file_offset: usize,
@@ -82,6 +83,14 @@ pub struct Navigation {
     position: Option<(usize, usize, usize)>,
 }
 #[derive(Clone)]
+struct DiffView {
+    preview: Preview,
+    cursor: (usize, usize),
+    top: usize,
+    left: usize,
+}
+
+#[derive(Clone)]
 struct View {
     preview: Option<Preview>,
     top: usize,
@@ -99,17 +108,8 @@ struct View {
 }
 impl App {
     pub fn new(capture: Capture, store: Store) -> Self {
-        let (marks, status, state_error) = match store.load_report(&capture.items) {
-            Ok(loaded) => {
-                let mut status = capture.diagnostic.clone();
-                if loaded.pending_legacy {
-                    if !status.is_empty() {
-                        status.push_str("; ");
-                    }
-                    status.push_str("Some prior review marks remain pending because their complete comparison identity cannot be proven");
-                }
-                (loaded.marks, status, false)
-            }
+        let (marks, status, state_error) = match store.load(&capture.items) {
+            Ok(marks) => (marks, capture.diagnostic.clone(), false),
             Err(error) => (
                 vec![false; capture.items.len()],
                 format!("{error:#}; marking is disabled to preserve prior state"),
@@ -166,6 +166,7 @@ impl App {
             startup: None,
             timed_navigation: None,
             history: Vec::new(),
+            diff_views: std::collections::BTreeMap::new(),
             capture,
             store,
             marks,
@@ -1030,10 +1031,29 @@ impl App {
             ((selected + len - 1) % len, selected == 0)
         };
         let focus = self.focus;
+        if let Some(preview) = &self.preview {
+            self.diff_views.insert(
+                selected,
+                DiffView {
+                    preview: preview.clone(),
+                    cursor: self.cursor,
+                    top: self.top,
+                    left: self.left,
+                },
+            );
+        }
         self.selected = next;
         // History views belong to the previous file; drop them as `select` does.
         self.abandon_navigation();
         self.open_diff();
+        if let Some(mut view) = self.diff_views.get(&next).cloned() {
+            view.preview.restyle(&self.theme);
+            self.preview = Some(view.preview);
+            self.cursor = view.cursor;
+            self.top = view.top;
+            self.left = view.left;
+            self.keep_cursor_visible();
+        }
         self.focus = focus;
         self.keep_selection_visible();
         self.status = match (wrapped, forward) {
@@ -1535,22 +1555,13 @@ impl App {
         if self.state_error {
             return;
         }
-        if self
-            .capture
-            .items
-            .get(self.selected)
-            .is_some_and(|item| item.canonical_identity.is_none())
-            && !self.marks.get(self.selected).copied().unwrap_or(false)
-        {
-            self.status =
-                "Mark unavailable: complete compared contents could not be proven for this item"
-                    .into();
-            return;
-        }
         if let Some(mark) = self.marks.get(self.selected) {
             let mut next = self.marks.clone();
             next[self.selected] = !mark;
-            match self.store.save(&self.capture.items, &next) {
+            match self
+                .store
+                .save_mark(&self.capture.items[self.selected], next[self.selected])
+            {
                 Ok(()) => {
                     self.marks = next;
                     self.status = "Review mark saved".into();

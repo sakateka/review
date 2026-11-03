@@ -51,10 +51,9 @@ pub(crate) fn hunk_bytes(line: &[u8]) -> Option<(usize, usize, usize, usize)> {
 pub(crate) struct Reconstructed {
     pub old: Vec<u8>,
     pub new: Vec<u8>,
-    pub new_oid: String,
 }
 
-// Reconstruct bytes for identity/state independently from text enrichment.
+// Reconstruct bytes for complete source proof independently from text enrichment.
 // Missing-newline markers describe the preceding source row; they are not
 // source bytes. All context still has to match the pinned old blob exactly.
 pub(crate) fn reconstruct(cwd: &Path, item: &Item) -> Result<Reconstructed> {
@@ -173,14 +172,10 @@ pub(crate) fn reconstruct_from_old(
     } else if verify_oid && !new_oid.starts_with(&item.new_oid) {
         bail!("patch differs from the captured new-source hash");
     }
-    Ok(Reconstructed {
-        old,
-        new: result,
-        new_oid,
-    })
+    Ok(Reconstructed { old, new: result })
 }
 
-// Enrichment retains its explicit text/newline limitations. State identity uses
+// Enrichment retains its explicit text/newline limitations. Source identity uses
 // the verified byte reconstruction above and does not depend on highlighting.
 pub fn load(cwd: &Path, item: &Item) -> Result<Sources> {
     if ![&item.old_mode, &item.new_mode]

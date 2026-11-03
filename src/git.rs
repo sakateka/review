@@ -27,7 +27,6 @@ pub struct Item {
     pub old_source: SourceIdentity,
     pub new_source: SourceIdentity,
     pub patch: Vec<u8>,
-    pub legacy_fingerprints: Vec<String>,
     /// Digest of both complete captured sides and semantic item metadata.
     /// Missing when the representation cannot prove complete side bytes.
     pub canonical_identity: Option<String>,
@@ -43,6 +42,45 @@ pub enum Statistics {
 }
 
 impl Item {
+    /// Identity of the displayed patch, independent of complete source proof.
+    pub fn patch_identity(&self) -> String {
+        let mut normalized = Vec::new();
+        let mut in_hunk = false;
+        for line in self.patch.split_inclusive(|byte| *byte == b'\n') {
+            if line.starts_with(b"@@ ") {
+                // Preserve the hunk boundary and exact function/context suffix.
+                if let Some(end) = line[3..].windows(3).position(|part| part == b" @@") {
+                    normalized.extend_from_slice(b"@@ @@");
+                    normalized.extend_from_slice(&line[3 + end + 3..]);
+                }
+                in_hunk = true;
+            } else if !in_hunk
+                && [
+                    b"index ".as_slice(),
+                    b"old mode ",
+                    b"new mode ",
+                    b"new file mode ",
+                    b"deleted file mode ",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+            {
+                continue;
+            } else {
+                normalized.extend_from_slice(line);
+            }
+        }
+        // Explicit operation preserves empty creation/deletion distinctions
+        // even though mode metadata itself is deliberately ignored.
+        crate::state::digest([
+            b"displayed-patch-v1".as_slice(),
+            &self.old_path,
+            &self.new_path,
+            &self.status.as_bytes()[..1],
+            &normalized,
+        ])
+    }
+
     pub fn statistics(&self) -> Statistics {
         self.statistics
     }
@@ -879,8 +917,6 @@ pub(crate) fn capture_with_hook(
                     };
                 }
             }
-            item.legacy_fingerprints =
-                legacy_fingerprints(cwd, item, &analysis).unwrap_or_default();
         }
     }
     let unavailable = items.is_none().then(|| "File structure is unavailable for this output. Marks and source enrichment are disabled.".into());
@@ -906,7 +942,7 @@ pub(crate) fn capture_with_hook(
             if !diagnostic.is_empty() {
                 diagnostic.push_str("; ");
             }
-            diagnostic.push_str(&format!("{unproven} item(s) lack complete captured-content proof; their marks cannot be restored"));
+            diagnostic.push_str(&format!("{unproven} item(s) lack complete captured-content proof; source navigation may be unavailable"));
         }
     }
     let mut catalog = crate::source::Catalog::default();
@@ -1468,63 +1504,6 @@ fn object_side(cwd: &Path, oid: &str) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
-fn legacy_fingerprints(cwd: &Path, item: &Item, analysis: &Analysis) -> Option<Vec<String>> {
-    if item.old_path != item.new_path || !matches!(item.status.as_str(), "M" | "A" | "D" | "T") {
-        return None;
-    }
-    let sources = crate::source::reconstruct(cwd, item).ok()?;
-    let full_new = sources.new_oid;
-    let zero = "0".repeat(full_new.len());
-    let old = if item.old_source == SourceIdentity::Empty {
-        &zero
-    } else {
-        &item.old_oid
-    };
-    let new = if item.new_source == SourceIdentity::Empty {
-        &zero
-    } else {
-        &full_new
-    };
-    let mut canonical = Vec::new();
-    for line in item.patch.split_inclusive(|byte| *byte == b'\n') {
-        if let Some(identity) = line.strip_prefix(b"index ") {
-            let suffix = identity
-                .iter()
-                .position(|byte| *byte == b' ')
-                .map(|position| &identity[position..])
-                .unwrap_or(b"\n");
-            canonical.extend_from_slice(format!("index {old}..{new}").as_bytes());
-            canonical.extend_from_slice(suffix);
-        } else {
-            canonical.extend_from_slice(line);
-        }
-    }
-    // For a worktree comparison Git can print either a zero raw ID or the
-    // index's full ID when the stat cache proves it already knows that side.
-    // Both baseline records describe these exact verified captured bytes.
-    let raw_ids = if analysis.immutable {
-        vec![new]
-    } else {
-        vec![new, &zero]
-    };
-    let mut fingerprints = Vec::new();
-    for raw_new in raw_ids {
-        let metadata = format!(
-            ":{} {} {old} {raw_new} {}",
-            item.old_mode, item.new_mode, item.status
-        );
-        fingerprints.push(crate::state::digest([
-            item.old_path.as_slice(),
-            &item.new_path,
-            metadata.as_bytes(),
-            canonical.as_slice(),
-        ]));
-    }
-    fingerprints.sort();
-    fingerprints.dedup();
-    Some(fingerprints)
-}
-
 fn oid(value: &[u8]) -> Option<String> {
     (value.len() >= 4 && value.len() <= 64 && value.iter().all(u8::is_ascii_hexdigit))
         .then(|| String::from_utf8_lossy(value).into_owned())
@@ -1673,8 +1652,6 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
         } else {
             SourceIdentity::CapturedPatch
         };
-        // Keep the legacy record representation for ordinary items. Extended
-        // identities include both paths/modes/status in the persisted digest.
         items.push(Item {
             old_path: std::mem::take(&mut old_path),
             new_path: std::mem::take(&mut new_path),
@@ -1686,7 +1663,6 @@ pub(crate) fn parse(cwd: &Path, bytes: &[u8]) -> Option<Vec<Item>> {
             old_source,
             new_source,
             patch: patch.to_vec(),
-            legacy_fingerprints: Vec::new(),
             canonical_identity: None,
             captured_sources: None,
             statistics: Statistics::Unavailable,

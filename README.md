@@ -76,9 +76,17 @@ Belarusian keyboard layout active, as with Vim's `langmap`.
 
 Files show `-` while pending and `+` with a dimmed name once reviewed. Marks
 are saved immediately to `$XDG_STATE_HOME/review/` (by default
-`~/.local/state/review/`), separately for each repository and argument list.
-A mark is tied to the content of both sides of a file, so it survives a rebase
-or a branch moving as long as that file's diff is the same.
+`~/.local/state/review/`), separately for each worktree (or canonical current
+directory outside Git). Marks follow each file's displayed diff across argument
+changes, including `-M HEAD` and `-M origin/main`. Added, removed and displayed
+context bytes, paths and missing-newline markers matter; index hashes, modes,
+hunk line numbers and undisplayed content do not. Binary marks follow the
+printed notice. Explicit unmarking applies across arguments too. Older state
+files are left untouched and their marks are not imported.
+
+Cycling with next/previous file remembers each diff's cursor, vertical and
+horizontal scroll, and after-changes mode for the current process. Positions
+are clamped to the viewport when resized and are not saved across restarts.
 
 review never writes to the repository, the index, refs or Git configuration.
 

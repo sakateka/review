@@ -2271,7 +2271,7 @@ fn marks_invalidation_and_compatibility(ctx: &Ctx, acceptance: &Path, left: &str
     session.wait_text("let value = 2;");
     quit_unchanged(&mut session, &baseline, acceptance, 0);
     let mut session = start(&[left, right, "--", "one.rs"], acceptance);
-    marks(&mut session, &[("one.rs", false)]);
+    marks(&mut session, &[("one.rs", true)]);
     assert!(!session.text().contains("two.rs"));
     quit_unchanged(&mut session, &baseline, acceptance, 0);
 
@@ -2731,6 +2731,7 @@ fn switch_file_diffs(ctx: &Ctx) {
     }
     switch_git(&["add", "."]);
     switch_git(&["commit", "-qm", "base"]);
+    switch_git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
     for name in names {
         write(
             &switch_repo.join(format!("{name}.rs")),
@@ -2762,6 +2763,8 @@ fn switch_file_diffs(ctx: &Ctx) {
     session.send(b"\r");
     shows(&mut session, 0);
     assert!(session.cursor_visible);
+    session.send(b"jjll");
+    let alpha_cursor = cursor(&session);
     session.send(b"\n");
     shows(&mut session, 1);
     assert!(
@@ -2775,6 +2778,11 @@ fn switch_file_diffs(ctx: &Ctx) {
     session.send(b"\n");
     shows(&mut session, 0);
     session.wait_text("Wrapped to first file");
+    assert_eq!(
+        cursor(&session),
+        alpha_cursor,
+        "file cursor was not retained"
+    );
     session.send(b"\x0b");
     shows(&mut session, 2);
     session.wait_text("Wrapped to last file");
@@ -2816,6 +2824,13 @@ fn switch_file_diffs(ctx: &Ctx) {
     shows(&mut session, 1);
     session.send(b",q");
     session.finish(0);
+    // Equivalent arguments restore marks in this worktree.
+    let mut session = ctx.session_in(&switch_repo, &["--", "-M", "origin/main"]);
+    marks(
+        &mut session,
+        &[("alpha.rs", true), ("beta.rs", false), ("gamma.rs", false)],
+    );
+    quit_unchanged(&mut session, &repo_before, &switch_repo, 0);
     // Emacs uses the same keys.
     let mut session = ctx.session_in(&switch_repo, &["--keymap", "emacs", "--", "HEAD"]);
     closed(&mut session);
@@ -3168,9 +3183,19 @@ fn keyboard_layouts(ctx: &Ctx) {
         .keys()
         .filter(|path| !state_before.contains_key(*path))
         .collect();
-    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!(added.len(), 2, "{added:?}");
+    assert_eq!(
+        added.iter().filter(|path| path.ends_with(".json")).count(),
+        1
+    );
+    assert_eq!(
+        added.iter().filter(|path| path.ends_with(".lock")).count(),
+        1
+    );
     let mut kept = state_after.clone();
-    kept.remove(added[0]);
+    for path in added {
+        kept.remove(path);
+    }
     assert_same(&state_before, &kept, "keyboard layout review state");
     pty_passed("keyboard layout mapping");
 }

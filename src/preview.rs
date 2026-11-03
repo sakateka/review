@@ -366,7 +366,11 @@ impl Preview {
             let mut retained_graphemes = 0;
             for (byte, grapheme) in graphemes.into_iter().take(4096) {
                 let mut role = Role {
-                    base,
+                    base: if base == Base::Added && byte == 0 {
+                        Base::AddedMarker
+                    } else {
+                        base
+                    },
                     ..Role::default()
                 };
                 if source_line && byte > 0 {

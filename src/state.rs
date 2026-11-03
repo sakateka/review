@@ -3,9 +3,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::OsString,
     io::Write,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 
@@ -13,10 +14,6 @@ use std::{
 struct Saved {
     version: u32,
     marks: BTreeMap<String, String>,
-    #[serde(default)]
-    tombstones: BTreeSet<String>,
-    #[serde(default)]
-    pending: BTreeMap<String, String>,
 }
 
 pub fn digest(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
@@ -32,12 +29,6 @@ pub fn digest(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
 #[derive(Debug)]
 pub struct Store {
     pub path: PathBuf,
-    pub(crate) legacy_path: PathBuf,
-}
-
-pub struct LoadedMarks {
-    pub marks: Vec<bool>,
-    pub pending_legacy: bool,
 }
 
 impl Store {
@@ -58,166 +49,105 @@ impl Store {
         Ok(Self::at(&base, cwd, args))
     }
 
-    pub fn at(base: &Path, cwd: &Path, args: &[OsString]) -> Self {
-        let context: BTreeMap<_, _> = std::env::vars_os()
-            .filter(|(key, _)| key.as_encoded_bytes().starts_with(b"GIT_"))
-            .collect();
-        let mut parts = vec![
-            b"review-session-v2".as_slice(),
-            cwd.as_os_str().as_encoded_bytes(),
-            b"git-environment",
-        ];
-        // Repository identity separates linked worktrees and repositories
-        // reached through the same cwd/environment without depending on refs.
-        let mut repository_context = Vec::new();
-        for option in ["--show-toplevel", "--git-common-dir", "--git-path"] {
-            let output = if option == "--git-path" {
-                crate::git::command(cwd)
-                    .args(["rev-parse", option, "index"])
-                    .output()
-            } else {
-                crate::git::command(cwd)
-                    .args(["rev-parse", option])
-                    .output()
-            };
-            if let Ok(output) = output
-                && output.status.success()
-            {
-                repository_context
-                    .extend_from_slice(output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout));
-                repository_context.push(0);
-            }
-        }
-        parts.push(&repository_context);
-        for (key, value) in &context {
-            parts.push(key.as_encoded_bytes());
-            parts.push(value.as_encoded_bytes());
-        }
-        parts.push(b"original-arguments");
-        parts.extend(args.iter().map(|arg| arg.as_encoded_bytes()));
-        let mut legacy_parts = vec![
-            b"review-session-v1".as_slice(),
-            cwd.as_os_str().as_encoded_bytes(),
-            b"git-environment",
-        ];
-        for (key, value) in &context {
-            legacy_parts.push(key.as_encoded_bytes());
-            legacy_parts.push(value.as_encoded_bytes());
-        }
-        legacy_parts.push(b"original-arguments");
-        legacy_parts.extend(args.iter().map(|arg| arg.as_encoded_bytes()));
+    pub fn at(base: &Path, cwd: &Path, _args: &[OsString]) -> Self {
+        // The per-worktree Git directory distinguishes linked worktrees and
+        // ignores invocation arguments, current refs and the caller's subdir.
+        let git_path = |option: &str| {
+            crate::git::command(cwd)
+                .args(["rev-parse", option])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    PathBuf::from(OsString::from_vec(
+                        output
+                            .stdout
+                            .strip_suffix(b"\n")
+                            .unwrap_or(&output.stdout)
+                            .to_vec(),
+                    ))
+                })
+                .map(|path| path.canonicalize().unwrap_or(path))
+        };
+        let git_dir = git_path("--absolute-git-dir");
+        let root = git_path("--show-toplevel")
+            .unwrap_or_else(|| cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()));
+        let key = digest([
+            b"review-displayed-patch-v3".as_slice(),
+            git_dir
+                .as_deref()
+                .unwrap_or(&root)
+                .as_os_str()
+                .as_encoded_bytes(),
+            root.as_os_str().as_encoded_bytes(),
+        ]);
         Self {
-            path: base.join("review").join(format!("{}.json", digest(parts))),
-            legacy_path: base
-                .join("review")
-                .join(format!("{}.json", digest(legacy_parts))),
+            path: base.join("review").join(format!("{key}.json")),
         }
     }
 
-    #[cfg(test)]
-    pub fn load(&self, items: &[Item]) -> Result<Vec<bool>> {
-        Ok(self.load_report(items)?.marks)
-    }
-
-    fn read_saved(path: &Path) -> Result<Option<Saved>> {
-        let bytes = match std::fs::read(path) {
+    fn records(&self) -> Result<Saved> {
+        let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Saved {
+                    version: 3,
+                    marks: BTreeMap::new(),
+                });
+            }
             Err(error) => return Err(error).context("cannot read review state"),
         };
         let saved: Saved = serde_json::from_slice(&bytes)
             .context("corrupt review state; marks were not restored")?;
-        if !matches!(saved.version, 1 | 2) {
+        if saved.version != 3 {
             bail!("unsupported review state version {}", saved.version);
         }
-        Ok(Some(saved))
+        Ok(saved)
     }
 
-    // Both paths remain inputs after migration. Legacy bytes are never edited;
-    // explicit v2 decisions take durable precedence over them, including unmark.
-    fn records(&self) -> Result<Saved> {
-        let primary = Self::read_saved(&self.path)?;
-        let legacy = Self::read_saved(&self.legacy_path)?;
-        let mut combined = Saved {
-            version: 2,
-            marks: BTreeMap::new(),
-            tombstones: BTreeSet::new(),
-            pending: BTreeMap::new(),
-        };
-        if let Some(legacy) = legacy {
-            combined.pending.extend(legacy.pending);
-            combined.pending.extend(legacy.marks);
-        }
-        if let Some(primary) = primary {
-            combined.pending.extend(primary.pending);
-            if primary.version == 1 {
-                combined.pending.extend(primary.marks);
-            } else {
-                combined.marks = primary.marks;
-                combined.tombstones = primary.tombstones;
-            }
-        }
-        Ok(combined)
-    }
-
-    pub fn load_report(&self, items: &[Item]) -> Result<LoadedMarks> {
+    pub fn load(&self, items: &[Item]) -> Result<Vec<bool>> {
         let saved = self.records()?;
-        let proven_legacy = |item: &Item, value: &String| {
-            item.canonical_identity.is_some() && item.legacy_fingerprints.contains(value)
-        };
-        let marks = items
+        Ok(items
             .iter()
-            .map(|item| {
-                let key = digest([&item.new_path]);
-                if saved.tombstones.contains(&key) {
-                    return false;
-                }
-                if let Some(value) = saved.marks.get(&key) {
-                    return item.canonical_identity.as_ref() == Some(value);
-                }
-                saved
-                    .pending
-                    .get(&key)
-                    .is_some_and(|value| proven_legacy(item, value))
-            })
-            .collect();
-        let pending_legacy = saved.pending.iter().any(|(key, value)| {
-            !saved.tombstones.contains(key)
-                && !saved.marks.contains_key(key)
-                && !items
-                    .iter()
-                    .any(|item| digest([&item.new_path]) == *key && proven_legacy(item, value))
-        });
-        Ok(LoadedMarks {
-            marks,
-            pending_legacy,
-        })
+            .map(|item| saved.marks.get(&digest([&item.new_path])) == Some(&item.patch_identity()))
+            .collect())
     }
 
+    /// Only explicit decisions are updated. A stale instance must not write
+    /// its other visible marks over more recent decisions from another process.
+    pub fn save_mark(&self, item: &Item, mark: bool) -> Result<()> {
+        self.save_updates(std::iter::once((item, mark)))
+    }
+
+    #[cfg(test)]
     pub fn save(&self, items: &[Item], marks: &[bool]) -> Result<()> {
-        // Recheck both files before replacing anything, preserving corrupt or
-        // unsupported data even if it appeared since the application loaded.
+        self.save_updates(items.iter().zip(marks.iter().copied()))
+    }
+
+    fn save_updates<'a>(&self, updates: impl IntoIterator<Item = (&'a Item, bool)>) -> Result<()> {
+        let directory = self.path.parent().context("state path has no parent")?;
+        std::fs::create_dir_all(directory).context("cannot create review state directory")?;
+        // Serialize read/modify/replace across active processes. The lock file
+        // stays in the external state directory, never the reviewed repository.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.path.with_extension("lock"))
+            .context("cannot open review state lock")?;
+        lock.lock().context("cannot lock review state")?;
+        // Re-read before replacing so corrupt/unsupported state is preserved.
         let mut saved = self.records()?;
-        for (item, mark) in items.iter().zip(marks) {
+        for (item, mark) in updates {
             let key = digest([&item.new_path]);
-            if *mark {
-                let identity = item
-                    .canonical_identity
-                    .clone()
-                    .context("complete compared contents could not be proven")?;
-                saved.marks.insert(key.clone(), identity);
-                saved.tombstones.remove(&key);
-            } else if saved.marks.remove(&key).is_some()
-                || saved.pending.get(&key).is_some_and(|value| {
-                    item.canonical_identity.is_some() && item.legacy_fingerprints.contains(value)
-                })
-            {
-                saved.tombstones.insert(key);
+            if mark {
+                saved.marks.insert(key, item.patch_identity());
+            } else {
+                saved.marks.remove(&key);
             }
         }
         let bytes = serde_json::to_vec(&saved)?;
-        let directory = self.path.parent().context("state path has no parent")?;
-        std::fs::create_dir_all(directory).context("cannot create review state directory")?;
         let mut temporary = tempfile::NamedTempFile::new_in(directory)
             .context("cannot create temporary review state")?;
         temporary

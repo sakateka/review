@@ -105,6 +105,7 @@ pub enum Base {
     #[default]
     Plain,
     Added,
+    AddedMarker,
     Removed,
     Hunk,
 }
@@ -203,7 +204,7 @@ impl Theme {
             captures,
             default_fg: Some(foreground),
             added_fg: added,
-            added_bg: Color::Rgb(0x26, 0x33, 0x2c),
+            added_bg: Color::Rgb(0x2a, 0x2d, 0x27),
             removed_fg: removed,
             removed_bg: Color::Rgb(0x57, 0x2e, 0x33),
             hunk: dark_gray,
@@ -313,7 +314,7 @@ impl Theme {
             background.and_then(|background| blend(color, background, ratio))
         };
         let (mut added_bg, mut removed_bg) = (
-            tint(added_fg, 0.2).unwrap_or(classic.added_bg),
+            tint(added_fg, 0.08).unwrap_or(classic.added_bg),
             tint(removed_fg, 0.2).unwrap_or(classic.removed_bg),
         );
         if added_bg == removed_bg {
@@ -395,7 +396,11 @@ impl Theme {
             Base::Plain => self
                 .default_fg
                 .map_or_else(Style::default, |fg| Style::default().fg(fg)),
-            Base::Added => Style::default().fg(self.added_fg).bg(self.added_bg),
+            Base::Added => self
+                .default_fg
+                .map_or_else(Style::default, |fg| Style::default().fg(fg))
+                .bg(self.added_bg),
+            Base::AddedMarker => Style::default().fg(self.added_fg).bg(self.added_bg),
             Base::Removed => Style::default().fg(self.removed_fg).bg(self.removed_bg),
             Base::Hunk => Style::default().fg(self.hunk),
         };
