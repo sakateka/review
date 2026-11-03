@@ -270,7 +270,7 @@ impl App {
     }
 
     fn scroll_help(&mut self, rows: isize) {
-        let lines = self.bindings.help().lines().count();
+        let lines = self.bindings.help_entries().len();
         if let Some(help) = &mut self.help {
             help.scroll = help
                 .scroll

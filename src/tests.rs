@@ -3855,7 +3855,7 @@ fn vim_definition_jump_has_general_help_and_on_demand_analysis_details() {
     app.key(KeyCode::Char('?'));
     assert!(app.help.is_some());
     assert!(app.navigation.is_some());
-    assert!(screen_text(&screen(&mut app, 120, 24)).contains("show_help: ?"));
+    assert!(screen_text(&screen(&mut app, 120, 24)).contains("Show help"));
     app.key(KeyCode::Esc);
     assert!(app.help.is_none() && app.navigation.is_some());
     app.key(KeyCode::Char('D'));
@@ -7529,10 +7529,18 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
         ] {
             assert!(!app.key(KeyCode::Char('?')));
             assert!(app.help.is_some());
-            let text = screen_text(&screen(&mut app, 100, 24));
+            let rendered = screen(&mut app, 100, 24);
+            let text = screen_text(&rendered);
             assert!(text.contains(" Help "), "{text}");
-            assert!(text.contains("show_help: ?"), "{text}");
-            assert!(text.contains("cursor_down:"), "{text}");
+            assert!(text.contains("Keybinding"), "{text}");
+            assert!(text.contains("Description"), "{text}");
+            assert!(text.contains("Show help"), "{text}");
+            assert!(text.contains("Cursor down"), "{text}");
+            assert!(!text.contains("show_help:"), "{text}");
+            let header = row_text(&rendered, 3);
+            assert!(header.find("Keybinding") < header.find("Description"));
+            let first_entry = row_text(&rendered, 4);
+            assert!(first_entry.find('?') < first_entry.find("Show help"));
             assert!(
                 !app.key_event(dismiss),
                 "{keymap} help dismissed the review"
@@ -7555,7 +7563,8 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
     app.key(KeyCode::Char('H'));
     assert!(app.help.is_some());
     let text = screen_text(&screen(&mut app, 100, 24));
-    assert!(text.contains("show_help: H"), "{text}");
+    assert!(text.contains("Show help"), "{text}");
+    assert!(text.contains('H'), "{text}");
     let effective = app.bindings.help();
     assert!(effective.contains("toggle_mark: M\n"), "{effective}");
     assert!(effective.contains("analysis_details: D\n"), "{effective}");
@@ -7700,16 +7709,18 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
     let before = screen(&mut app, 100, 12);
     app.key(KeyCode::Char('?'));
     let initial = screen_text(&screen(&mut app, 100, 12));
-    assert!(initial.contains("show_help: ?"), "{initial}");
+    assert!(initial.contains("Show help"), "{initial}");
+    assert!(initial.contains("Keybinding"), "{initial}");
+    assert!(initial.contains("Description"), "{initial}");
     assert!(!initial.contains("arrows/paging"), "{initial}");
-    assert!(!initial.contains("previous_file_diff:"), "{initial}");
+    assert!(!initial.contains("Previous file diff"), "{initial}");
     let viewport = app.help.unwrap().viewport;
-    assert!(viewport > 0 && viewport < app.bindings.help().lines().count());
+    assert!(viewport > 0 && viewport < app.bindings.help_entries().len());
     app.key(KeyCode::Char('G'));
-    let bottom = app.bindings.help().lines().count() - viewport;
+    let bottom = app.bindings.help_entries().len() - viewport;
     assert_eq!(app.help.unwrap().scroll, bottom);
     let text = screen_text(&screen(&mut app, 100, 12));
-    assert!(text.contains("previous_file_diff:"), "{text}");
+    assert!(text.contains("Previous file diff"), "{text}");
     app.key(KeyCode::Down);
     app.mouse(
         mouse_event(crossterm::event::MouseEventKind::ScrollDown, 50, 5),

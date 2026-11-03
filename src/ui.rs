@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
 };
 use std::{
     io,
@@ -519,8 +519,8 @@ fn draw_palette(
 /// Centered floating help; the active bindings are its only content source.
 fn draw_help(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
-    let text = app.bindings.help();
-    let lines = text.lines().count();
+    let entries = app.bindings.help_entries();
+    let lines = entries.len();
     let width = screen.width.saturating_sub(4).min(90);
     let height = screen.height.saturating_sub(4).min(24);
     if width < 3 || height < 3 {
@@ -539,15 +539,31 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         .title(" Help ")
         .title_bottom(" esc/q/? close ");
     let inner = block.inner(area);
-    app.layout_help(inner.height as usize, lines);
+    app.layout_help(inner.height.saturating_sub(1) as usize, lines);
     let scroll = app.help.expect("help is open").scroll;
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
+    let key_width = entries
+        .iter()
+        .map(|(_, keys)| keys.width())
+        .max()
+        .unwrap_or(0)
+        .max("Keybinding".width())
+        .min(u16::MAX as usize) as u16;
+    let rows = entries
+        .into_iter()
+        .skip(scroll)
+        .map(|(action, keys)| Row::new(vec![keys, action.description()]));
     frame.render_widget(
-        Paragraph::new(text).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        Table::new(rows, [Constraint::Length(key_width), Constraint::Min(0)])
+            .header(
+                Row::new(vec!["Keybinding", "Description"])
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
+            )
+            .column_spacing(2),
         inner,
     );
 }

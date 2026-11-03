@@ -1230,12 +1230,14 @@ fn help_popup(ctx: &Ctx) {
         for (index, dismiss) in [b"?".as_slice(), b"q", b"\x1b"].into_iter().enumerate() {
             session.send(b"?");
             session.wait_text(" Help ");
-            session.wait_text("show_help: ?");
+            session.wait_text("Keybinding");
+            session.wait_text("Description");
+            session.wait_text("Show help");
             let (help_column, help_row) = locate(&session, " Help ");
             assert!(help_column > 0 && help_row > 0, "help was not centered");
             if index == 0 {
                 session.send(b"\x1b[6~\x1b[6~");
-                session.wait_text("previous_file_diff:");
+                session.wait_text("Previous file diff");
                 for (rows, columns) in [(1, 1), (3, 8), (30, 140)] {
                     session.resize(rows, columns);
                 }
@@ -1284,10 +1286,11 @@ fn help_popup(ctx: &Ctx) {
     );
     session.send(b"H");
     session.wait_text(" Help ");
-    session.wait_text("show_help: H");
+    session.wait_text("Show help");
     session.send(b"G");
-    session.wait_text("analysis_details: D");
-    session.wait_text("toggle_after_changes: (disabled)");
+    session.wait_text("Analysis details");
+    session.wait_text("Toggle after changes");
+    session.wait_text("(disabled)");
     session.send(b"?");
     assert_eq!(session.text(), origin, "custom help changed the file list");
     session.send(b",q");

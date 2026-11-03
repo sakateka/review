@@ -27,6 +27,11 @@ macro_rules! actions {
         impl Action {
             pub const ALL: &'static [Self] = &[$(Self::$variant),*];
             pub fn name(self) -> &'static str { match self { $(Self::$variant => $name),* } }
+            pub fn description(self) -> String {
+                let mut description = self.name().replace('_', " ");
+                description[..1].make_ascii_uppercase();
+                description
+            }
         }
     }
 }
@@ -324,7 +329,7 @@ impl Bindings {
             .collect::<Vec<_>>()
             .join("/")
     }
-    pub fn help(&self) -> String {
+    pub fn help_entries(&self) -> Vec<(Action, String)> {
         Action::ALL
             .iter()
             .map(|action| {
@@ -340,16 +345,21 @@ impl Bindings {
                         }
                     })
                     .collect::<Vec<_>>();
-                format!(
-                    "  {}: {}\n",
-                    action.name(),
+                (
+                    *action,
                     if labels.is_empty() {
                         "(disabled)".into()
                     } else {
                         labels.join(", ")
-                    }
+                    },
                 )
             })
+            .collect()
+    }
+    pub fn help(&self) -> String {
+        self.help_entries()
+            .into_iter()
+            .map(|(action, labels)| format!("  {}: {}\n", action.name(), labels))
             .collect()
     }
     pub fn legend(&self) -> String {
