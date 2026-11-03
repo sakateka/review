@@ -264,6 +264,9 @@ fn rust_docs(text: &str, comments: &[Range<usize>], bytes: &mut Captures, budget
             }
         } else {
             let info = line[count..].trim();
+            let compile_fail = info
+                .split([',', ' ', '\t'])
+                .any(|attribute| attribute == "compile_fail");
             let supported = info.is_empty()
                 || info
                     .split([',', ' ', '\t'])
@@ -282,7 +285,10 @@ fn rust_docs(text: &str, comments: &[Range<usize>], bytes: &mut Captures, budget
                                 | "edition2018"
                                 | "edition2021"
                                 | "edition2024"
-                        )
+                        ) || (compile_fail
+                            && s.len() == 5
+                            && s.starts_with('E')
+                            && s.as_bytes()[1..].iter().all(u8::is_ascii_digit))
                     });
             open = Some((marker.unwrap(), count, supported, index + 1));
         }
@@ -1203,6 +1209,19 @@ mod embedded_tests {
         assert_ne!(at(&c, text, "let x"), comment);
         assert_ne!(at(&c, text, "let n"), comment);
         for needle in ["```compile_fail", "let y", "ordinary", "let unclosed"] {
+            assert_eq!(at(&c, text, needle), comment, "{needle}");
+        }
+    }
+
+    #[test]
+    fn rustdoc_compile_fail_error_codes_are_highlighted() {
+        let text = "/// prose\n/// ```compile_fail,E0080\n/// use yanet_sys::dp::Object;\n/// const TYPE: &str = \"mine\";\n/// ```\n/// ```rust,compile_fail,E0308,E0080\n/// let valid = 1;\n/// ```\n/// ```\n/// let implicit = 4;\n/// ```\n/// ```python,compile_fail,E0080\n/// let foreign = 2;\n/// ```\n/// ```compile_fail,E008x\n/// let invalid = 3;\n/// ```\nfn f() {}\n";
+        let c = captures("a.rs", text);
+        let comment = at(&c, text, "prose");
+        for needle in ["use yanet", "const TYPE", "let valid", "let implicit"] {
+            assert_ne!(at(&c, text, needle), comment, "{needle}");
+        }
+        for needle in ["```compile_fail,E0080", "let foreign", "let invalid"] {
             assert_eq!(at(&c, text, needle), comment, "{needle}");
         }
     }

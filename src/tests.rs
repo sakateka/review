@@ -11107,7 +11107,7 @@ fn embedded_highlighting_preserves_captured_views_and_restyles() {
     for (name, old) in [
         (
             "embedded.rs",
-            "/// café prose\n/// ```compile_fail\n/// # use std::fmt;\n/// let value = 42;\n/// ```\nfn f() {}\n",
+            "/// café prose\n/// ```compile_fail,E0080\n/// # use std::fmt;\n/// let value = 42;\n/// ```\nfn f() {}\n",
         ),
         (
             "embedded.go",
