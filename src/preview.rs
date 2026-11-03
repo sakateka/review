@@ -5,7 +5,7 @@ use crate::{
 };
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use std::{cell::RefCell, ops::Range, path::Path, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, ops::Range, path::Path, rc::Rc};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -32,6 +32,12 @@ pub struct Preview {
 
 type Captures = Vec<Option<u8>>;
 type MappedCaptures<'a> = (&'a source::Sources, &'a [Option<u8>], &'a [Option<u8>]);
+
+thread_local! {
+    // Compiling the queries is expensive, especially when each rustdoc fence
+    // is highlighted separately. Configurations are immutable after setup.
+    static HIGHLIGHT_CONFIGS: RefCell<HashMap<String, Rc<HighlightConfiguration>>> = RefCell::new(HashMap::new());
+}
 
 /// Per-byte capture indices into the shared theme capture table.
 fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
@@ -112,9 +118,21 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
         .iter()
         .map(|name| crate::theme::capture(name))
         .collect();
-    let mut configuration =
-        HighlightConfiguration::new(language.into(), extension, &query, "", "")?;
-    configuration.configure(&names);
+    let cached = HIGHLIGHT_CONFIGS.with(|configs| configs.borrow().get(extension).cloned());
+    let configuration = if let Some(configuration) = cached {
+        configuration
+    } else {
+        let mut configuration =
+            HighlightConfiguration::new(language.into(), extension, &query, "", "")?;
+        configuration.configure(&names);
+        let configuration = Rc::new(configuration);
+        HIGHLIGHT_CONFIGS.with(|configs| {
+            configs
+                .borrow_mut()
+                .insert(extension.to_owned(), configuration.clone());
+        });
+        configuration
+    };
     let mut highlighter = Highlighter::new();
     let events =
         highlighter.highlight(&configuration, side.content.as_bytes(), None, None, |_| {
@@ -1188,6 +1206,27 @@ impl Preview {
 #[cfg(test)]
 mod embedded_tests {
     use super::*;
+
+    #[test]
+    fn many_doc_tests_keep_independent_highlighting() {
+        let mut text = String::new();
+        for i in 0..100 {
+            text.push_str(&format!("/// example {i}\n/// ```compile_fail,E0080\n/// use std::fmt;\n/// struct Mine;\n/// impl Mine {{\n///     fn f() -> u64 {{ 42 }}\n/// }}\n/// ```\nfn f{i}() {{}}\n"));
+        }
+        let side = source::Side {
+            path: b"x.rs".to_vec(),
+            content: text,
+        };
+        let captures = syntax(&side).unwrap();
+        let comment = captures[side.content.find("/// example").unwrap()];
+        let mut checked = 0;
+        for (offset, _) in side.content.match_indices("///     fn f() -> u64 { 42 }") {
+            assert_ne!(captures[offset + "///     ".len()], comment);
+            assert_ne!(captures[offset + "///     fn f() -> u64 { ".len()], comment);
+            checked += 1;
+        }
+        assert_eq!(checked, 100);
+    }
 
     fn captures(path: &str, text: &str) -> Captures {
         syntax(&source::Side {
