@@ -9126,6 +9126,132 @@ fn file_list_totals_sum_text_statistics_in_the_bottom_row() {
 }
 
 #[test]
+fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
+    let directory = fixture();
+    change(directory.path());
+    std::fs::write(directory.path().join("review.notes"), "#one.rs:2:4\nFirst note\ncontinued\n#one.rs:2:9\nSecond note\n#one.rs:3:1\nThird note\n#two.rs:2:1\nOther file\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let list = screen(&mut app, 100, 24);
+    assert_eq!(list[(97, 1)].symbol(), "📝");
+    assert_eq!(list[(97, 2)].symbol(), "📝");
+    assert!(row_text(&list, 1).contains("2 +-"));
+    app.key_event(alt('n'));
+    let popup = screen_text(&screen(&mut app, 100, 24));
+    assert!(
+        popup.contains("one.rs:2:4")
+            && popup.contains("First note")
+            && popup.contains("Third note"),
+        "{popup}"
+    );
+    assert!(!popup.contains("Other file"));
+    app.key(KeyCode::Esc);
+    assert!(app.notes_popup.is_none());
+
+    app.key(KeyCode::Enter);
+    let diff = screen(&mut app, 100, 24);
+    assert_eq!(diff[(27, 1)].symbol(), "📝");
+    assert_eq!(diff[(97, 8)].symbol(), "📝");
+    assert_ne!(diff[(97, 7)].symbol(), "📝"); // deleted row has no new-side location
+    for _ in 0..7 {
+        app.key(KeyCode::Char('j'));
+    }
+    app.key_event(alt('n'));
+    let popup = screen_text(&screen(&mut app, 100, 24));
+    assert!(popup.contains("First note") && popup.contains("Second note"));
+    assert!(!popup.contains("Third note"));
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Char('c'));
+    for c in "Comment".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    let both = screen(&mut app, 100, 24);
+    assert_eq!(both[(25, 1)].symbol(), "📝");
+    assert_eq!(both[(27, 1)].symbol(), "💬");
+    assert_eq!(both[(95, 8)].symbol(), "📝");
+    assert_eq!(both[(97, 8)].symbol(), "💬");
+    app.key(KeyCode::Esc);
+    let both = screen(&mut app, 100, 24);
+    assert_eq!(both[(95, 1)].symbol(), "📝");
+    assert_eq!(both[(97, 1)].symbol(), "💬");
+    assert!(row_text(&both, 1).contains("2 +-"));
+    assert!(
+        std::fs::read_to_string(directory.path().join("review.notes"))
+            .unwrap()
+            .contains("First note\ncontinued")
+    );
+}
+
+#[test]
+fn notes_load_from_root_when_review_runs_in_subdirectory() {
+    let directory = fixture();
+    let subdir = directory.path().join("nested");
+    std::fs::create_dir(&subdir).unwrap();
+    std::fs::write(subdir.join("file.rs"), "one\n").unwrap();
+    git_run(directory.path(), &["add", "."]);
+    git_run(directory.path(), &["commit", "-qm", "nested"]);
+    std::fs::write(subdir.join("file.rs"), "two\n").unwrap();
+    std::fs::write(
+        directory.path().join("review.notes"),
+        "#nested/file.rs:1:2\nroot note\n#../bad:1:1\nbad\n#nested/file.rs:0:1\nbad\n",
+    )
+    .unwrap();
+    for args in [&["HEAD"][..], &["--relative", "HEAD"][..]] {
+        let state = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            capture(&subdir, args),
+            state::Store::at(state.path(), &subdir, &[]),
+        );
+        assert_eq!(app.notes.entries.len(), 1);
+        assert!(app.status.contains("invalid"));
+        assert_eq!(screen(&mut app, 100, 24)[(97, 1)].symbol(), "📝");
+        app.key_event(alt('n'));
+        assert!(screen_text(&screen(&mut app, 100, 24)).contains("root note"));
+    }
+}
+
+#[test]
+fn notes_help_is_a_separate_cli_topic() {
+    assert_eq!(
+        parse_args(["--help".into(), "notes".into()]).unwrap(),
+        Cli::HelpNotes
+    );
+    assert!(NOTES_HELP.contains("#path:line:char"));
+    assert!(help(None, None).unwrap().contains("review --help notes"));
+}
+
+#[test]
+fn notes_popup_scrolls_wrapped_text_and_escape_is_modal() {
+    let directory = fixture();
+    change(directory.path());
+    let text = (0..35)
+        .map(|i| format!("note row {i} — {}", "long ".repeat(15)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        directory.path().join("review.notes"),
+        format!("#one.rs:2:1\n{text}\n"),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key_event(alt('n'));
+    let first = screen_text(&screen(&mut app, 50, 12));
+    assert!(first.contains("note row 0"));
+    assert!(!first.contains("note row 20"));
+    for _ in 0..10 {
+        app.key(KeyCode::PageDown);
+    }
+    let last = screen_text(&screen(&mut app, 50, 12));
+    assert!(last.contains("note row 34"), "{last}");
+    assert_eq!(app.selected, 0);
+    app.key(KeyCode::Esc);
+    assert!(app.notes_popup.is_none());
+    assert!(app.preview.is_none());
+}
+
+#[test]
 fn file_list_totals_count_binary_and_unavailable_items() {
     let directory = fixture();
     let root = directory.path();

@@ -58,15 +58,15 @@ fn file_row(
     width: usize,
     show_stats: bool,
     comment: Option<bool>,
+    note: bool,
     theme: &crate::theme::Theme,
 ) -> Line<'static> {
     use crate::git::Statistics;
     let name = item.name();
-    let icon_width = if comment.is_some() && width >= 4 {
-        2 + usize::from(width > 4)
-    } else {
-        0
-    };
+    let show_comment = comment.is_some() && width >= 4;
+    let show_note = note && width >= 4 + usize::from(show_comment) * 2;
+    let icon_cells = 2 * (usize::from(show_comment) + usize::from(show_note));
+    let icon_width = icon_cells + usize::from(icon_cells > 0 && width > icon_cells + 2);
     let available = width.saturating_sub(2 + icon_width);
     let statistics = item.statistics();
     let label = match statistics {
@@ -170,10 +170,15 @@ fn file_row(
         if !show_stats {
             spans.push(Span::raw(" ".repeat(padding)));
         }
-        if icon_width > 2 {
+        if icon_width > icon_cells {
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::styled("💬", comment_style(comment.unwrap(), theme)));
+        if show_note {
+            spans.push(Span::styled("📝", Style::default().fg(theme.comment)));
+        }
+        if show_comment {
+            spans.push(Span::styled("💬", comment_style(comment.unwrap(), theme)));
+        }
     }
     Line::from(spans)
 }
@@ -291,15 +296,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .for_item(item)
                     .map(|(_, comment)| comment.outdated)
                     .reduce(|a, b| a && b);
+                let note = app.notes.for_item(item).next().is_some();
                 ListItem::new(file_row(
                     item,
                     *reviewed,
                     panels[0]
                         .width
-                        .saturating_sub(if comment.is_some() { 2 } else { 4 })
+                        .saturating_sub(if comment.is_some() || note { 2 } else { 4 })
                         as usize,
                     show_stats,
                     comment,
+                    note,
                     &app.theme,
                 ))
                 .style(if index == app.selected {
@@ -354,12 +361,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             inner.width,
             inner.height.min(1),
         );
-        // Commented diffs reserve a two-cell icon column at the right edge.
         let markers = app.comment_markers();
+        let notes = app.note_markers();
+        let marker_width = 2 * (u16::from(markers.is_some()) + u16::from(notes.is_some()));
         let mut text_area = content;
-        if markers.is_some() {
-            text_area.width = text_area.width.saturating_sub(2);
-        }
+        text_area.width = text_area.width.saturating_sub(marker_width);
         app.preview_area = text_area;
         app.layout_preview(text_area.height as usize, text_area.width as usize);
         let preview = app.preview.as_ref().expect("preview exists");
@@ -424,6 +430,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         content.y + offset as u16,
                         "💬",
                         comment_style(*outdated, &app.theme),
+                    );
+                }
+            }
+        }
+        if let Some(notes) = &notes
+            && content.width >= marker_width
+        {
+            for offset in 0..app.viewport.0 {
+                if rows
+                    .get(offset)
+                    .and_then(|(row, _)| notes.get(*row))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    frame.buffer_mut().set_string(
+                        content.x + content.width - marker_width,
+                        content.y + offset as u16,
+                        "📝",
+                        Style::default().fg(app.theme.comment),
                     );
                 }
             }
@@ -523,6 +548,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(editor) = &mut app.editor {
         draw_editor(frame, editor, &app.theme);
+    }
+    if let Some(popup) = &mut app.notes_popup {
+        draw_notes(frame, popup, &app.theme);
     }
     if app.help.is_some() {
         draw_help(frame, app);
@@ -736,6 +764,50 @@ fn draw_palette(
             Rect::new(inner.x, inner.y + 1 + (offset - top) as u16, inner.width, 1),
         );
     }
+}
+
+fn draw_notes(frame: &mut Frame, popup: &mut crate::app::NotesPopup, theme: &crate::theme::Theme) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(90);
+    let height = screen.height.saturating_sub(4).min(24);
+    if width < 3 || height < 3 {
+        return;
+    }
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focused))
+        .title(" Notes ")
+        .title_bottom(" ↑/↓ scroll · esc close ");
+    let inner = block.inner(area);
+    let mut lines = Vec::new();
+    for line in popup.text.split('\n') {
+        let mut wrapped = String::new();
+        let mut used = 0;
+        for grapheme in line.graphemes(true) {
+            let size = grapheme.width();
+            if used > 0 && used + size > inner.width as usize {
+                lines.push(Line::raw(std::mem::take(&mut wrapped)));
+                used = 0;
+            }
+            wrapped.push_str(grapheme);
+            used += size;
+        }
+        lines.push(Line::raw(wrapped));
+    }
+    popup.max_scroll = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    popup.scroll = popup.scroll.min(popup.max_scroll);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines).scroll((popup.scroll, 0)), inner);
 }
 
 /// Centered floating help; the active bindings are its only content source.

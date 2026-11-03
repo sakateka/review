@@ -7,6 +7,7 @@ mod keybindings;
 mod layouts;
 mod motion;
 mod navigation;
+mod notes;
 mod preview;
 mod search;
 mod source;
@@ -21,6 +22,7 @@ use anyhow::{Result, bail};
 use std::{ffi::OsString, io::IsTerminal};
 
 const HELP: &str = "review [--help | --version] [--keymap vim|emacs] [--config PATH] -- [git diff arguments]\n\nReview a captured Git comparison. Git's own -- path separator is preserved.\nConfigure [features] keymap/readline, [appearance] colorscheme, [keyboard] layouts/langmap\nand [keybindings] action=\"key\" in --config or $XDG_CONFIG_HOME/review/config.toml (fallback $HOME/.config/review/config.toml).\nCLI keymap overrides config. Overrides replace all defaults; \"\" disables an action.\nKeys: characters, named keys (enter, esc, space, down), ctrl-/alt- chords, sequences (gd).\n\n";
+const NOTES_HELP: &str = "Notes\n\nPut review.notes in the repository or worktree root. Review reads it at startup.\nEach note begins with #path:line:char; paths are relative to that root and\nline and character numbers start at 1. Following lines are the note text;\na text line cannot start with #. Start another note with another header.\n\nExample:\n  #src/main.rs:12:3\n  Check this branch.\n  #src/lib.rs:5:1\n  Another note.\n\n📝 marks files and diff lines with notes. Press Alt+N on a file to see its\nnotes or on a diff line to see that line's notes. Esc closes the window;\nUp/Down and PageUp/PageDown scroll. The show_notes binding is configurable.\n";
 
 fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -> Result<String> {
     let loaded = config::Config::load(config)?;
@@ -38,7 +40,7 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
         "\nKeyboard layouts: an unbound non-ASCII shortcut key acts as the US English key at the same\nposition (like Vim langmap), e.g. Russian о is j and бй is ,q; text inputs stay verbatim.\n[keyboard] layouts = [\"ru\", \"uk\", \"be\"] (default; [] disables; available: {}) and\n[keyboard] langmap = \"оj,лk\" or \"ОЛ;jk\" (Vim syntax, overrides built-ins).\nKeys that already type ASCII are not translated (ЙЦУКЕН's / key types .); bind\nsearch_symbols = \".\" yourself if wanted (it replaces /). Labels show the configured\nkeys and are never translated.\n",
         layouts::NAMES.join(", ")
     ));
-    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nLocal startup and go-to-definition/references timings (no paths or names) are appended to\ntelemetry.jsonl there; [telemetry] enabled = false in the config turns them off.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nReviewing requires system Git and an interactive terminal.\n");
+    text.push_str("\nSymbol query: Enter submits, Escape returns, Backspace deletes.\nEscape cancels pending sequences/counts. Ctrl-C safely exits.\nClick selects/positions; double-click opens; wheel scrolls.\nMarks are saved under $XDG_STATE_HOME/review, or $HOME/.local/state/review.\nLocal startup and go-to-definition/references timings (no paths or names) are appended to\ntelemetry.jsonl there; [telemetry] enabled = false in the config turns them off.\nComments (comment, select_range, delete_comment) are saved to review-<summary>.comments\nin the launch directory. Comment editor: Enter (or Ctrl-S) saves; Ctrl+Enter, Shift+Enter,\nAlt+Enter or Ctrl-J inserts a newline; Escape (or Ctrl-G) cancels.\nNotes from the worktree's review.notes: Alt+N opens them; see review --help notes.\nReviewing requires system Git and an interactive terminal.\n");
     text.push_str(
         "\nCommand line (command_line): Enter runs, Escape cancels, Tab/Shift-Tab complete.\n",
     );
@@ -61,6 +63,7 @@ fn help(keymap: Option<keybindings::Keymap>, config: Option<&std::path::Path>) -
 
 #[derive(Debug, PartialEq)]
 enum Cli {
+    HelpNotes,
     Help {
         keymap: Option<keybindings::Keymap>,
         config: Option<std::path::PathBuf>,
@@ -78,8 +81,10 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
     let mut keymap = None;
     let mut config = None;
     let mut help = false;
+    let mut help_notes = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("notes") if help && !help_notes => help_notes = true,
             Some("--help" | "-h") => {
                 help = true;
             }
@@ -116,7 +121,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
         }
     }
     if help {
-        Ok(Cli::Help { keymap, config })
+        if help_notes {
+            Ok(Cli::HelpNotes)
+        } else {
+            Ok(Cli::Help { keymap, config })
+        }
     } else {
         Ok(Cli::Review {
             args: Vec::new(),
@@ -129,6 +138,10 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Cli> {
 fn run() -> Result<i32> {
     telemetry::start();
     let (args, keymap, config) = match parse_args(std::env::args_os().skip(1))? {
+        Cli::HelpNotes => {
+            print!("{NOTES_HELP}");
+            return Ok(0);
+        }
         Cli::Help { keymap, config } => {
             print!("{}", help(keymap, config.as_deref())?);
             return Ok(0);

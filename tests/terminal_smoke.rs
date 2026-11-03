@@ -3364,3 +3364,36 @@ fn comment_delete_removes_character_at_cursor() {
     let saved = read(&ctx.repo.join("review-HEAD.comments"));
     assert!(saved.contains("\na\n"), "{saved}");
 }
+
+#[test]
+fn notes_open_with_alt_n_and_escape_returns_to_review() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-notes-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    write(
+        &ctx.repo.join("review.notes"),
+        "#caller.rs:1:1\nCheck this call\n",
+    );
+    let mut session = ctx.session(&["--", "HEAD", "--", "caller.rs"]);
+    session.wait_text("Files");
+    session.send(b"\x1bn");
+    session.wait_text("Check this call");
+    session.send(b"\x1b");
+    session.wait_text("Files");
+    session.send(b",q");
+    session.finish(0);
+    assert_eq!(
+        read(&ctx.repo.join("review.notes")),
+        "#caller.rs:1:1\nCheck this call\n"
+    );
+}

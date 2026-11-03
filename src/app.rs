@@ -26,6 +26,12 @@ pub struct Help {
     pub viewport: usize,
 }
 
+pub struct NotesPopup {
+    pub text: String,
+    pub scroll: u16,
+    pub max_scroll: u16,
+}
+
 pub struct App {
     pub capture: Capture,
     pub store: Store,
@@ -69,6 +75,8 @@ pub struct App {
     pub palette: Option<Palette>,
     pub help: Option<Help>,
     pub comments: crate::comments::Store,
+    pub notes: crate::notes::Notes,
+    pub notes_popup: Option<NotesPopup>,
     /// Display row where an active line-range selection started.
     pub selection: Option<usize>,
     pub editor: Option<crate::comments::Editor>,
@@ -131,12 +139,19 @@ impl App {
             Err(_) => (crate::state::Positions::default(), true),
         };
         let (comments, loaded) = crate::comments::Store::load(&capture);
+        let (notes, notes_status) = crate::notes::Notes::load(&capture);
         let mut status = status;
         if let Some(loaded) = loaded {
             if !status.is_empty() {
                 status.push_str("; ");
             }
             status.push_str(&loaded);
+        }
+        if let Some(message) = notes_status {
+            if !status.is_empty() {
+                status.push_str("; ");
+            }
+            status.push_str(&message);
         }
         let original = capture.unavailable.is_some();
         let theme = Theme::default();
@@ -176,6 +191,8 @@ impl App {
             palette: None,
             help: None,
             comments,
+            notes,
+            notes_popup: None,
             selection: None,
             editor: None,
             startup: None,
@@ -438,6 +455,14 @@ impl App {
             }
             return;
         }
+        if self.notes_popup.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_notes(-3),
+                MouseEventKind::ScrollDown => self.scroll_notes(3),
+                _ => {}
+            }
+            return;
+        }
         if self.editor.is_some() || self.palette.is_some() {
             return;
         }
@@ -576,6 +601,17 @@ impl App {
         self.last_click = None;
         if self.editor.is_some() {
             return self.editor_key(key);
+        }
+        if self.notes_popup.is_some() {
+            match key.code {
+                KeyCode::Esc => self.notes_popup = None,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_notes(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_notes(1),
+                KeyCode::PageUp => self.scroll_notes(-10),
+                KeyCode::PageDown => self.scroll_notes(10),
+                _ => {}
+            }
+            return false;
         }
         if self.command.is_some() {
             return self.command_key(key);
@@ -813,6 +849,7 @@ impl App {
             ToggleMark => self.toggle_mark(),
             SelectRange => self.select_range(),
             Comment => self.comment(),
+            ShowNotes => self.show_notes(),
             DeleteComment => self.delete_comment(),
             CursorDown | CursorUp => {
                 let direction = if action == CursorDown {
@@ -1910,6 +1947,83 @@ impl App {
                 })
                 .collect(),
         )
+    }
+
+    pub fn note_markers(&self) -> Option<Vec<bool>> {
+        let item = &self.capture.items[self.diff_item().ok()?];
+        let notes: Vec<_> = self.notes.for_item(item).collect();
+        if notes.is_empty() {
+            return None;
+        }
+        let preview = self.preview.as_ref()?;
+        Some(
+            preview
+                .locations
+                .iter()
+                .map(|(_, new)| new.is_some_and(|line| notes.iter().any(|note| note.line == line)))
+                .collect(),
+        )
+    }
+
+    fn show_notes(&mut self) {
+        let Some(item) = self.capture.items.get(self.selected) else {
+            self.status = "No file selected".into();
+            return;
+        };
+        let line = if self.focus == Focus::Preview {
+            if self.diff_item().is_err() {
+                self.status = "Notes are available in the file list or file diff".into();
+                return;
+            }
+            self.preview
+                .as_ref()
+                .and_then(|preview| preview.locations.get(self.cursor.0))
+                .and_then(|(_, new)| *new)
+        } else {
+            None
+        };
+        if self.focus == Focus::Preview && line.is_none() {
+            self.status = "No notes on this line".into();
+            return;
+        }
+        let notes: Vec<_> = self
+            .notes
+            .for_item(item)
+            .filter(|note| line.is_none_or(|line| line == note.line))
+            .map(|note| {
+                format!(
+                    "{}:{}:{}\n{}",
+                    crate::git::visible_bytes(note.path.as_bytes()),
+                    note.line,
+                    note.column,
+                    crate::git::visible_bytes(note.text.as_bytes())
+                )
+            })
+            .collect();
+        if notes.is_empty() {
+            self.status = if line.is_some() {
+                "No notes on this line"
+            } else {
+                "No notes for this file"
+            }
+            .into();
+            return;
+        }
+        self.notes_popup = Some(NotesPopup {
+            text: notes.join("\n\n"),
+            scroll: 0,
+            max_scroll: 0,
+        });
+        self.bindings.clear();
+    }
+
+    fn scroll_notes(&mut self, rows: i16) {
+        if let Some(popup) = &mut self.notes_popup {
+            popup.scroll = popup
+                .scroll
+                .saturating_add_signed(rows)
+                .min(popup.max_scroll);
+        }
     }
 
     /// Inclusive displayed rows of the active selection.

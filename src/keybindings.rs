@@ -51,7 +51,7 @@ actions! {
     ToggleAfterChanges => "toggle_after_changes",
     AnalysisDetails => "analysis_details", ToggleMark => "toggle_mark",
     CommandLine => "command_line", CommandPalette => "command_palette",
-    Comment => "comment", SelectRange => "select_range", DeleteComment => "delete_comment",
+    Comment => "comment", SelectRange => "select_range", DeleteComment => "delete_comment", ShowNotes => "show_notes",
     NextFileDiff => "next_file_diff", PreviousFileDiff => "previous_file_diff",
 }
 #[derive(Clone)]
@@ -115,6 +115,7 @@ impl Bindings {
             (SearchWordBackward, &["#"]),
             (SearchNext, &["n"]),
             (SearchPrevious, &["N"]),
+            (ShowNotes, &["alt-n"]),
             (Comment, &["c"]),
             (DeleteComment, &["dc"]),
             (NextFileDiff, &["ctrl-j"]),

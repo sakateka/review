@@ -57,6 +57,7 @@ Vim keymap (default):
 | `:set nowrap` | Toggle soft line wrapping in previews for this session |
 | `:help` | Open in-app help |
 | `c` / `dc` | Add or edit / delete a comment on the line or the `v` selection |
+| `Alt-N` | Show notes for the selected file or current diff line |
 | `gd` / `gr` | Definition / references under the cursor |
 | `K` / `P` | Show the documentation / preview the definition |
 | `Ctrl-O` | Go back |
@@ -105,6 +106,27 @@ shortcuts, including Ctrl-A/E/B/F/P/N and Alt-B/F. Comments are written to `revi
 current directory: Markdown with front matter describing the comparison, and
 the reviewed excerpt next to each comment. On restart they are loaded again,
 and any whose lines have changed are flagged as outdated.
+
+## Notes
+
+At startup, review reads `review.notes` from the repository or worktree root.
+Each note starts with a header containing a root-relative path and one-based
+line and character positions. The following lines contain its text:
+
+```text
+#src/main.rs:12:3
+Check this branch.
+#src/lib.rs:5:1
+Another note, possibly spanning
+multiple lines.
+```
+
+A text line cannot begin with `#`, which starts a new header. Notes are
+read-only in review. 📝 marks files and new-side diff lines with notes; it
+appears to the left of 💬 when both are present. Press `Alt-N` to show all
+notes for the selected file, or the notes on the current diff line. Scroll
+with arrows, Page Up/Down or the mouse wheel; `Esc` closes the window.
+Run `review --help notes` for the notes format and controls.
 
 ## Code navigation
 
