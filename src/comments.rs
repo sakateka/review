@@ -938,6 +938,80 @@ impl Editor {
         }
     }
 
+    pub fn line_start(&mut self) {
+        self.column = 0;
+    }
+
+    pub fn line_end(&mut self) {
+        self.column = self.lines[self.row].chars().count();
+    }
+
+    pub fn word_backward(&mut self) {
+        let chars: Vec<_> = self.lines[self.row].chars().collect();
+        while self.column > 0 && !chars[self.column - 1].is_alphanumeric() {
+            self.column -= 1;
+        }
+        while self.column > 0 && chars[self.column - 1].is_alphanumeric() {
+            self.column -= 1;
+        }
+    }
+
+    pub fn word_forward(&mut self) {
+        let chars: Vec<_> = self.lines[self.row].chars().collect();
+        while self.column < chars.len() && !chars[self.column].is_alphanumeric() {
+            self.column += 1;
+        }
+        while self.column < chars.len() && chars[self.column].is_alphanumeric() {
+            self.column += 1;
+        }
+    }
+
+    pub fn delete(&mut self) {
+        let byte = self.byte();
+        if byte < self.lines[self.row].len() {
+            self.lines[self.row].remove(byte);
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+        }
+    }
+
+    pub fn kill_to_end(&mut self) {
+        let byte = self.byte();
+        if byte == self.lines[self.row].len() {
+            self.delete();
+        } else {
+            self.lines[self.row].truncate(byte);
+        }
+    }
+
+    pub fn kill_to_start(&mut self) {
+        let byte = self.byte();
+        self.lines[self.row].drain(..byte);
+        self.column = 0;
+    }
+
+    pub fn kill_word_backward(&mut self) {
+        let end = self.byte();
+        let chars: Vec<_> = self.lines[self.row].chars().collect();
+        while self.column > 0 && chars[self.column - 1].is_whitespace() {
+            self.column -= 1;
+        }
+        while self.column > 0 && !chars[self.column - 1].is_whitespace() {
+            self.column -= 1;
+        }
+        let start = self.byte();
+        self.lines[self.row].drain(start..end);
+    }
+
+    pub fn kill_word_forward(&mut self) {
+        let start = self.byte();
+        self.word_forward();
+        let end = self.byte();
+        self.lines[self.row].drain(start..end);
+        self.column = self.lines[self.row][..start].chars().count();
+    }
+
     pub fn vertical(&mut self, down: bool) {
         if down && self.row + 1 < self.lines.len() {
             self.row += 1;

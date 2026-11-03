@@ -8621,6 +8621,59 @@ mod review_comments {
     }
 
     #[test]
+    fn editor_readline_keys_edit_text_and_move_visible_cursor() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        open_at(&mut app, 7);
+        app.key(KeyCode::Char('c'));
+        type_text(&mut app, "alpha 界beta gamma");
+        ctrl(&mut app, 'a');
+        assert_eq!(app.editor.as_ref().unwrap().column, 0);
+        ctrl(&mut app, 'f');
+        ctrl(&mut app, 'b');
+        assert_eq!(app.editor.as_ref().unwrap().column, 0);
+        app.key_event(super::alt('f'));
+        assert_eq!(app.editor.as_ref().unwrap().column, 5);
+        app.key_event(super::alt('f'));
+        app.key_event(super::alt('b'));
+        assert_eq!(app.editor.as_ref().unwrap().column, 6);
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 'w');
+        assert_eq!(app.editor.as_ref().unwrap().text(), "alpha 界beta ");
+        ctrl(&mut app, 'j');
+        type_text(&mut app, "second line");
+        ctrl(&mut app, 'p');
+        assert_eq!(app.editor.as_ref().unwrap().row, 0);
+        ctrl(&mut app, 'n');
+        assert_eq!(app.editor.as_ref().unwrap().row, 1);
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'd');
+        assert_eq!(
+            app.editor.as_ref().unwrap().text(),
+            "alpha 界beta \necond line"
+        );
+        ctrl(&mut app, 'k');
+        assert_eq!(app.editor.as_ref().unwrap().text(), "alpha 界beta \n");
+        type_text(&mut app, "界end");
+        ctrl(&mut app, 'a');
+        ctrl(&mut app, 'f');
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let pos = terminal.get_cursor_position().unwrap();
+        let inner_x = (50 - 46) / 2 + 1;
+        let inner_y = (12 - 8) / 2 + 1;
+        assert_eq!((pos.x, pos.y), (inner_x + 2, inner_y + 1));
+        ctrl(&mut app, 'e');
+        ctrl(&mut app, 'u');
+        assert_eq!(app.editor.as_ref().unwrap().text(), "alpha 界beta \n");
+        ctrl(&mut app, 's');
+        assert!(app.editor.is_none());
+        assert!(file(directory.path(), "review-HEAD.comments").contains("alpha 界beta"));
+    }
+
+    #[test]
     fn editor_cancel_empty_save_and_delete_last_remove_the_file() {
         let directory = fixture();
         change(directory.path());

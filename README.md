@@ -99,7 +99,8 @@ review never writes to the repository, the index, refs or Git configuration.
 ## Comments
 
 Press `c` in a diff to comment on a line, a `v` range or the whole file (on
-its header). Comments are written to `review-<arguments>.comments` in the
+its header). The comment editor supports readline cursor movement and editing
+shortcuts, including Ctrl-A/E/B/F/P/N and Alt-B/F. Comments are written to `review-<arguments>.comments` in the
 current directory: Markdown with front matter describing the comparison, and
 the reviewed excerpt next to each comment. On restart they are loaded again,
 and any whose lines have changed are flagged as outdated.

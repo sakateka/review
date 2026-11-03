@@ -3303,3 +3303,64 @@ fn cursor_reopens_last_diff_after_restart() {
     second.send(b",q");
     second.finish(0);
 }
+
+#[test]
+fn comment_editor_readline_moves_cursor_and_edits_text() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-comment-readline-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    let mut session = ctx.session(&["--", "HEAD"]);
+    session.wait_text("Files");
+    session.send(b"\rcalpha beta");
+    session.wait_text("alpha beta");
+    let end = cursor(&session);
+    session.send(b"\x01");
+    let start = cursor(&session);
+    assert_eq!(start.0, end.0);
+    assert_eq!(end.1 - start.1, 10);
+    session.send(b"X\x05\x1bbY");
+    session.wait_text("Xalpha Ybeta");
+    session.send(b"\x01\x1b[3~");
+    session.wait_text("alpha Ybeta");
+    assert!(!session.text().contains("Xalpha Ybeta"));
+    session.send(b"X\r");
+    session.wait_text("Comment saved");
+    session.send(b",q");
+    session.finish(0);
+    assert!(read(&ctx.repo.join("review-HEAD.comments")).contains("Xalpha Ybeta"));
+}
+
+#[test]
+fn comment_delete_removes_character_at_cursor() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-comment-delete-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    let mut session = ctx.session(&["--", "HEAD"]);
+    session.wait_text("Files");
+    session.send(b"\rcab\x1b[D\x1b[3~\r");
+    session.wait_text("Comment saved");
+    session.send(b",q");
+    session.finish(0);
+    let saved = read(&ctx.repo.join("review-HEAD.comments"));
+    assert!(saved.contains("\na\n"), "{saved}");
+}

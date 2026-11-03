@@ -2088,6 +2088,32 @@ impl App {
             KeyCode::Char('j') if control => editor.newline(),
             KeyCode::Enter => self.save_comment(),
             KeyCode::Char('s') if control => self.save_comment(),
+            KeyCode::Char('a') if control => editor.line_start(),
+            KeyCode::Char('e') if control => editor.line_end(),
+            KeyCode::Char('b') if control => editor.left(),
+            KeyCode::Char('f') if control => editor.right(),
+            KeyCode::Char('p') if control => editor.vertical(false),
+            KeyCode::Char('n') if control => editor.vertical(true),
+            KeyCode::Char('h') if control => editor.backspace(),
+            KeyCode::Char('d') if control => editor.delete(),
+            KeyCode::Char('k') if control => editor.kill_to_end(),
+            KeyCode::Char('u') if control => editor.kill_to_start(),
+            KeyCode::Char('w') if control => editor.kill_word_backward(),
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                editor.word_backward()
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                editor.word_forward()
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                editor.kill_word_forward()
+            }
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
+                editor.kill_word_backward()
+            }
+            KeyCode::Home => editor.line_start(),
+            KeyCode::End => editor.line_end(),
+            KeyCode::Delete => editor.delete(),
             KeyCode::Backspace => editor.backspace(),
             KeyCode::Left => editor.left(),
             KeyCode::Right => editor.right(),
