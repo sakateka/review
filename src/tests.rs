@@ -10989,3 +10989,124 @@ fn wrapped_mouse_rejects_clipped_wide_grapheme() {
     app.mouse(click, std::time::Instant::now());
     assert_eq!(app.cursor, (0, 0));
 }
+
+#[test]
+fn embedded_highlighting_preserves_captured_views_and_restyles() {
+    for (name, old) in [
+        (
+            "embedded.rs",
+            "/// café prose\n/// ```compile_fail\n/// # use std::fmt;\n/// let value = 42;\n/// ```\nfn f() {}\n",
+        ),
+        (
+            "embedded.go",
+            "package p\n/* café prose\nint value = 42;\n*/\nimport \"C\"\n// unrelated comment\n",
+        ),
+    ] {
+        let directory = fixture();
+        let path = directory.path().join(name);
+        std::fs::write(&path, old).unwrap();
+        git_run(directory.path(), &["add", "."]);
+        git_run(directory.path(), &["commit", "-qm", "embedded"]);
+        let new = old.replace("42", "43");
+        std::fs::write(&path, &new).unwrap();
+        let captured = capture(directory.path(), &["HEAD", "--unified=100", "--", name]);
+        let mut catalog = source::Catalog::default();
+        for (side, content) in [
+            (source::ComparedSide::Old, old),
+            (source::ComparedSide::New, new.as_str()),
+        ] {
+            catalog.insert(side, name.as_bytes().to_vec(), content.as_bytes().to_vec());
+        }
+        std::fs::write(&path, "checkout changed").unwrap();
+        let mut views = vec![preview::Preview::item(
+            directory.path(),
+            &captured.items[0],
+            &theme::Theme::classic(),
+        )];
+        views.extend(
+            catalog
+                .sources
+                .iter()
+                .map(|source| preview::Preview::source(source, &theme::Theme::classic())),
+        );
+        for view in &mut views {
+            let token = if name.ends_with("rs") {
+                "let value"
+            } else {
+                "int value"
+            };
+            let style = |view: &preview::Preview, needle: &str| {
+                let line = view
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .find(|(row, line)| {
+                        view.locations[*row] != (None, None) && line.to_string().contains(needle)
+                    })
+                    .unwrap()
+                    .1;
+                let index = line.to_string().find(needle).unwrap();
+                let mut offset = 0;
+                line.spans
+                    .iter()
+                    .find_map(|span| {
+                        let found = offset <= index && index < offset + span.content.len();
+                        offset += span.content.len();
+                        found.then_some(span.style)
+                    })
+                    .unwrap()
+            };
+            assert_ne!(
+                style(view, token).fg,
+                style(view, if name.ends_with("rs") { "///" } else { "/*" }).fg
+            );
+            let before = style(view, token).fg;
+            let text: Vec<_> = view.lines.iter().map(ToString::to_string).collect();
+            let locations = view.locations.clone();
+            let cells = view.cells.clone();
+            view.restyle(&theme::Theme::gruvbox_baby());
+            assert_ne!(before, style(view, token).fg);
+            assert_eq!(
+                text,
+                view.lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(locations, view.locations);
+            assert_eq!(cells, view.cells);
+        }
+        for number in ["42", "43"] {
+            let line = views[0]
+                .lines
+                .iter()
+                .find(|line| line.to_string().contains(number))
+                .unwrap();
+            assert!(
+                line.spans.iter().any(|span| span.style.bg.is_some()
+                    && span.style.add_modifier.contains(Modifier::BOLD))
+            );
+            let token = if name.ends_with("rs") { "let" } else { "int" };
+            let start = line.to_string().find(token).unwrap();
+            let mut offset = 0;
+            let token_style = line
+                .spans
+                .iter()
+                .find_map(|span| {
+                    let found = offset <= start && start < offset + span.content.len();
+                    offset += span.content.len();
+                    found.then_some(span.style)
+                })
+                .unwrap();
+            assert_eq!(
+                token_style.fg,
+                Some(if name.ends_with("rs") {
+                    Color::Rgb(0xfb, 0x49, 0x34)
+                } else {
+                    Color::Rgb(0x8e, 0xc0, 0x7c)
+                }),
+                "{name} {number}"
+            );
+        }
+    }
+}

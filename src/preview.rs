@@ -35,6 +35,10 @@ type MappedCaptures<'a> = (&'a source::Sources, &'a [Option<u8>], &'a [Option<u8
 
 /// Per-byte capture indices into the shared theme capture table.
 fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
+    highlight(side, true)
+}
+
+fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
     let path = std::path::Path::new(std::str::from_utf8(&side.path)?);
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
     let (language, query) = match extension {
@@ -129,7 +133,295 @@ fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
             }
         }
     }
+    if embedded && matches!(extension, "rs" | "go") {
+        overlay_embedded(&side.content, extension, &mut bytes);
+    }
     Ok(bytes)
+}
+
+// Extracted bytes retain a direct mapping to the captured source. Newlines inserted
+// between comment fragments have no source mapping.
+fn apply_embedded(text: &str, map: &[Option<usize>], extension: &str, bytes: &mut Captures) {
+    if text.len() > 256 * 1024 {
+        return;
+    }
+    let side = source::Side {
+        path: format!("embedded.{extension}").into_bytes(),
+        content: text.to_owned(),
+    };
+    if let Ok(captures) = highlight(&side, false) {
+        for (capture, original) in captures.into_iter().zip(map) {
+            if let (Some(capture), Some(original)) = (capture, original) {
+                bytes[*original] = Some(capture);
+            }
+        }
+    }
+}
+
+fn append_fragment(
+    text: &str,
+    range: Range<usize>,
+    extracted: &mut String,
+    map: &mut Vec<Option<usize>>,
+) {
+    extracted.push_str(&text[range.clone()]);
+    map.extend(range.map(Some));
+    extracted.push('\n');
+    map.push(None);
+}
+
+fn rust_docs(text: &str, comments: &[Range<usize>], bytes: &mut Captures, budget: &mut usize) {
+    let mut lines = Vec::new();
+    for range in comments {
+        let comment = &text[range.clone()];
+        let block = comment.starts_with("/*");
+        let start = range.start + 3;
+        let end = if block && comment.ends_with("*/") {
+            range.end - 2
+        } else {
+            range.end
+        };
+        if start > end {
+            continue;
+        }
+        let mut offset = start;
+        for line in text[start..end].split_inclusive('\n') {
+            let end = offset + line.trim_end_matches(['\r', '\n']).len();
+            let mut content = offset;
+            if block {
+                while content < end && matches!(text.as_bytes()[content], b' ' | b'\t') {
+                    content += 1;
+                }
+                if content < end && text.as_bytes().get(content) == Some(&b'*') {
+                    content += 1;
+                }
+            }
+            lines.push(content..end);
+            offset += line.len();
+        }
+    }
+    let indentation = |line: &str| {
+        let mut columns: usize = 0;
+        for byte in line.bytes() {
+            match byte {
+                b' ' => columns += 1,
+                b'\t' => columns += 4 - columns % 4,
+                _ => break,
+            }
+        }
+        columns
+    };
+    // Rustdoc removes the shared indentation of nonblank documentation lines
+    // before handing their content to Markdown.
+    let common_indent = lines
+        .iter()
+        .map(|range| &text[range.clone()])
+        .filter(|line| !line.trim().is_empty())
+        .map(indentation)
+        .min()
+        .unwrap_or(0);
+    let mut open: Option<(u8, usize, bool, usize)> = None;
+    for (index, range) in lines.iter().enumerate() {
+        let raw = &text[range.clone()];
+        if indentation(raw).saturating_sub(common_indent) > 3 {
+            continue;
+        }
+        let line = raw.trim();
+        let marker = line.as_bytes().first().copied();
+        let count = marker.map_or(0, |m| line.bytes().take_while(|b| *b == m).count());
+        if !matches!(marker, Some(b'`' | b'~')) || count < 3 {
+            continue;
+        }
+        if let Some((m, n, supported, first)) = open {
+            if marker == Some(m) && count >= n && line[count..].trim().is_empty() {
+                if supported && *budget > 0 {
+                    *budget -= 1;
+                    let mut extracted = String::new();
+                    let mut map = Vec::new();
+                    for content in &lines[first..index] {
+                        // Rustdoc strips a leading `# ` from hidden setup lines before
+                        // parsing the example. Keep that marker in the comment style.
+                        let line = &text[content.clone()];
+                        let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+                        let hidden = &line[indent..];
+                        if hidden == "#" || hidden.starts_with("# ") || hidden.starts_with("#\t") {
+                            extracted.push_str(&line[..indent]);
+                            map.extend((content.start..content.start + indent).map(Some));
+                            let skip = if hidden.len() == 1 { 1 } else { 2 };
+                            append_fragment(
+                                text,
+                                content.start + indent + skip..content.end,
+                                &mut extracted,
+                                &mut map,
+                            );
+                        } else {
+                            append_fragment(text, content.clone(), &mut extracted, &mut map);
+                        }
+                    }
+                    apply_embedded(&extracted, &map, "rs", bytes);
+                }
+                open = None;
+            }
+        } else {
+            let info = line[count..].trim();
+            let supported = info.is_empty()
+                || info
+                    .split([',', ' ', '\t'])
+                    .filter(|s| !s.is_empty())
+                    .all(|s| {
+                        matches!(
+                            s,
+                            "rust"
+                                | "compile_fail"
+                                | "no_run"
+                                | "should_panic"
+                                | "ignore"
+                                | "allow_fail"
+                                | "test_harness"
+                                | "edition2015"
+                                | "edition2018"
+                                | "edition2021"
+                                | "edition2024"
+                        )
+                    });
+            open = Some((marker.unwrap(), count, supported, index + 1));
+        }
+    }
+}
+
+fn overlay_embedded(text: &str, extension: &str, bytes: &mut Captures) {
+    let language = if extension == "rs" {
+        tree_sitter_rust::LANGUAGE
+    } else {
+        tree_sitter_go::LANGUAGE
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&language.into()).is_err() {
+        return;
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return;
+    };
+    let mut nodes = vec![tree.root_node()];
+    let mut comments = Vec::new();
+    let mut imports = Vec::new();
+    while let Some(node) = nodes.pop() {
+        if extension == "rs" && matches!(node.kind(), "line_comment" | "block_comment") {
+            if node.child_by_field_name("doc").is_some() {
+                comments.push(node.byte_range());
+            }
+            continue;
+        }
+        if extension == "go" && node.kind() == "comment" {
+            comments.push(node.byte_range());
+            continue;
+        }
+        if extension == "go"
+            && node.kind() == "import_spec"
+            && node.child_by_field_name("name").is_none()
+            && node
+                .child_by_field_name("path")
+                .is_some_and(|p| &text[p.byte_range()] == "\"C\"")
+            && let Some(parent) = node.parent()
+        {
+            if parent.kind() == "import_declaration" {
+                imports.push((parent.start_byte(), None));
+            } else if parent.kind() == "import_spec_list" {
+                let mut cursor = parent.walk();
+                let count = parent
+                    .named_children(&mut cursor)
+                    .filter(|n| n.kind() == "import_spec")
+                    .count();
+                let fallback = (count == 1)
+                    .then(|| parent.parent().map(|n| n.start_byte()))
+                    .flatten();
+                imports.push((node.start_byte(), fallback));
+            }
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    comments.sort_by_key(|r| r.start);
+    if extension == "rs" {
+        let mut group: Vec<Range<usize>> = Vec::new();
+        let mut budget = 128;
+        for range in comments {
+            let adjacent = group.last().is_some_and(|previous| {
+                text[previous.clone()].starts_with("//")
+                    && text[range.clone()].starts_with("//")
+                    && {
+                        let gap = &text[previous.end..range.start];
+                        gap.bytes().filter(|b| *b == b'\n').count()
+                            + usize::from(text[previous.clone()].ends_with('\n'))
+                            == 1
+                            && gap.trim().is_empty()
+                    }
+            });
+            if !adjacent && !group.is_empty() {
+                rust_docs(text, &group, bytes, &mut budget);
+                group.clear();
+            }
+            group.push(range);
+        }
+        rust_docs(text, &group, bytes, &mut budget);
+    } else {
+        let mut standalone = Vec::with_capacity(comments.len());
+        for (index, range) in comments.iter().enumerate() {
+            let line_start = text[..range.start].rfind('\n').map_or(0, |i| i + 1);
+            let previous = index.checked_sub(1).map(|i| &comments[i]);
+            let begins_line = text[line_start..range.start].trim().is_empty()
+                || previous.is_some_and(|prior| {
+                    prior.end >= line_start
+                        && text[prior.end..range.start].trim().is_empty()
+                        && standalone[index - 1]
+                });
+            standalone.push(begins_line);
+        }
+        for (import, fallback) in imports.into_iter().take(128) {
+            let preceding = |import| {
+                let mut end = import;
+                let mut group = Vec::new();
+                let count = comments.partition_point(|range| range.end <= import);
+                for index in (0..count).rev() {
+                    let range = &comments[index];
+                    let gap = &text[range.end..end];
+                    let newlines = gap.bytes().filter(|b| *b == b'\n').count();
+                    if !gap.trim().is_empty()
+                        || newlines > 1
+                        || (end == import && newlines != 1)
+                        || !standalone[index]
+                    {
+                        break;
+                    }
+                    group.push(range.clone());
+                    end = range.start;
+                }
+                group.reverse();
+                group
+            };
+            let mut group = preceding(import);
+            if group.is_empty()
+                && let Some(fallback) = fallback
+            {
+                group = preceding(fallback);
+            }
+            let mut extracted = String::new();
+            let mut map = Vec::new();
+            for range in group {
+                let comment = &text[range.clone()];
+                let start = range.start + 2;
+                let end = if comment.starts_with("/*") && comment.ends_with("*/") {
+                    range.end - 2
+                } else {
+                    range.end
+                };
+                if start <= end {
+                    append_fragment(text, start..end, &mut extracted, &mut map);
+                }
+            }
+            apply_embedded(&extracted, &map, "c", bytes);
+        }
+    }
 }
 
 fn changed_ranges(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
@@ -880,5 +1172,117 @@ impl Preview {
                 line
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod embedded_tests {
+    use super::*;
+
+    fn captures(path: &str, text: &str) -> Captures {
+        syntax(&source::Side {
+            path: path.as_bytes().to_vec(),
+            content: text.into(),
+        })
+        .unwrap()
+    }
+
+    fn at(captures: &Captures, text: &str, needle: &str) -> Option<u8> {
+        captures[text.find(needle).unwrap()]
+    }
+
+    #[test]
+    fn rust_doc_fences_are_projected_without_affecting_other_comments() {
+        let text = "/// prose café\n/// ```compile_fail\n/// let x = 42;\n/// ```\n/// ```python\n/// let y = 3;\n/// ```\nfn f() {}\n/* ordinary let z = 9; */\n/**\n * ```rust\n * let n = 5;\n * ```\n */\nfn g() {}\n/// ```\n/// let unclosed = 2;\n";
+        let c = captures("a.rs", text);
+        let comment = at(&c, text, "prose");
+        assert_ne!(at(&c, text, "let x"), comment);
+        assert_ne!(at(&c, text, "let n"), comment);
+        for needle in ["```compile_fail", "let y", "ordinary", "let unclosed"] {
+            assert_eq!(at(&c, text, needle), comment, "{needle}");
+        }
+    }
+
+    #[test]
+    fn rustdoc_fences_respect_normalized_markdown_indentation() {
+        let text = "/// prose\n///     ```rust\n///     let literal = 1;\n///     ```\n///    ```rust\n///    let valid = 2;\n///    ```\nfn f() {}\n";
+        let c = captures("a.rs", text);
+        let comment = at(&c, text, "prose");
+        assert_eq!(at(&c, text, "let literal"), comment);
+        assert_ne!(at(&c, text, "let valid"), comment);
+
+        let indented = "///    ```rust\n///    let example = 1;\n///    ```\npub fn sample() {}\n";
+        let c = captures("a.rs", indented);
+        assert_ne!(at(&c, indented, "let example"), at(&c, indented, "///"));
+    }
+
+    #[test]
+    fn cgo_adjacent_block_comments_are_a_single_preamble() {
+        let text = "package p\n/* int first = 1; */ /* int second = 2; */\nimport \"C\"\nimport (\n \"fmt\"\n /* int grouped_first = 3; */ /* int grouped_second = 4; */\n \"C\"\n)\nimport \"io\" /* int trailing_first = 5; */ /* int trailing_second = 6; */\nimport \"C\"\n";
+        let c = captures("a.go", text);
+        let comment = at(&c, text, "/* int first");
+        for token in [
+            "int first",
+            "int second",
+            "int grouped_first",
+            "int grouped_second",
+        ] {
+            assert_ne!(at(&c, text, token), comment, "{token}");
+        }
+        for token in ["int trailing_first", "int trailing_second"] {
+            assert_eq!(at(&c, text, token), comment, "{token}");
+        }
+    }
+
+    #[test]
+    fn hidden_rustdoc_setup_preserves_following_highlighting() {
+        let text =
+            "/// ```compile_fail\n/// # use std::fmt;\n/// let value = 42;\n/// ```\nfn f() {}\n";
+        let c = captures("a.rs", text);
+        let comment = at(&c, text, "/// #");
+        assert_ne!(at(&c, text, "use std"), comment);
+        assert_ne!(at(&c, text, "let value"), comment);
+        assert_ne!(at(&c, text, "42"), comment);
+        assert_eq!(at(&c, text, "# use"), comment);
+    }
+
+    #[test]
+    fn cgo_line_comments_and_resource_fallback() {
+        let text = "package p\n// int line_value = 7;\nimport \"C\"\n";
+        let c = captures("a.go", text);
+        assert_ne!(at(&c, text, "int line_value"), at(&c, text, "//"));
+        let huge = format!(
+            "/// ```rust\n/// let value = 7;{}\n/// ```\nfn f() {{}}\n",
+            " ".repeat(256 * 1024)
+        );
+        let c = captures("a.rs", &huge);
+        assert_eq!(at(&c, &huge, "let value"), at(&c, &huge, "///"));
+    }
+
+    #[test]
+    fn cgo_grouped_imports_use_only_their_own_standalone_comments() {
+        let text = "package p\nimport (\n \"fmt\"\n // int grouped = 42;\n \"C\"\n \"os\"\n)\nimport (\n \"strings\" // int trailing_grouped = 5;\n \"C\"\n)\nimport \"io\" // int trailing_direct = 6;\nimport \"C\"\n";
+        let c = captures("a.go", text);
+        let comment = at(&c, text, "// int grouped");
+        assert_ne!(at(&c, text, "int grouped"), comment);
+        assert_ne!(at(&c, text, "42"), comment);
+        assert_eq!(at(&c, text, "int trailing_grouped"), comment);
+        assert_eq!(at(&c, text, "int trailing_direct"), comment);
+    }
+
+    #[test]
+    fn cgo_grouped_single_import_accepts_declaration_doc_fallback() {
+        let text = "package p\n// int fallback = 42;\nimport (\n \"C\"\n)\n";
+        let c = captures("a.go", text);
+        assert_ne!(at(&c, text, "int fallback"), at(&c, text, "//"));
+    }
+
+    #[test]
+    fn cgo_requires_a_real_adjacent_import() {
+        let text = "package p\n/*\nint x = 42;\n*/\nimport \"C\"\n// int unrelated = 8;\nimport \"fmt\"\nvar s = `/* int fake = 3; */ import \"C\"`\n";
+        let c = captures("a.go", text);
+        assert_ne!(at(&c, text, "int x"), at(&c, text, "int unrelated"));
+        assert_eq!(at(&c, text, "int unrelated"), at(&c, text, "// int"));
+        assert_ne!(at(&c, text, "int fake"), at(&c, text, "int x"));
     }
 }
