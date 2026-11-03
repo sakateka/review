@@ -5,7 +5,7 @@ use crate::{
 };
 use ratatui::text::{Line, Span};
 use similar::{ChangeTag, TextDiff};
-use std::{ops::Range, path::Path};
+use std::{cell::RefCell, ops::Range, path::Path, rc::Rc};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -26,6 +26,8 @@ pub struct Preview {
     /// Theme-independent meaning of every span, parallel to `lines`.
     roles: Vec<Vec<Role>>,
     theme: Theme,
+    /// Per-width cumulative row counts; the logical text remains authoritative.
+    wrap_index: RefCell<Option<(usize, Rc<Vec<usize>>)>>,
 }
 
 type Captures = Vec<Option<u8>>;
@@ -464,6 +466,7 @@ impl Preview {
             ordinary: None,
             roles,
             theme: *theme,
+            wrap_index: RefCell::new(None),
         };
         preview.restyle(theme);
         if omitted_rows {
@@ -478,6 +481,7 @@ impl Preview {
     /// Project only classified hunk removals from this captured rendering.
     /// Returns the corresponding cursor and viewport rows without loading Git/source.
     pub fn toggle_after_changes(&mut self, cursor: usize, top: usize) -> (usize, usize) {
+        self.wrap_index.get_mut().take();
         let search = self.search.clone();
         let mapped = if let Some(ordinary) = self.ordinary.take() {
             let retained: Vec<_> = (0..ordinary.lines.len())
@@ -592,6 +596,7 @@ impl Preview {
 
     /// Append another rendering's rows below this one.
     pub fn append(&mut self, other: Preview) {
+        self.wrap_index.get_mut().take();
         self.width = self.width.max(other.width);
         self.roles.resize(self.lines.len(), Vec::new());
         self.lines.extend(other.lines);
@@ -740,6 +745,86 @@ impl Preview {
             }
         }
         None
+    }
+
+    /// Cell ranges for each visual row, retaining grapheme boundaries.
+    fn segments(&self, row: usize, width: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let mut graphemes = self.lines[row]
+            .spans
+            .iter()
+            .flat_map(|s| s.content.graphemes(true))
+            .peekable();
+        let mut cell = 0usize;
+        let mut first = true;
+        let width = width.max(1);
+        std::iter::from_fn(move || {
+            if !first && graphemes.peek().is_none() {
+                return None;
+            }
+            first = false;
+            let start = cell;
+            while let Some(g) = graphemes.peek() {
+                let size = g.width();
+                if cell > start && cell.saturating_add(size) > start.saturating_add(width) {
+                    break;
+                }
+                cell = cell.saturating_add(size);
+                graphemes.next();
+                if cell.saturating_sub(start) >= width {
+                    break;
+                }
+            }
+            Some((start, cell))
+        })
+    }
+
+    fn wrap_index(&self, width: usize) -> Rc<Vec<usize>> {
+        let width = width.max(1);
+        if let Some((cached_width, rows)) = &*self.wrap_index.borrow()
+            && *cached_width == width
+        {
+            return Rc::clone(rows);
+        }
+        let mut offsets = Vec::with_capacity(self.lines.len() + 1);
+        offsets.push(0usize);
+        for row in 0..self.lines.len() {
+            offsets.push(offsets[row].saturating_add(self.segments(row, width).count()));
+        }
+        let offsets = Rc::new(offsets);
+        *self.wrap_index.borrow_mut() = Some((width, Rc::clone(&offsets)));
+        offsets
+    }
+
+    pub fn visual_rows(&self, width: usize) -> usize {
+        *self.wrap_index(width).last().unwrap_or(&0)
+    }
+
+    pub fn visual_position(&self, row: usize, column: usize, width: usize) -> (usize, usize) {
+        let row = row.min(self.lines.len().saturating_sub(1));
+        if self.lines.is_empty() {
+            return (0, 0);
+        }
+        let before = self.wrap_index(width)[row];
+        for (index, (start, end)) in self.segments(row, width).enumerate() {
+            if column < end || start == end {
+                return (
+                    before + index,
+                    column.saturating_sub(start).min(width.saturating_sub(1)),
+                );
+            }
+        }
+        (before, 0)
+    }
+
+    pub fn visual_segment(&self, visual: usize, width: usize) -> Option<(usize, usize, usize)> {
+        let offsets = self.wrap_index(width);
+        if visual >= *offsets.last()? {
+            return None;
+        }
+        let row = offsets.partition_point(|offset| *offset <= visual) - 1;
+        self.segments(row, width)
+            .nth(visual - offsets[row])
+            .map(|(start, end)| (row, start, end))
     }
 
     pub fn visible(

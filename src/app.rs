@@ -34,6 +34,8 @@ pub struct App {
     pub preview: Option<Preview>,
     pub focus: Focus,
     pub top: usize,
+    pub wrap: bool,
+    pub top_segment: usize,
     pub left: usize,
     pub viewport: (usize, usize),
     pub status: String,
@@ -90,6 +92,7 @@ struct DiffView {
     preview: Preview,
     cursor: (usize, usize),
     top: usize,
+    top_segment: usize,
     left: usize,
 }
 
@@ -97,6 +100,7 @@ struct DiffView {
 struct View {
     preview: Option<Preview>,
     top: usize,
+    top_segment: usize,
     left: usize,
     side: ComparedSide,
     source: Option<usize>,
@@ -182,6 +186,8 @@ impl App {
                 Focus::Files
             },
             top: 0,
+            wrap: false,
+            top_segment: 0,
             left: 0,
             viewport: (0, 0),
             status,
@@ -189,7 +195,41 @@ impl App {
         }
     }
 
+    pub fn set_line_wrap(&mut self, wrap: bool) {
+        if self.preview.is_some() && self.wrap != wrap {
+            self.wrap = wrap;
+            self.top_segment = 0;
+            self.keep_cursor_visible();
+        }
+    }
+
+    pub fn visual_top(&self) -> usize {
+        self.preview.as_ref().map_or(0, |p| {
+            p.visual_position(self.top, 0, self.viewport.1).0 + self.top_segment
+        })
+    }
+
+    fn set_visual_top(&mut self, visual: usize) {
+        if let Some(p) = &self.preview
+            && let Some((row, _, _)) = p.visual_segment(visual, self.viewport.1)
+        {
+            self.top = row;
+            self.top_segment = visual - p.visual_position(row, 0, self.viewport.1).0;
+        }
+    }
+
     pub fn clamp_scroll(&mut self) {
+        if self.wrap {
+            if let Some(preview) = &self.preview {
+                let top = self.visual_top().min(
+                    preview
+                        .visual_rows(self.viewport.1)
+                        .saturating_sub(self.viewport.0.max(1)),
+                );
+                self.set_visual_top(top);
+            }
+            return;
+        }
         if let Some(preview) = &self.preview {
             self.top = self
                 .top
@@ -214,6 +254,22 @@ impl App {
 
     pub fn keep_cursor_visible(&mut self) {
         self.clamp_cursor();
+        if self.wrap {
+            if let Some(preview) = &self.preview {
+                let row = preview
+                    .visual_position(self.cursor.0, self.cursor.1, self.viewport.1)
+                    .0;
+                let top = self.visual_top();
+                let height = self.viewport.0.max(1);
+                if row < top {
+                    self.set_visual_top(row);
+                } else if row >= top.saturating_add(height) {
+                    self.set_visual_top(row + 1 - height);
+                }
+                self.clamp_scroll();
+            }
+            return;
+        }
         if self.cursor.0 < self.top {
             self.top = self.cursor.0;
         }
@@ -230,6 +286,9 @@ impl App {
     }
 
     pub fn layout_preview(&mut self, height: usize, width: usize) {
+        if self.wrap && self.viewport.1 != width {
+            self.top_segment = 0;
+        }
         self.viewport = (height, width);
         // Opening must wait for the real content rectangle. A zero-height
         // frame cannot position the target; consume the request on first layout
@@ -241,6 +300,7 @@ impl App {
         {
             self.clamp_cursor();
             self.top = self.cursor.0.saturating_sub(height / 2);
+            self.top_segment = 0;
         }
         self.keep_cursor_visible();
     }
@@ -253,6 +313,29 @@ impl App {
 
     pub fn scroll_preview(&mut self, rows: isize, columns: isize) {
         self.center_preview_on_layout = None;
+        if self.wrap {
+            let top = self.visual_top().saturating_add_signed(rows);
+            if let Some(preview) = &self.preview {
+                let top = top.min(
+                    preview
+                        .visual_rows(self.viewport.1)
+                        .saturating_sub(self.viewport.0.max(1)),
+                );
+                let cursor_row = preview
+                    .visual_position(self.cursor.0, self.cursor.1, self.viewport.1)
+                    .0;
+                let target =
+                    cursor_row.clamp(top, top.saturating_add(self.viewport.0.saturating_sub(1)));
+                if let Some((row, start, end)) = preview.visual_segment(target, self.viewport.1) {
+                    self.cursor = (
+                        row,
+                        self.cursor.1.clamp(start, end.saturating_sub(1).max(start)),
+                    );
+                }
+                self.set_visual_top(top);
+            }
+            return;
+        }
         self.top = self.top.saturating_add_signed(rows);
         self.left = self.left.saturating_add_signed(columns);
         self.clamp_scroll();
@@ -403,8 +486,23 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) if preview => {
                 self.last_click = None;
                 self.focus = Focus::Preview;
-                let row = self.top + (mouse.row - self.preview_area.y) as usize;
-                let column = self.left + (mouse.column - self.preview_area.x) as usize;
+                let offset = (mouse.row - self.preview_area.y) as usize;
+                let x = (mouse.column - self.preview_area.x) as usize;
+                let (row, column) = if self.wrap {
+                    let Some((row, start, end)) = self.preview.as_ref().and_then(|p| {
+                        p.visual_segment(self.visual_top() + offset, self.viewport.1)
+                    }) else {
+                        return;
+                    };
+                    if end.saturating_sub(start) > self.viewport.1
+                        || (start + x >= end && end != start)
+                    {
+                        return;
+                    }
+                    (row, start + x)
+                } else {
+                    (self.top + offset, self.left + x)
+                };
                 if self
                     .preview
                     .as_ref()
@@ -607,6 +705,7 @@ impl App {
                     &self.theme,
                 ));
                 self.top = 0;
+                self.top_segment = 0;
                 self.left = 0;
                 self.cursor = (0, 0);
                 self.focus = Focus::Preview;
@@ -636,6 +735,7 @@ impl App {
                 if let Some(preview) = &mut self.preview {
                     (self.cursor.0, self.top) =
                         preview.toggle_after_changes(self.cursor.0, self.top);
+                    self.top_segment = 0;
                     if let Some(search) = &preview.search {
                         self.status = if search.matches.is_empty() {
                             format!("/{} · no displayed matches", search.word)
@@ -976,6 +1076,7 @@ impl App {
             self.file_diff = true;
             self.focus = Focus::Preview;
             self.top = 0;
+            self.top_segment = 0;
             self.left = 0;
         } else if self.capture.unavailable.is_some() {
             self.status = "File actions are unavailable in original-output mode".into();
@@ -1034,6 +1135,7 @@ impl App {
         self.focus = Focus::Files;
         self.cursor = (0, 0);
         self.top = 0;
+        self.top_segment = 0;
         self.left = 0;
         self.status.clear();
     }
@@ -1050,6 +1152,7 @@ impl App {
         self.focus = Focus::Files;
         self.cursor = (0, 0);
         self.top = 0;
+        self.top_segment = 0;
         self.left = 0;
         self.keep_selection_visible();
     }
@@ -1105,6 +1208,7 @@ impl App {
                     preview: preview.clone(),
                     cursor: self.cursor,
                     top: self.top,
+                    top_segment: self.top_segment,
                     left: self.left,
                 },
             );
@@ -1118,6 +1222,7 @@ impl App {
             self.preview = Some(view.preview);
             self.cursor = view.cursor;
             self.top = view.top;
+            self.top_segment = view.top_segment;
             self.left = view.left;
             self.keep_cursor_visible();
         }
@@ -1138,6 +1243,7 @@ impl App {
         self.history.push(View {
             preview: self.preview.clone(),
             top: self.top,
+            top_segment: self.top_segment,
             left: self.left,
             side: self.side,
             source: self.source,
@@ -1170,6 +1276,7 @@ impl App {
         if let Some(view) = self.history.pop() {
             self.preview = view.preview;
             self.top = view.top;
+            self.top_segment = view.top_segment;
             self.left = view.left;
             self.side = view.side;
             self.source = view.source;
@@ -1348,6 +1455,7 @@ impl App {
                     preview.title = Some("Function documentation".into());
                     self.preview = Some(preview);
                     self.top = 0;
+                    self.top_segment = 0;
                     self.left = 0;
                     self.cursor = (0, 0);
                     self.focus = Focus::Preview;
@@ -1427,6 +1535,7 @@ impl App {
         self.top = nav
             .selected
             .saturating_sub(self.viewport.0.saturating_sub(3));
+        self.top_segment = 0;
         self.left = 0;
         self.cursor = (nav.selected + 2, 0);
         self.status = if nav.coverage.contains("Analysis failed") {
@@ -1516,6 +1625,7 @@ impl App {
         self.side = side;
         self.source = Some(candidate.source);
         self.top = candidate.tag.line.saturating_sub(1) as usize;
+        self.top_segment = 0;
         self.cursor = (candidate.tag.line.saturating_sub(1) as usize, left);
         self.center_preview_on_layout = is_definition_preview.then_some(self.cursor);
         // Source columns are Unicode scalars; rendered prefixes/backslash/tab
@@ -1598,12 +1708,18 @@ impl App {
             ),
             (None, None) => return None,
         };
-        let col = preview.visible_hit(
-            self.cursor.0,
-            self.cursor.1,
-            self.left,
-            self.viewport.1.max(1),
-        )?;
+        let left = if self.wrap {
+            let visual = preview
+                .visual_position(self.cursor.0, self.cursor.1, self.viewport.1)
+                .0;
+            preview
+                .visual_segment(visual, self.viewport.1)
+                .map_or(0, |(_, start, _)| start)
+        } else {
+            self.left
+        };
+        let col =
+            preview.visible_hit(self.cursor.0, self.cursor.1, left, self.viewport.1.max(1))?;
         let id = if let Some(id) = self.source {
             id
         } else {

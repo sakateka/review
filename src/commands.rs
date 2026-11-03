@@ -32,6 +32,12 @@ pub const COMMANDS: &[Command] = &[
         summary: "show or change a runtime setting",
         values: None,
     },
+    Command {
+        name: "help",
+        usage: "help",
+        summary: "open help with the active bindings",
+        values: None,
+    },
 ];
 
 pub struct Setting {
@@ -145,7 +151,11 @@ fn candidates(text: &str) -> (&str, &str, Vec<&'static str>) {
             None => (
                 &text[..argument_start],
                 argument,
-                SETTINGS.iter().map(|setting| setting.key).collect(),
+                SETTINGS
+                    .iter()
+                    .map(|setting| setting.key)
+                    .chain(["wrap", "nowrap"])
+                    .collect(),
             ),
         },
         _ => match COMMANDS
@@ -183,6 +193,12 @@ pub fn entries() -> Vec<Entry> {
                     text: format!("{SET} {}={value}", setting.key),
                     summary: setting.summary,
                 }));
+            }
+            for text in ["set wrap", "set nowrap"] {
+                entries.push(Entry {
+                    text: text.into(),
+                    summary: "change line wrapping for this session",
+                });
             }
             continue;
         }
@@ -278,9 +294,18 @@ pub fn execute(app: &mut App, text: &str) {
         .split_once(char::is_whitespace)
         .map_or((text, ""), |(name, argument)| (name, argument.trim()));
     match name {
+        "help" if argument.is_empty() => {
+            app.help = Some(crate::app::Help::default());
+            app.bindings.clear();
+        }
         "colorscheme" => setting(app, COLORSCHEME, (!argument.is_empty()).then_some(argument)),
         "set" if argument.is_empty() => {
             app.status = format!("set requires a setting such as {COLORSCHEME}=<name>");
+        }
+        "set" if matches!(argument, "wrap" | "nowrap") => {
+            let wrap = if argument == "wrap" { true } else { !app.wrap };
+            app.set_line_wrap(wrap);
+            app.status = if app.wrap { "wrap" } else { "nowrap" }.into();
         }
         "set" => match argument.split_once('=') {
             Some((key, value)) => setting(app, key.trim(), Some(value.trim())),

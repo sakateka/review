@@ -3201,3 +3201,51 @@ fn keyboard_layouts(ctx: &Ctx) {
     assert_same(&state_before, &kept, "keyboard layout review state");
     pty_passed("keyboard layout mapping");
 }
+
+#[test]
+fn line_wrap_and_help_terminal() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-wrap-pty-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    line_wrap(&ctx);
+}
+
+fn line_wrap(ctx: &Ctx) {
+    let repo = ctx.root.join("wrap-pty");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| ctx.git_in(&repo, args);
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Wrap test"]);
+    git(&["config", "user.email", "wrap@example.invalid"]);
+    write(&repo.join("long.txt"), "before\n");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "initial"]);
+    write(
+        &repo.join("long.txt"),
+        format!("{}WRAPPED_END\n", "x".repeat(180)),
+    );
+    let mut session = ctx.session_in(&repo, &["--", "HEAD"]);
+    closed(&mut session);
+    session.send(b"\rG0");
+    assert!(!session.text().contains("WRAPPED_END"));
+    session.send(b":set nowrap\r");
+    assert!(session.text().contains("WRAPPED_END"), "{}", session.text());
+    session.send(b":set nowrap\r");
+    assert!(!session.text().contains("WRAPPED_END"));
+    session.send(b":help\r");
+    session.wait_text(" Help ");
+    session.wait_text("Keybinding");
+    session.send(b"\x1b");
+    session.send(b",q");
+    session.finish(0);
+}

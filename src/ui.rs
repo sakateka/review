@@ -306,10 +306,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.preview_area = text_area;
         app.layout_preview(text_area.height as usize, text_area.width as usize);
         let preview = app.preview.as_ref().expect("preview exists");
-        let mut lines = preview.visible(app.top, app.left, app.viewport.0, app.viewport.1);
+        let visual_top = if app.wrap { app.visual_top() } else { app.top };
+        let rows: Vec<_> = (0..app.viewport.0)
+            .filter_map(|offset| {
+                if app.wrap {
+                    preview
+                        .visual_segment(visual_top + offset, app.viewport.1)
+                        .map(|(row, start, _)| (row, start))
+                } else {
+                    (app.top + offset < preview.lines.len()).then_some((app.top + offset, app.left))
+                }
+            })
+            .collect();
+        let mut lines: Vec<_> = rows
+            .iter()
+            .filter_map(|&(row, left)| {
+                preview
+                    .visible(row, left, 1, app.viewport.1)
+                    .into_iter()
+                    .next()
+            })
+            .collect();
         if let Some((first, last)) = app.selected_rows() {
             for (offset, line) in lines.iter_mut().enumerate() {
-                if (first..=last).contains(&(app.top + offset)) {
+                if (first..=last).contains(&rows[offset].0) {
                     if line.spans.is_empty() {
                         line.spans.push(Span::raw(" "));
                     }
@@ -339,7 +359,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             && content.width >= 2
         {
             for offset in 0..app.viewport.0 {
-                if let Some(Some(outdated)) = markers.get(app.top + offset) {
+                if let Some(Some(outdated)) =
+                    rows.get(offset).and_then(|(row, _)| markers.get(*row))
+                {
                     let style = if *outdated {
                         Style::default()
                             .fg(app.theme.comment_outdated)
@@ -362,14 +384,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             (app.cursor.0 + 1, app.cursor.1 + 1)
         };
-        let scroll = if total <= app.viewport.0 {
+        let visual_total = if app.wrap {
+            preview.visual_rows(app.viewport.1)
+        } else {
+            total
+        };
+        let scroll = if visual_total <= app.viewport.0 {
             "All".to_owned()
-        } else if app.top == 0 {
+        } else if visual_top == 0 {
             "Top".to_owned()
-        } else if app.top >= total.saturating_sub(app.viewport.0) {
+        } else if visual_top >= visual_total.saturating_sub(app.viewport.0) {
             "Bot".to_owned()
         } else {
-            format!("{}%", app.top * 100 / (total - app.viewport.0))
+            format!("{}%", visual_top * 100 / (visual_total - app.viewport.0))
         };
         frame.render_widget(
             Paragraph::new(format!("{total} lines  {row}:{column}  {scroll}"))
@@ -383,9 +410,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             && app.viewport.0 > 0
             && app.viewport.1 > 0
         {
+            let (row, column) = if app.wrap {
+                let (row, column) =
+                    preview.visual_position(app.cursor.0, app.cursor.1, app.viewport.1);
+                (row.saturating_sub(visual_top), column)
+            } else {
+                (
+                    app.cursor.0.saturating_sub(app.top),
+                    app.cursor.1.saturating_sub(app.left),
+                )
+            };
             frame.set_cursor_position((
-                app.preview_area.x + (app.cursor.1 - app.left) as u16,
-                app.preview_area.y + (app.cursor.0 - app.top) as u16,
+                app.preview_area.x + column as u16,
+                app.preview_area.y + row as u16,
             ));
         }
     }
@@ -672,7 +709,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_focused))
         .title(" Help ")
-        .title_bottom(" esc/q/? close ");
+        .title_bottom(" esc/q/? close · :set nowrap toggle wrap ");
     let inner = block.inner(area);
     app.layout_help(inner.height.saturating_sub(1) as usize, lines);
     let scroll = app.help.expect("help is open").scroll;

@@ -7689,6 +7689,7 @@ fn palette_entries_follow_the_registry_order() {
             .iter()
             .map(|name| format!("set appearance.colorscheme={name}")),
     );
+    expected.extend(["set wrap".into(), "set nowrap".into(), "help".into()]);
     assert_eq!(
         entries
             .iter()
@@ -7699,7 +7700,11 @@ fn palette_entries_follow_the_registry_order() {
     // Bare `set` only errors and is not listed.
     assert!(!entries.iter().any(|entry| entry.text == "set"));
     for entry in &entries {
-        let summary = if entry.text.starts_with("set ") {
+        let summary = if entry.text == "help" {
+            commands::COMMANDS[2].summary
+        } else if entry.text == "set wrap" || entry.text == "set nowrap" {
+            "change line wrapping for this session"
+        } else if entry.text.starts_with("set ") {
             commands::SETTINGS[0].summary
         } else {
             commands::COMMANDS[0].summary
@@ -10733,4 +10738,254 @@ fn definitions_popup_preserves_origin_and_handles_selection_mouse_resize_and_emp
     screen(&mut app, 2, 2);
     app.key(KeyCode::Esc);
     assert!(app.navigation.is_none());
+}
+
+#[test]
+fn line_wrap_maps_visual_rows_and_bindings() {
+    let p = preview::Preview::original("abc界de\u{301}fghij".as_bytes(), &theme::Theme::default());
+    assert_eq!(p.visual_segment(0, 4), Some((0, 0, 3)));
+    assert_eq!(p.visual_segment(1, 4), Some((0, 3, 7)));
+    assert_eq!(p.visual_position(0, 5, 4), (1, 2));
+    assert!(p.visual_rows(1) > 1);
+    assert!(p.visual_segment(0, 0).is_some());
+}
+
+#[test]
+fn line_wrap_draws_scrolls_and_mouse_targets_logical_cells() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("{}\n", "abcdefghij".repeat(40)),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    let row = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .lines
+        .iter()
+        .position(|l| l.to_string().contains("abcdefghij"))
+        .unwrap();
+    app.cursor = (row, 0);
+    screen(&mut app, 50, 12);
+    run_command(&mut app, "set nowrap");
+    screen(&mut app, 50, 12);
+    let width = app.viewport.1;
+    let visual = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .visual_position(row, 0, width)
+        .0;
+    let second = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .visual_segment(visual + 1, width)
+        .unwrap();
+    app.scroll_preview(1, 0);
+    let screen_row = visual + 1 - app.visual_top();
+    let point = mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        app.preview_area.x,
+        app.preview_area.y + screen_row as u16,
+    );
+    app.mouse(point, std::time::Instant::now());
+    assert_eq!(app.cursor, (row, second.1));
+    let cursor = app.cursor;
+    screen(&mut app, 38, 10);
+    assert_eq!(app.cursor, cursor);
+    run_command(&mut app, "set nowrap");
+    assert!(!app.wrap);
+    assert_eq!(app.cursor, cursor);
+}
+
+#[test]
+fn help_and_wrap_commands_follow_session_state() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    run_command(&mut app, "help");
+    assert!(app.help.is_some());
+    app.key(KeyCode::Esc);
+    app.key(KeyCode::Enter);
+    run_command(&mut app, "set nowrap");
+    assert!(app.wrap);
+    run_command(&mut app, "set nowrap");
+    assert!(!app.wrap);
+    run_command(&mut app, "set wrap");
+    assert!(app.wrap);
+}
+
+#[test]
+fn wrapped_search_and_definition_keep_logical_source_positions() {
+    let directory = fixture();
+    let source = format!(
+        "fn target() {{}}\nfn caller() {{ {}target(); target(); }}\n",
+        " ".repeat(80)
+    );
+    std::fs::write(directory.path().join("one.rs"), &source).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 60, 14);
+    run_command(&mut app, "set nowrap");
+    let preview = app.preview.as_ref().unwrap();
+    let row = preview
+        .lines
+        .iter()
+        .position(|line| line.to_string().contains("fn caller"))
+        .unwrap();
+    let text = preview.lines[row].to_string();
+    let first = text.find("target").unwrap();
+    let second = text.rfind("target").unwrap();
+    app.cursor = (row, first);
+    app.keep_cursor_visible();
+    screen(&mut app, 60, 14);
+    app.key(KeyCode::Char('*'));
+    assert_eq!(app.cursor, (row, second));
+    assert!(app.visual_top() > 0);
+    app.key(KeyCode::Char('g'));
+    app.key(KeyCode::Char('d'));
+    await_navigation(&mut app);
+    let nav = app.navigation.as_ref().expect("definition navigation");
+    assert!(
+        nav.candidates
+            .iter()
+            .any(|candidate| candidate.tag.name.as_ref() == "target")
+    );
+    app.key_event(crossterm::event::KeyEvent::new(
+        KeyCode::Char('o'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    assert_eq!(app.cursor, (row, second));
+    assert!(app.wrap);
+}
+
+#[test]
+fn wrapped_selection_and_comments_anchor_logical_lines() {
+    let directory = fixture();
+    std::fs::write(
+        directory.path().join("one.rs"),
+        format!("{}\n{}\n", "a".repeat(90), "b".repeat(90)),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 65, 15);
+    run_command(&mut app, "set nowrap");
+    let row = app
+        .preview
+        .as_ref()
+        .unwrap()
+        .locations
+        .iter()
+        .position(|location| *location == (None, Some(1)))
+        .unwrap();
+    app.cursor = (row, 60);
+    app.keep_cursor_visible();
+    screen(&mut app, 65, 15);
+    app.key(KeyCode::Char('v'));
+    app.key(KeyCode::Char('j'));
+    assert_eq!(app.selected_rows(), Some((row, row + 1)));
+    let rendered = screen(&mut app, 65, 15);
+    let preview = app.preview.as_ref().unwrap();
+    let mut selected_segments = 0;
+    for offset in 0..app.viewport.0 {
+        if let Some((logical, _, _)) =
+            preview.visual_segment(app.visual_top() + offset, app.viewport.1)
+            && (row..=row + 1).contains(&logical)
+        {
+            assert!(
+                rendered[(app.preview_area.x, app.preview_area.y + offset as u16)]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            selected_segments += 1;
+        }
+    }
+    assert!(selected_segments > 2);
+    app.key(KeyCode::Char('c'));
+    assert_eq!(app.editor.as_ref().unwrap().title, "one.rs:1-2 (new)");
+    type_text(&mut app, "wrapped selection");
+    app.key(KeyCode::Enter);
+    let saved = std::fs::read_to_string(directory.path().join("review-HEAD.comments")).unwrap();
+    assert!(saved.contains("## one.rs:1-2 (new)"), "{saved}");
+    assert!(saved.contains("wrapped selection"));
+    assert!(app.marks.iter().all(|marked| !marked));
+}
+
+#[test]
+fn wrap_boundaries_preserve_wide_and_combining_graphemes() {
+    let p = preview::Preview::original("ab界e\u{301}z\n".as_bytes(), &theme::Theme::default());
+    assert_eq!(p.visual_segment(0, 3), Some((0, 0, 2)));
+    assert_eq!(p.visual_segment(1, 3), Some((0, 2, 5)));
+    assert_eq!(p.visible(0, 2, 1, 3)[0].to_string(), "界e\u{301}");
+    assert_eq!(p.visual_position(0, 4, 3), (1, 2));
+    assert_eq!(p.visual_segment(2, 3), Some((0, 5, 6)));
+    assert_eq!(p.visual_segment(1, 1), Some((0, 1, 2)));
+    assert_eq!(p.visual_segment(2, 1), Some((0, 2, 4)));
+    assert_eq!(p.visible(0, 2, 1, 1)[0].to_string(), " ");
+    assert_eq!(p.visible_hit(0, 2, 2, 1), None);
+}
+
+#[test]
+fn wrap_index_tracks_projection_append_and_width_changes() {
+    let directory = fixture();
+    change(directory.path());
+    let capture = capture(directory.path(), &["HEAD"]);
+    let mut p = preview::Preview::item(
+        directory.path(),
+        &capture.items[0],
+        &theme::Theme::default(),
+    );
+    let ordinary = p.visual_rows(8);
+    p.toggle_after_changes(0, 0);
+    let projected = p.visual_rows(8);
+    assert!(projected < ordinary);
+    p.toggle_after_changes(0, 0);
+    assert_eq!(p.visual_rows(8), ordinary);
+    let extra = preview::Preview::original(b"abcdefghijklmnop\n", &theme::Theme::default());
+    p.append(extra);
+    assert_eq!(p.visual_rows(8), ordinary + 2);
+    assert_eq!(
+        p.visual_rows(16),
+        p.lines
+            .iter()
+            .map(|line| line.width().max(1).div_ceil(16))
+            .sum::<usize>()
+    );
+}
+
+#[test]
+fn wrapped_mouse_rejects_clipped_wide_grapheme() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.preview = Some(preview::Preview::original(
+        "界x".as_bytes(),
+        &theme::Theme::default(),
+    ));
+    app.wrap = true;
+    app.viewport = (1, 1);
+    app.preview_area = ratatui::layout::Rect::new(0, 0, 1, 1);
+    app.cursor = (0, 2);
+    assert_eq!(
+        app.preview.as_ref().unwrap().visible(0, 0, 1, 1)[0].to_string(),
+        " "
+    );
+    let click = mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0);
+    app.mouse(click, std::time::Instant::now());
+    assert_eq!(app.cursor, (0, 2));
+    app.viewport = (1, 2);
+    app.preview_area.width = 2;
+    app.mouse(click, std::time::Instant::now());
+    assert_eq!(app.cursor, (0, 0));
 }

@@ -54,6 +54,8 @@ Vim keymap (default):
 | `Tab` | Switch pane |
 | `m` | Toggle the file's reviewed mark |
 | `a` | Toggle between the diff and the new side only |
+| `:set nowrap` | Toggle soft line wrapping in previews for this session |
+| `:help` | Open in-app help |
 | `c` / `dc` | Add or edit / delete a comment on the line or the `v` selection |
 | `gd` / `gr` | Definition / references under the cursor |
 | `K` / `P` | Show the documentation / preview the definition |
@@ -68,7 +70,8 @@ Vim keymap (default):
 | `,q` | Quit from anywhere |
 
 Usual Vim motions work in diffs: `w b e`, `0 ^ $`, `gg G`, `Ctrl-U/D/B/F`,
-counts. The Emacs keymap uses `Ctrl-N/P/B/F`, `Alt-.`, `Alt-?`, `Alt-,` and
+counts. Use `:set wrap` to enable wrapping and `:set nowrap` to toggle it.
+The Emacs keymap uses `Ctrl-N/P/B/F`, `Alt-.`, `Alt-?`, `Alt-,` and
 `Alt-X` instead. Shortcuts keep working with a Russian, Ukrainian or
 Belarusian keyboard layout active, as with Vim's `langmap`.
 
