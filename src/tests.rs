@@ -7438,9 +7438,9 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
             assert!(text.contains("Show help"), "{text}");
             assert!(text.contains("Cursor down"), "{text}");
             assert!(!text.contains("show_help:"), "{text}");
-            let header = row_text(&rendered, 3);
+            let header = row_text(&rendered, 2);
             assert!(header.find("Keybinding") < header.find("Description"));
-            let first_entry = row_text(&rendered, 4);
+            let first_entry = row_text(&rendered, 3);
             assert!(first_entry.find('?') < first_entry.find("Show help"));
             assert!(
                 !app.key_event(dismiss),
@@ -7507,6 +7507,7 @@ fn help_search_accepts_quit_keys_and_escape_closes() {
         .unwrap();
         app.key(KeyCode::Char('H'));
         assert!(app.help.is_some());
+        app.key(KeyCode::Char('/'));
         assert!(!app.key(key));
         assert!(app.help.is_some());
         assert_eq!(app.help_query, key.to_string());
@@ -7562,8 +7563,7 @@ fn help_is_modal_and_restores_the_exact_review() {
     ] {
         assert!(!app.key(key));
     }
-    assert_eq!(app.help_query, "m:x");
-    app.key_event(ctrl('u'));
+    assert!(app.help_query.is_empty());
     let now = std::time::Instant::now();
     app.mouse(
         mouse_event(
@@ -7646,7 +7646,7 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
     assert_eq!(app.help.unwrap().viewport, 0);
     for height in [20, 40, 100] {
         screen(&mut app, 100, height);
-        assert_eq!(app.help.unwrap().viewport, (height as usize * 90 / 100) - 4);
+        assert_eq!(app.help.unwrap().viewport, (height as usize * 90 / 100) - 3);
     }
     screen(&mut app, 100, 12);
     assert_eq!(app.help.unwrap().viewport, viewport);
@@ -7675,12 +7675,17 @@ fn help_fuzzy_filters_highlights_matches_and_selects_results() {
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
     app.key(KeyCode::Char('?'));
+    let initial = screen(&mut app, 100, 24);
+    assert!(!row_text(&initial, 23).starts_with('/'));
+    app.key(KeyCode::Char('x'));
+    assert!(app.help_query.is_empty());
+    app.key(KeyCode::Char('/'));
     for c in "shwnts".chars() {
         app.key(KeyCode::Char(c));
     }
     let rendered = screen(&mut app, 100, 24);
     let text = screen_text(&rendered);
-    assert!(text.contains("Filter: shwnts"), "{text}");
+    assert!(row_text(&rendered, 23).starts_with("/shwnts"), "{text}");
     assert!(text.contains("Show notes"), "{text}");
     assert!(!text.contains("Toggle mark"), "{text}");
     let row = (0..rendered.area.height)
@@ -7693,6 +7698,15 @@ fn help_fuzzy_filters_highlights_matches_and_selects_results() {
     assert!(
         (0..rendered.area.width).any(|x| rendered[(x, row)].modifier.contains(Modifier::REVERSED))
     );
+    app.key(KeyCode::Enter);
+    assert!(!app.help.unwrap().searching);
+    assert!(!row_text(&screen(&mut app, 100, 24), 23).starts_with('/'));
+    assert!(
+        app.filtered_help()
+            .iter()
+            .any(|(action, _)| *action == keybindings::Action::ShowNotes)
+    );
+    app.key(KeyCode::Char('/'));
     app.key(KeyCode::Backspace);
     assert_eq!(app.help_query, "shwnt");
     app.key_event(ctrl('u'));

@@ -1244,9 +1244,9 @@ fn help_popup(ctx: &Ctx) {
             let (help_column, help_row) = locate(&session, " Help ");
             assert!(help_column > 0 && help_row > 0, "help was not centered");
             if index == 0 {
-                session.send(b"shwnts");
+                session.send(b"/shwnts");
                 session.wait_text("Show notes");
-                session.send(b"\x15");
+                session.send(b"\x15\r");
                 session.send(b"\x1b[F");
                 session.wait_text("Previous file diff");
                 for (rows, columns) in [(1, 1), (3, 8), (30, 140)] {
@@ -3403,4 +3403,35 @@ fn notes_open_with_alt_n_and_escape_returns_to_review() {
         read(&ctx.repo.join("review.notes")),
         "#caller.rs:1:1\nCheck this call\n"
     );
+}
+
+#[test]
+fn help_search_starts_with_slash_and_uses_bottom_terminal_row() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-help-search-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    let mut session = ctx.session(&["--", "HEAD"]);
+    session.wait_text("Files");
+    session.send(b"?");
+    session.wait_text(" Help ");
+    assert!(!session.lines()[29].starts_with('/'));
+    session.send(b"/shwnts");
+    session.wait_text("Show notes");
+    assert!(session.lines()[29].starts_with("/shwnts"));
+    session.send(b"\r");
+    assert!(!session.lines()[29].starts_with('/'));
+    session.send(b"\x1b");
+    session.wait_text("Files");
+    session.send(b",q");
+    session.finish(0);
 }

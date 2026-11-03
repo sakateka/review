@@ -869,36 +869,13 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_focused))
         .title(" Help ")
-        .title_bottom(" type to filter · ↑/↓ select · esc close ");
+        .title_bottom(" / search · ↑/↓ select · esc close ");
     let inner = block.inner(area);
-    app.layout_help(inner.height.saturating_sub(2) as usize, lines);
+    app.layout_help(inner.height.saturating_sub(1) as usize, lines);
     let help = app.help.expect("help is open");
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-    let prompt = format!("Filter: {}", app.help_query);
-    let skip = prompt
-        .width()
-        .saturating_sub((inner.width as usize).saturating_sub(1));
-    let shown: String = prompt
-        .graphemes(true)
-        .scan(0, |cells, grapheme| {
-            let start = *cells;
-            *cells += grapheme.width();
-            Some(if start >= skip { grapheme } else { "" })
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(shown.clone()),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-    frame.set_cursor_position((
-        inner.x + shown.width().min(inner.width.saturating_sub(1) as usize) as u16,
-        inner.y,
-    ));
-    if inner.height < 2 {
         return;
     }
     let key_width = entries
@@ -929,7 +906,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             ])
             .style(style)
         });
-    let table_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
+    let table_area = inner;
     frame.render_widget(
         Table::new(rows, [Constraint::Length(key_width), Constraint::Min(0)])
             .header(
@@ -944,6 +921,27 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
             Paragraph::new("No matches").style(Style::default().fg(app.theme.metrics)),
             Rect::new(table_area.x, table_area.y + 1, table_area.width, 1),
         );
+    }
+    if help.searching && screen.height > 0 && screen.width > 0 {
+        let prompt = format!("/{}", app.help_query);
+        let skip = prompt
+            .width()
+            .saturating_sub((screen.width as usize).saturating_sub(1));
+        let shown: String = prompt
+            .graphemes(true)
+            .scan(0, |cells, grapheme| {
+                let start = *cells;
+                *cells += grapheme.width();
+                Some(if start >= skip { grapheme } else { "" })
+            })
+            .collect();
+        let prompt_area = Rect::new(screen.x, screen.y + screen.height - 1, screen.width, 1);
+        frame.render_widget(Clear, prompt_area);
+        frame.render_widget(Paragraph::new(shown.clone()), prompt_area);
+        frame.set_cursor_position((
+            screen.x + shown.width().min(screen.width.saturating_sub(1) as usize) as u16,
+            prompt_area.y,
+        ));
     }
 }
 

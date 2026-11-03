@@ -25,6 +25,7 @@ pub struct Help {
     pub scroll: usize,
     pub viewport: usize,
     pub selected: usize,
+    pub searching: bool,
 }
 
 pub struct NotesPopup {
@@ -1020,21 +1021,44 @@ impl App {
             self.bindings.clear();
             return false;
         }
-        // Keep the default global quit sequence available while the filter is empty.
-        if self.help_query.is_empty() && (self.bindings.pending() || key.code == KeyCode::Char(','))
-        {
-            let held = self.bindings.pending_keys().to_vec();
-            match self.bindings.resolve_quit(key) {
-                Resolution::Action(Action::Quit) => return true,
-                Resolution::Pending => return false,
-                _ => {
-                    for held_key in held {
-                        if let KeyCode::Char(c) = held_key.code {
-                            self.help_query.push(c);
-                        }
-                    }
-                }
+        if !self.help.is_some_and(|help| help.searching) {
+            if key.code == KeyCode::Home {
+                self.scroll_help(isize::MIN);
+                return false;
             }
+            if key.code == KeyCode::End {
+                self.scroll_help(isize::MAX);
+                return false;
+            }
+            if key.code == KeyCode::Char('/')
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                self.bindings.clear();
+                self.help.as_mut().expect("help is open").searching = true;
+                return false;
+            }
+            let action = match self.bindings.resolve(key, false) {
+                Resolution::Action(action) => action,
+                _ => return false,
+            };
+            match action {
+                Action::Quit => return true,
+                Action::ShowHelp | Action::CloseOrQuit | Action::CloseDiffView => self.help = None,
+                Action::CursorDown => self.scroll_help(1),
+                Action::CursorUp => self.scroll_help(-1),
+                Action::PageDown | Action::HalfPageDown => {
+                    self.scroll_help(self.help.map_or(1, |h| h.viewport.max(1)) as isize)
+                }
+                Action::PageUp | Action::HalfPageUp => {
+                    self.scroll_help(-(self.help.map_or(1, |h| h.viewport.max(1)) as isize))
+                }
+                Action::FirstLine => self.scroll_help(isize::MIN),
+                Action::LastLine => self.scroll_help(isize::MAX),
+                _ => {}
+            }
+            return false;
         }
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let modified = key
@@ -1042,6 +1066,7 @@ impl App {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         let mut changed = false;
         match key.code {
+            KeyCode::Enter => self.help.as_mut().expect("help is open").searching = false,
             KeyCode::Up => self.scroll_help(-1),
             KeyCode::Down => self.scroll_help(1),
             KeyCode::PageUp => {
