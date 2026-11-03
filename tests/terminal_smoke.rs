@@ -2177,14 +2177,15 @@ fn file_statistics(ctx: &Ctx) {
         "{}",
         session.text()
     );
-    // An open diff hides per-file statistics and the totals line.
+    // An open diff hides per-file statistics but retains the totals line.
     session.send(b"\r");
     session.wait_text("+extra");
     let end = Instant::now() + Duration::from_secs(10);
-    while session.text().contains("3 ++-") || session.text().contains('Σ') {
+    while session.text().contains("3 ++-") {
         session.pump(0.1);
         assert!(Instant::now() < end, "{}", session.text());
     }
+    session.wait_text("Σ +2 −1 · 1 binary");
     session.send(b"\x1b");
     session.wait_text("Σ +2 −1 · 1 binary");
     session.wait_text("3 ++-");

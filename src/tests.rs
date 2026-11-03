@@ -6004,7 +6004,7 @@ fn file_statistics_rows_keep_names_styles_marks_and_resize_safe() {
     app.key(KeyCode::Char('m'));
     app.key(KeyCode::Enter);
     let text = screen_text(&screen(&mut app, 100, 24));
-    assert!(!text.contains("2 +-") && !text.contains('Σ'), "{text}");
+    assert!(!text.contains("2 +-") && text.contains("Σ +2 −2"), "{text}");
     app.key(KeyCode::Esc);
     assert!(screen_text(&screen(&mut app, 100, 24)).contains("2 +-"));
     app.key(KeyCode::Down);
@@ -9010,7 +9010,7 @@ fn file_list_totals_count_binary_and_unavailable_items() {
 }
 
 #[test]
-fn open_diff_hides_statistics_and_totals_until_closed() {
+fn open_diff_hides_per_file_statistics_but_keeps_totals() {
     let directory = fixture();
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
@@ -9021,7 +9021,7 @@ fn open_diff_hides_statistics_and_totals_until_closed() {
     assert!(app.preview.is_some());
     let rendered = screen(&mut app, 100, 24);
     let text = screen_text(&rendered);
-    assert!(!text.contains('Σ'), "{text}");
+    assert!(text.contains("Σ +2 −2"), "{text}");
     // Rows hold only the mark and the name; the list keeps the full height.
     let files: String = (1..29).map(|x| rendered[(x, 2)].symbol()).collect();
     assert!(files.trim_end().ends_with("- two.rs"), "{files}");
@@ -9055,8 +9055,8 @@ fn file_list_height_is_constant_and_double_click_opens_the_bottom_row_with_a_dif
     let rendered = screen(&mut app, 100, 13);
     assert!(app.preview.is_some());
     assert_eq!(rows(&app), closed);
-    // The reserved row stays blank while the diff is open.
-    assert!(!row_text(&rendered, app.file_area.y + 8).contains('Σ'));
+    // The reserved row keeps the whole-comparison totals visible.
+    assert!(row_text(&rendered, app.file_area.y + 8).contains('Σ'));
     // Double-clicking the bottom visible file row selects and opens it.
     let bottom = app.file_area.y + app.file_area.height - 1;
     let click = mouse_event(

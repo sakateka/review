@@ -227,7 +227,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         })
         .split(areas[0]);
     if !original {
-        // Statistics and the totals line appear only while no diff is open.
+        // Per-file statistics appear only while no preview is open.
         let show_stats = app.preview.is_none();
         let items: Vec<_> = app
             .capture
@@ -266,16 +266,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(block, panels[0]);
         // The bottom inner row is reserved for the totals line whether or not
         // a diff is open, so the list height (and hit-testing) never changes
-        // on open/close; the row stays blank while a diff is open.
+        // on open/close.
         let mut list_area = inner;
         if !app.capture.items.is_empty() && inner.height >= 2 {
             list_area.height -= 1;
-            if show_stats {
-                frame.render_widget(
-                    Paragraph::new(totals_line(&app.capture.items, &app.theme)),
-                    Rect::new(inner.x, inner.y + list_area.height, inner.width, 1),
-                );
-            }
+            frame.render_widget(
+                Paragraph::new(totals_line(&app.capture.items, &app.theme)),
+                Rect::new(inner.x, inner.y + list_area.height, inner.width, 1),
+            );
         }
         let files = List::new(items)
             .highlight_style(app.theme.selection)
