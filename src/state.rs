@@ -32,6 +32,22 @@ pub fn digest(parts: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
 #[derive(Debug)]
 pub struct Store {
     pub path: PathBuf,
+    positions_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Position {
+    pub row: usize,
+    pub column: usize,
+    pub top: usize,
+    pub left: usize,
+    pub after_changes: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Positions {
+    pub last: Option<String>,
+    pub files: BTreeMap<String, Position>,
 }
 
 impl Store {
@@ -52,7 +68,7 @@ impl Store {
         Ok(Self::at(&base, cwd, args))
     }
 
-    pub fn at(base: &Path, cwd: &Path, _args: &[OsString]) -> Self {
+    pub fn at(base: &Path, cwd: &Path, args: &[OsString]) -> Self {
         // The per-worktree Git directory distinguishes linked worktrees and
         // ignores invocation arguments, current refs and the caller's subdir.
         let git_path = |option: &str| {
@@ -84,9 +100,42 @@ impl Store {
                 .as_encoded_bytes(),
             root.as_os_str().as_encoded_bytes(),
         ]);
+        let comparison = digest(
+            std::iter::once(key.as_bytes())
+                .chain(args.iter().map(|arg| arg.as_os_str().as_encoded_bytes())),
+        );
         Self {
             path: base.join("review").join(format!("{key}.json")),
+            positions_path: base
+                .join("review")
+                .join("positions")
+                .join(format!("{comparison}.json")),
         }
+    }
+
+    pub fn load_positions(&self) -> Result<Positions> {
+        match std::fs::read(&self.positions_path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).context("cannot read saved cursor positions")
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Positions::default()),
+            Err(error) => Err(error).context("cannot read saved cursor positions"),
+        }
+    }
+
+    pub fn save_positions(&self, positions: &Positions) -> Result<()> {
+        let directory = self
+            .positions_path
+            .parent()
+            .context("position path has no parent")?;
+        std::fs::create_dir_all(directory).context("cannot create position directory")?;
+        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+        serde_json::to_writer(&mut temporary, positions)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&self.positions_path)
+            .context("cannot save cursor positions")?;
+        Ok(())
     }
 
     fn records(&self) -> Result<Saved> {

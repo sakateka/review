@@ -88,8 +88,9 @@ printed notice. Explicit unmarking applies across arguments too. Older state
 files are left untouched and their marks are not imported.
 
 Cycling with next/previous file remembers each diff's cursor, vertical and
-horizontal scroll, and after-changes mode for the current process. Positions
-are clamped to the viewport when resized and are not saved across restarts.
+horizontal scroll, and after-changes mode. On exit these positions are saved
+for the current comparison, and the last file reopens on restart if its diff
+has not changed. Positions are clamped to the viewport when resized.
 
 review never writes to the repository, the index, refs or Git configuration.
 

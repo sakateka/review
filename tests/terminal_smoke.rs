@@ -172,6 +172,12 @@ impl Ctx {
     }
 
     fn session_in(&self, cwd: &Path, args: &[&str]) -> Session {
+        // Existing scenarios start with a fresh cursor while sharing review marks.
+        let _ = std::fs::remove_dir_all(self.state.join("review/positions"));
+        self.resume_session_in(cwd, args)
+    }
+
+    fn resume_session_in(&self, cwd: &Path, args: &[&str]) -> Session {
         Session::new(&self.binary, args, cwd, &self.env, None, false)
     }
 
@@ -194,7 +200,9 @@ impl Ctx {
 }
 
 fn without_telemetry(mut files: Snapshot) -> Snapshot {
-    files.retain(|path, _| !path.starts_with("review/telemetry.jsonl"));
+    files.retain(|path, _| {
+        !path.starts_with("review/telemetry.jsonl") && !path.starts_with("review/positions/")
+    });
     files
 }
 
@@ -2636,6 +2644,7 @@ fn comments(ctx: &Ctx) {
     // A kitty-protocol terminal gets disambiguated keys: Ctrl+Enter and
     // Shift+Enter insert newlines, CSI-u Escape still closes, and the flags
     // are popped on exit.
+    let _ = std::fs::remove_dir_all(ctx.state.join("review/positions"));
     let mut session = Session::new(
         &ctx.binary,
         &["--", "HEAD"],
@@ -2884,6 +2893,7 @@ fn local_telemetry(ctx: &Ctx) {
     let repo_before = snapshot(&repo);
 
     let session_in = |state: &Path, words: &[&str]| {
+        let _ = std::fs::remove_dir_all(state.join("review/positions"));
         let mut env = ctx.env.clone();
         for (key, value) in &mut env.vars {
             if key == "XDG_STATE_HOME" {
@@ -3249,4 +3259,47 @@ fn line_wrap(ctx: &Ctx) {
     session.send(b"\x1b");
     session.send(b",q");
     session.finish(0);
+}
+
+#[test]
+fn cursor_reopens_last_diff_after_restart() {
+    let directory = tempfile::Builder::new()
+        .prefix("review-cursor-pty-")
+        .tempdir()
+        .unwrap();
+    let binary = std::env::var_os("REVIEW_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_review")));
+    let ctx = setup(
+        std::fs::canonicalize(binary).unwrap(),
+        None,
+        which("git"),
+        directory.path().to_owned(),
+    );
+    let repo = ctx.root.join("cursor-restart");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| ctx.git_in(&repo, args);
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Cursor test"]);
+    git(&["config", "user.email", "cursor@example.invalid"]);
+    write(&repo.join("long.txt"), "before\n");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "initial"]);
+    write(
+        &repo.join("long.txt"),
+        (0..60)
+            .map(|n| format!("line {n:02} {}\n", "x".repeat(100)))
+            .collect::<String>(),
+    );
+    let mut first = ctx.resume_session_in(&repo, &["--", "HEAD"]);
+    first.wait_text("Files");
+    first.send(b"\r10j5l");
+    let position = cursor(&first);
+    first.send(b",q");
+    first.finish(0);
+    let mut second = ctx.resume_session_in(&repo, &["--", "HEAD"]);
+    second.wait_text("Diff");
+    assert_eq!(cursor(&second), position, "{}", second.text());
+    second.send(b",q");
+    second.finish(0);
 }

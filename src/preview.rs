@@ -772,6 +772,10 @@ impl Preview {
 
     /// Project only classified hunk removals from this captured rendering.
     /// Returns the corresponding cursor and viewport rows without loading Git/source.
+    pub fn after_changes(&self) -> bool {
+        self.ordinary.is_some()
+    }
+
     pub fn toggle_after_changes(&mut self, cursor: usize, top: usize) -> (usize, usize) {
         self.wrap_index.get_mut().take();
         let search = self.search.clone();

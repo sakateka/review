@@ -54,6 +54,9 @@ pub struct App {
     pub cursor: (usize, usize),
     history: Vec<View>,
     diff_views: std::collections::BTreeMap<usize, DiffView>,
+    positions: crate::state::Positions,
+    initial_positions: crate::state::Positions,
+    positions_error: bool,
     pub file_area: Rect,
     pub preview_area: Rect,
     pub popup_area: Rect,
@@ -123,6 +126,10 @@ impl App {
                 true,
             ),
         };
+        let (positions, positions_error) = match store.load_positions() {
+            Ok(positions) => (positions, false),
+            Err(_) => (crate::state::Positions::default(), true),
+        };
         let (comments, loaded) = crate::comments::Store::load(&capture);
         let mut status = status;
         if let Some(loaded) = loaded {
@@ -145,7 +152,7 @@ impl App {
             Preview::original(&output, &theme)
         });
         let worker = Worker::start(capture.catalog.clone());
-        Self {
+        let mut app = Self {
             worker,
             generation: 0,
             pending: None,
@@ -175,6 +182,9 @@ impl App {
             timed_navigation: None,
             history: Vec::new(),
             diff_views: std::collections::BTreeMap::new(),
+            initial_positions: positions.clone(),
+            positions,
+            positions_error,
             capture,
             store,
             marks,
@@ -192,7 +202,48 @@ impl App {
             viewport: (0, 0),
             status,
             state_error,
+        };
+        if !original
+            && let Some(last) = app.positions.last.as_ref()
+            && let Some(index) = app
+                .capture
+                .items
+                .iter()
+                .position(|item| item.patch_identity() == *last)
+        {
+            app.selected = index;
+            app.open_diff();
         }
+        app
+    }
+
+    fn remember_position(&mut self) {
+        if !self.file_diff_open() {
+            return;
+        }
+        if let (Some(item), Some(preview)) = (self.capture.items.get(self.selected), &self.preview)
+        {
+            let key = item.patch_identity();
+            self.positions.files.insert(
+                key.clone(),
+                crate::state::Position {
+                    row: self.cursor.0,
+                    column: self.cursor.1,
+                    top: self.top,
+                    left: self.left,
+                    after_changes: preview.after_changes(),
+                },
+            );
+            self.positions.last = Some(key);
+        }
+    }
+
+    pub fn save_positions(&mut self) -> anyhow::Result<()> {
+        self.remember_position();
+        if self.positions.last.is_some() && !self.positions_error {
+            self.store.save_positions(&self.positions)?;
+        }
+        Ok(())
     }
 
     pub fn set_line_wrap(&mut self, wrap: bool) {
@@ -1066,7 +1117,16 @@ impl App {
             self.cursor = (0, 0);
             self.navigation = None;
             self.selection = None;
+            let key = item.patch_identity();
+            let saved = self.initial_positions.files.get(&key).cloned();
+            self.positions.last = Some(key);
             let mut preview = Preview::item(&self.capture.cwd, item, &self.theme);
+            if saved
+                .as_ref()
+                .is_some_and(|position| position.after_changes)
+            {
+                preview.toggle_after_changes(0, 0);
+            }
             if !self.capture.stderr.is_empty() {
                 let mut warning = b"\nGit stderr:\n".to_vec();
                 warning.extend_from_slice(&self.capture.stderr);
@@ -1078,6 +1138,11 @@ impl App {
             self.top = 0;
             self.top_segment = 0;
             self.left = 0;
+            if let Some(position) = saved {
+                self.cursor = (position.row, position.column);
+                self.top = position.top;
+                self.left = position.left;
+            }
         } else if self.capture.unavailable.is_some() {
             self.status = "File actions are unavailable in original-output mode".into();
         }
@@ -1128,6 +1193,7 @@ impl App {
     }
 
     fn close_preview(&mut self) {
+        self.remember_position();
         self.selection = None;
         self.abandon_navigation();
         self.preview = None;
@@ -1141,6 +1207,7 @@ impl App {
     }
 
     fn select(&mut self, direction: isize) {
+        self.remember_position();
         self.selection = None;
         self.abandon_navigation();
         self.selected = self
@@ -1194,6 +1261,7 @@ impl App {
             self.status = "Only one file".into();
             return;
         }
+        self.remember_position();
         let selected = self.selected.min(len - 1);
         let (next, wrapped) = if forward {
             ((selected + 1) % len, selected + 1 == len)
@@ -1236,6 +1304,7 @@ impl App {
     }
 
     fn save_view(&mut self) {
+        self.remember_position();
         self.selection = None;
         if self.history.len() == 64 {
             self.history.remove(0);

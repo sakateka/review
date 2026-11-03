@@ -172,6 +172,9 @@ fn run() -> Result<i32> {
         keymap,
     });
     ui::run(&mut app)?;
+    if let Err(error) = app.save_positions() {
+        eprintln!("review: cannot save cursor position: {error:#}");
+    }
     Ok(app.capture.status.code().unwrap_or(1))
 }
 

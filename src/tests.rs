@@ -11110,3 +11110,49 @@ fn embedded_highlighting_preserves_captured_views_and_restyles() {
         }
     }
 }
+
+#[test]
+fn cursor_positions_survive_restart_and_ignore_changed_patches() {
+    let directory = fixture();
+    let state = tempfile::tempdir().unwrap();
+    let content = (0..100)
+        .map(|i| format!("line {i} {}\n", "x".repeat(160)))
+        .collect::<String>();
+    std::fs::write(directory.path().join("one.rs"), &content).unwrap();
+    std::fs::write(directory.path().join("two.rs"), &content).unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    screen(&mut app, 80, 20);
+    app.cursor = (55, 100);
+    app.keep_cursor_visible();
+    let first = (app.cursor, app.top, app.left);
+    app.key_event(ctrl('j'));
+    app.key(KeyCode::Char('a'));
+    screen(&mut app, 80, 20);
+    app.cursor = (32, 90);
+    app.keep_cursor_visible();
+    let second = (app.cursor, app.top, app.left);
+    app.save_positions().unwrap();
+
+    let mut fresh = application(directory.path(), state.path());
+    assert_eq!(fresh.selected, 1);
+    assert!(fresh.preview.as_ref().unwrap().after_changes());
+    screen(&mut fresh, 80, 20);
+    assert_eq!((fresh.cursor, fresh.top, fresh.left), second);
+    fresh.key_event(ctrl('k'));
+    screen(&mut fresh, 80, 20);
+    assert_eq!((fresh.cursor, fresh.top, fresh.left), first);
+    assert_eq!(fresh.marks, [false, false]);
+    fresh.key_event(ctrl('j'));
+    fresh.save_positions().unwrap();
+    std::fs::write(
+        directory.path().join("two.rs"),
+        format!("{content}changed\n"),
+    )
+    .unwrap();
+    let fresh = application(directory.path(), state.path());
+    assert!(
+        fresh.preview.is_none(),
+        "changed patch must not reopen stale position"
+    );
+}
