@@ -7441,9 +7441,9 @@ fn help_defaults_both_keymaps_overrides_and_layout_translation() {
             assert!(text.contains("Show help"), "{text}");
             assert!(text.contains("Cursor down"), "{text}");
             assert!(!text.contains("show_help:"), "{text}");
-            let header = row_text(&rendered, 3);
+            let header = row_text(&rendered, 2);
             assert!(header.find("Keybinding") < header.find("Description"));
-            let first_entry = row_text(&rendered, 4);
+            let first_entry = row_text(&rendered, 3);
             assert!(first_entry.find('?') < first_entry.find("Show help"));
             assert!(
                 !app.key_event(dismiss),
@@ -7643,6 +7643,10 @@ fn help_scrolls_to_effective_content_and_survives_tiny_frames() {
         screen(&mut app, size.0, size.1);
     }
     assert_eq!(app.help.unwrap().viewport, 0);
+    for height in [20, 40, 100] {
+        screen(&mut app, 100, height);
+        assert_eq!(app.help.unwrap().viewport, (height as usize * 90 / 100) - 3);
+    }
     screen(&mut app, 100, 12);
     assert_eq!(app.help.unwrap().viewport, viewport);
     app.key(KeyCode::Char('?'));

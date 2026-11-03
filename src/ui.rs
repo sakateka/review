@@ -657,7 +657,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     let entries = app.bindings.help_entries();
     let lines = entries.len();
     let width = screen.width.saturating_sub(4).min(90);
-    let height = screen.height.saturating_sub(4).min(24);
+    let height = (u32::from(screen.height) * 90 / 100) as u16;
     if width < 3 || height < 3 {
         app.layout_help(0, lines);
         return;
