@@ -8513,26 +8513,29 @@ mod review_comments {
         assert_ne!(opened[(27, 2)].symbol(), "💬");
         app.key(KeyCode::Esc);
         let closed = screen(&mut app, 100, 24);
-        assert_eq!(closed[(97, 1)].symbol(), "💬");
+        let icon = icon_x(&closed, 1, "💬").unwrap();
+        assert!(icon < 95);
         assert!(row_text(&closed, 1).contains("2 +-"));
         assert!(row_text(&closed, 2).contains("2 +-"));
-        assert_ne!(closed[(97, 2)].symbol(), "💬");
+        assert!(icon_x(&closed, 2, "💬").is_none());
 
         let mut restarted = application(directory.path(), state.path());
-        assert_eq!(screen(&mut restarted, 100, 24)[(97, 1)].symbol(), "💬");
+        assert!(icon_x(&screen(&mut restarted, 100, 24), 1, "💬").is_some());
         restarted.comments.comments[0].outdated = true;
         let outdated = screen(&mut restarted, 100, 24);
-        assert_eq!(outdated[(97, 1)].fg, restarted.theme.comment_outdated);
-        assert!(outdated[(97, 1)].modifier.contains(Modifier::DIM));
+        let icon = icon_x(&outdated, 1, "💬").unwrap();
+        assert_eq!(outdated[(icon, 1)].fg, restarted.theme.comment_outdated);
+        assert!(outdated[(icon, 1)].modifier.contains(Modifier::DIM));
         let mut current = restarted.comments.comments[0].clone();
         current.outdated = false;
         restarted.comments.comments.push(current);
+        let mixed = screen(&mut restarted, 100, 24);
         assert_eq!(
-            screen(&mut restarted, 100, 24)[(97, 1)].fg,
+            mixed[(icon_x(&mixed, 1, "💬").unwrap(), 1)].fg,
             restarted.theme.comment
         );
         restarted.comments.comments.clear();
-        assert_ne!(screen(&mut restarted, 100, 24)[(97, 1)].symbol(), "💬");
+        assert!(icon_x(&screen(&mut restarted, 100, 24), 1, "💬").is_none());
         for width in 0..20 {
             screen(&mut app, width, 8);
         }
@@ -9148,6 +9151,10 @@ fn row_text(buffer: &ratatui::buffer::Buffer, row: u16) -> String {
         .collect()
 }
 
+fn icon_x(buffer: &ratatui::buffer::Buffer, row: u16, icon: &str) -> Option<u16> {
+    (0..buffer.area.width).find(|x| buffer[(*x, row)].symbol() == icon)
+}
+
 #[test]
 fn file_list_totals_sum_text_statistics_in_the_bottom_row() {
     let directory = fixture();
@@ -9181,8 +9188,8 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
     let list = screen(&mut app, 100, 24);
-    assert_eq!(list[(97, 1)].symbol(), "📝");
-    assert_eq!(list[(97, 2)].symbol(), "📝");
+    assert!(icon_x(&list, 1, "📝").is_some());
+    assert!(icon_x(&list, 2, "📝").is_some());
     assert!(row_text(&list, 1).contains("2 +-"));
     app.key_event(alt('n'));
     let popup = screen_text(&screen(&mut app, 100, 24));
@@ -9204,6 +9211,10 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
     for _ in 0..7 {
         app.key(KeyCode::Char('j'));
     }
+    let focused = screen(&mut app, 100, 24);
+    assert!(focused[(97, 8)].modifier.contains(Modifier::REVERSED));
+    assert!(focused[(32, 8)].modifier.contains(Modifier::REVERSED));
+    assert!(!focused[(97, 9)].modifier.contains(Modifier::REVERSED));
     app.key_event(alt('n'));
     let popup = screen_text(&screen(&mut app, 100, 24));
     assert!(popup.contains("First note") && popup.contains("Second note"));
@@ -9219,11 +9230,18 @@ fn notes_show_in_files_and_new_diff_lines_and_open_by_location() {
     assert_eq!(both[(27, 1)].symbol(), "💬");
     assert_eq!(both[(95, 8)].symbol(), "📝");
     assert_eq!(both[(97, 8)].symbol(), "💬");
+    assert_eq!(both[(97, 9)].symbol(), "📝");
     app.key(KeyCode::Esc);
     let both = screen(&mut app, 100, 24);
-    assert_eq!(both[(95, 1)].symbol(), "📝");
-    assert_eq!(both[(97, 1)].symbol(), "💬");
+    let note_x = icon_x(&both, 1, "📝").unwrap();
+    let comment_x = icon_x(&both, 1, "💬").unwrap();
+    assert_eq!(note_x + 2, comment_x);
+    assert!(comment_x < 95);
     assert!(row_text(&both, 1).contains("2 +-"));
+    app.comments.comments.clear();
+    let only_note = screen(&mut app, 100, 24);
+    assert_eq!(icon_x(&only_note, 1, "📝"), Some(comment_x));
+    assert!(icon_x(&only_note, 1, "💬").is_none());
     assert!(
         std::fs::read_to_string(directory.path().join("review.notes"))
             .unwrap()
@@ -9253,7 +9271,7 @@ fn notes_load_from_root_when_review_runs_in_subdirectory() {
         );
         assert_eq!(app.notes.entries.len(), 1);
         assert!(app.status.contains("invalid"));
-        assert_eq!(screen(&mut app, 100, 24)[(97, 1)].symbol(), "📝");
+        assert!(icon_x(&screen(&mut app, 100, 24), 1, "📝").is_some());
         app.key_event(alt('n'));
         assert!(screen_text(&screen(&mut app, 100, 24)).contains("root note"));
     }
@@ -9297,6 +9315,41 @@ fn notes_popup_scrolls_wrapped_text_and_escape_is_modal() {
     app.key(KeyCode::Esc);
     assert!(app.notes_popup.is_none());
     assert!(app.preview.is_none());
+}
+
+#[test]
+fn file_markers_keep_space_when_names_are_long_and_diff_opens() {
+    let directory = fixture();
+    let name = "a_very_long_file_name_that_needs_to_be_shortened.rs";
+    std::fs::write(directory.path().join(name), "old\n").unwrap();
+    git_run(directory.path(), &["add", name]);
+    git_run(directory.path(), &["commit", "-qm", "long name"]);
+    std::fs::write(directory.path().join(name), "new\n").unwrap();
+    std::fs::write(
+        directory.path().join("review.notes"),
+        format!("#{name}:1:1\nNote\n"),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('c'));
+    app.key(KeyCode::Char('x'));
+    app.key(KeyCode::Enter);
+    let opened = screen(&mut app, 70, 24);
+    assert_eq!(
+        icon_x(&opened, 1, "📝").unwrap() + 2,
+        icon_x(&opened, 1, "💬").unwrap()
+    );
+    assert!(row_text(&opened, 1).contains('…'));
+    app.key(KeyCode::Esc);
+    let closed = screen(&mut app, 32, 24);
+    let row = row_text(&closed, 1);
+    assert!(
+        row.contains('…') && row.contains("2 +-") && row.contains("📝") && row.contains("💬"),
+        "{row}"
+    );
+    assert!(icon_x(&closed, 1, "💬").unwrap() < 28);
 }
 
 #[test]

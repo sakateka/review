@@ -2507,7 +2507,10 @@ fn comments(ctx: &Ctx) {
             .iter()
             .enumerate()
             .filter_map(|(row, line)| {
-                char_index(line, "💬").map(|col| (row, session.color(row, col)))
+                line.rfind("💬")
+                    .map(|byte| line[..byte].chars().count())
+                    .filter(|&col| col >= session.columns as usize * 3 / 10)
+                    .map(|col| (row, session.color(row, col)))
             })
             .collect()
     };

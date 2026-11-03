@@ -126,6 +126,7 @@ read-only in review. 📝 marks files and new-side diff lines with notes; it
 appears to the left of 💬 when both are present. Press `Alt-N` to show all
 notes for the selected file, or the notes on the current diff line. Scroll
 with arrows, Page Up/Down or the mouse wheel; `Esc` closes the window.
+The note marker and diff line under the cursor are highlighted together.
 Run `review --help notes` for the notes format and controls.
 
 ## Code navigation

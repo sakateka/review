@@ -77,10 +77,9 @@ fn file_row(
         Statistics::Binary => "binary".into(),
         Statistics::Unavailable => "unavailable".into(),
     };
-    // Names retain at least twelve cells (or the entire tiny pane). Statistics
-    // yield first; the graph is optional and bounded to twelve cells.
+    // Preserve the label and markers first; long names and graphs yield space.
     let name_minimum = name.width().min(12);
-    let show_stats = show_stats && available >= name_minimum + 2 + label.width();
+    let show_stats = show_stats && available >= usize::from(!name.is_empty()) + 2 + label.width();
     let graph_width = if show_stats {
         available
             .saturating_sub(name_minimum + 3 + label.width())
@@ -152,8 +151,20 @@ fn file_row(
             }),
         ),
     ];
+    spans.push(Span::raw(" ".repeat(padding)));
+    if icon_width > 0 {
+        if icon_width > icon_cells {
+            spans.push(Span::raw(" "));
+        }
+        if show_note {
+            spans.push(Span::styled("📝", Style::default().fg(theme.comment)));
+        }
+        if show_comment {
+            spans.push(Span::styled("💬", comment_style(comment.unwrap(), theme)));
+        }
+    }
     if show_stats {
-        spans.push(Span::raw(format!("{}  {label}", " ".repeat(padding))));
+        spans.push(Span::raw(format!("  {label}")));
         if plus + minus > 0 {
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
@@ -164,20 +175,6 @@ fn file_row(
                 "-".repeat(minus),
                 Style::default().fg(theme.stat_minus),
             ));
-        }
-    }
-    if icon_width > 0 {
-        if !show_stats {
-            spans.push(Span::raw(" ".repeat(padding)));
-        }
-        if icon_width > icon_cells {
-            spans.push(Span::raw(" "));
-        }
-        if show_note {
-            spans.push(Span::styled("📝", Style::default().fg(theme.comment)));
-        }
-        if show_comment {
-            spans.push(Span::styled("💬", comment_style(comment.unwrap(), theme)));
         }
     }
     Line::from(spans)
@@ -402,6 +399,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
             }
         }
+        let cursor_visual = if app.wrap {
+            preview
+                .visual_position(app.cursor.0, app.cursor.1, app.viewport.1)
+                .0
+        } else {
+            app.cursor.0
+        };
+        let cursor_note = |offset: usize| {
+            app.focus == Focus::Preview
+                && rows.get(offset).is_some_and(|(row, _)| {
+                    *row == app.cursor.0
+                        && notes
+                            .as_ref()
+                            .and_then(|notes| notes.get(*row))
+                            .copied()
+                            .unwrap_or(false)
+                })
+                && if app.wrap {
+                    visual_top + offset == cursor_visual
+                } else {
+                    true
+                }
+        };
+        for (offset, line) in lines.iter_mut().enumerate() {
+            if cursor_note(offset) {
+                for span in &mut line.spans {
+                    span.style = span.style.patch(app.theme.selection);
+                }
+            }
+        }
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
@@ -444,11 +471,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .copied()
                     .unwrap_or(false)
                 {
+                    let has_comment = rows
+                        .get(offset)
+                        .and_then(|(row, _)| markers.as_ref().and_then(|markers| markers.get(*row)))
+                        .is_some_and(Option::is_some);
+                    let right = if has_comment { 4 } else { 2 };
                     frame.buffer_mut().set_string(
-                        content.x + content.width - marker_width,
+                        content.x + content.width - right,
                         content.y + offset as u16,
                         "📝",
-                        Style::default().fg(app.theme.comment),
+                        if cursor_note(offset) {
+                            Style::default()
+                                .fg(app.theme.comment)
+                                .patch(app.theme.selection)
+                        } else {
+                            Style::default().fg(app.theme.comment)
+                        },
                     );
                 }
             }
