@@ -2171,7 +2171,7 @@ fn file_statistics(ctx: &Ctx) {
     session.wait_text("3 ++-");
     session.wait_text("binary");
     // The whole-diff total sums the numstat oracle: +2 -1 and one binary.
-    session.wait_text("Σ +2 −1 · 1 binary");
+    session.wait_text("Σ +2 −1 current +2 −1 · 1 binary");
     let stats_row = |session: &Session, name: &str| find_line(session, name).1;
     assert!(stats_row(&session, "binary.dat").contains("binary"));
     // Python: re.search(r"mode.txt +0", row).
@@ -2193,9 +2193,9 @@ fn file_statistics(ctx: &Ctx) {
         session.pump(0.1);
         assert!(Instant::now() < end, "{}", session.text());
     }
-    session.wait_text("Σ +2 −1 · 1 binary");
+    session.wait_text("Σ +2 −1 current +2 −1 · 1 binary");
     session.send(b"\x1b");
-    session.wait_text("Σ +2 −1 · 1 binary");
+    session.wait_text("Σ +2 −1 current +2 −1 · 1 binary");
     session.wait_text("3 ++-");
     session.send(b"jk");
     for (rows, cols) in [(30, 28), (3, 8), (1, 1), (30, 140)] {

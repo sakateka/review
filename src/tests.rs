@@ -8992,7 +8992,10 @@ fn file_list_totals_count_binary_and_unavailable_items() {
     let state = tempfile::tempdir().unwrap();
     let mut app = application(root, state.path());
     let text = screen_text(&screen(&mut app, 100, 24));
-    assert!(text.contains("Σ +3 −0 · 1 binary "), "{text}");
+    assert!(
+        text.contains("Σ +3 −0 current binary · 1 binary "),
+        "{text}"
+    );
     assert!(!text.contains("unavailable"), "{text}");
     // A whitespace-suppressed mode change has no provable statistics.
     use std::os::unix::fs::PermissionsExt;
@@ -9004,7 +9007,7 @@ fn file_list_totals_count_binary_and_unavailable_items() {
     );
     let text = screen_text(&screen(&mut app, 100, 24));
     assert!(
-        text.contains("Σ +3 −0 · 1 binary · 1 unavailable"),
+        text.contains("Σ +3 −0 current binary · 1 binary · 1 unavailable"),
         "{text}"
     );
 }
@@ -11155,4 +11158,20 @@ fn cursor_positions_survive_restart_and_ignore_changed_patches() {
         fresh.preview.is_none(),
         "changed patch must not reopen stale position"
     );
+}
+
+#[test]
+fn totals_show_selected_file_statistics_and_follow_selection() {
+    let directory = fixture();
+    std::fs::write(directory.path().join("one.rs"), "new one\nmore\n").unwrap();
+    std::fs::write(directory.path().join("two.rs"), "new two\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    let first = row_text(&screen(&mut app, 100, 24), 20);
+    assert!(first.contains("current +2 −3"), "{first}");
+    app.key(KeyCode::Down);
+    app.key(KeyCode::Enter);
+    let second = row_text(&screen(&mut app, 100, 24), 20);
+    assert!(second.contains("current +1 −3"), "{second}");
+    assert!(second.contains("Σ +3 −6"), "{second}");
 }

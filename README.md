@@ -91,6 +91,8 @@ Cycling with next/previous file remembers each diff's cursor, vertical and
 horizontal scroll, and after-changes mode. On exit these positions are saved
 for the current comparison, and the last file reopens on restart if its diff
 has not changed. Positions are clamped to the viewport when resized.
+The file list summary shows totals for the comparison and `current` additions
+and deletions for the selected file.
 
 review never writes to the repository, the index, refs or Git configuration.
 

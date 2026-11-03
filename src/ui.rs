@@ -164,7 +164,11 @@ fn file_row(
 }
 
 /// One-line sum of every captured item's statistics, e.g. `Σ +3 −0 · 1 binary`.
-fn totals_line(items: &[crate::git::Item], theme: &crate::theme::Theme) -> Line<'static> {
+fn totals_line(
+    items: &[crate::git::Item],
+    current: usize,
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
     use crate::git::Statistics;
     let (mut additions, mut deletions, mut binary, mut unavailable) = (0usize, 0usize, 0, 0);
     for item in items {
@@ -193,6 +197,27 @@ fn totals_line(items: &[crate::git::Item], theme: &crate::theme::Theme) -> Line<
             Style::default().fg(theme.stat_minus),
         ),
     ];
+    if let Some(item) = items.get(current) {
+        spans.push(Span::styled(" current ", neutral));
+        match item.statistics() {
+            Statistics::Text {
+                additions,
+                deletions,
+            } => {
+                spans.push(Span::styled(
+                    format!("+{additions}"),
+                    Style::default().fg(theme.stat_plus),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("−{deletions}"),
+                    Style::default().fg(theme.stat_minus),
+                ));
+            }
+            Statistics::Binary => spans.push(Span::styled("binary", neutral)),
+            Statistics::Unavailable => spans.push(Span::styled("unavailable", neutral)),
+        }
+    }
     if binary > 0 {
         spans.push(Span::styled(format!(" · {binary} binary"), neutral));
     }
@@ -271,7 +296,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if !app.capture.items.is_empty() && inner.height >= 2 {
             list_area.height -= 1;
             frame.render_widget(
-                Paragraph::new(totals_line(&app.capture.items, &app.theme)),
+                Paragraph::new(totals_line(&app.capture.items, app.selected, &app.theme)),
                 Rect::new(inner.x, inner.y + list_area.height, inner.width, 1),
             );
         }
