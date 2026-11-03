@@ -57,11 +57,17 @@ fn file_row(
     reviewed: bool,
     width: usize,
     show_stats: bool,
+    comment: Option<bool>,
     theme: &crate::theme::Theme,
 ) -> Line<'static> {
     use crate::git::Statistics;
     let name = item.name();
-    let available = width.saturating_sub(2);
+    let icon_width = if comment.is_some() && width >= 4 {
+        2 + usize::from(width > 4)
+    } else {
+        0
+    };
+    let available = width.saturating_sub(2 + icon_width);
     let statistics = item.statistics();
     let label = match statistics {
         Statistics::Text {
@@ -160,7 +166,26 @@ fn file_row(
             ));
         }
     }
+    if icon_width > 0 {
+        if !show_stats {
+            spans.push(Span::raw(" ".repeat(padding)));
+        }
+        if icon_width > 2 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled("💬", comment_style(comment.unwrap(), theme)));
+    }
     Line::from(spans)
+}
+
+fn comment_style(outdated: bool, theme: &crate::theme::Theme) -> Style {
+    if outdated {
+        Style::default()
+            .fg(theme.comment_outdated)
+            .add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(theme.comment)
+    }
 }
 
 /// One-line sum of every captured item's statistics, e.g. `Σ +3 −0 · 1 binary`.
@@ -261,11 +286,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .zip(&app.marks)
             .enumerate()
             .map(|(index, (item, reviewed))| {
+                let comment = app
+                    .comments
+                    .for_item(item)
+                    .map(|(_, comment)| comment.outdated)
+                    .reduce(|a, b| a && b);
                 ListItem::new(file_row(
                     item,
                     *reviewed,
-                    panels[0].width.saturating_sub(4) as usize,
+                    panels[0]
+                        .width
+                        .saturating_sub(if comment.is_some() { 2 } else { 4 })
+                        as usize,
                     show_stats,
+                    comment,
                     &app.theme,
                 ))
                 .style(if index == app.selected {
@@ -385,18 +419,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 if let Some(Some(outdated)) =
                     rows.get(offset).and_then(|(row, _)| markers.get(*row))
                 {
-                    let style = if *outdated {
-                        Style::default()
-                            .fg(app.theme.comment_outdated)
-                            .add_modifier(Modifier::DIM)
-                    } else {
-                        Style::default().fg(app.theme.comment)
-                    };
                     frame.buffer_mut().set_string(
                         content.x + content.width - 2,
                         content.y + offset as u16,
                         "💬",
-                        style,
+                        comment_style(*outdated, &app.theme),
                     );
                 }
             }

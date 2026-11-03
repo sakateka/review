@@ -8224,9 +8224,10 @@ mod review_comments {
 
     fn icon_rows(app: &mut App) -> Vec<(usize, Color)> {
         let buffer = screen(app, 120, 30);
+        let preview_x = app.preview_area.x + app.preview_area.width;
         let mut rows = Vec::new();
         for y in 0..buffer.area.height {
-            for x in 0..buffer.area.width {
+            for x in preview_x..buffer.area.width {
                 let cell = &buffer[(x, y)];
                 if cell.symbol() == "💬" {
                     rows.push((y as usize, cell.fg));
@@ -8448,6 +8449,45 @@ mod review_comments {
         ctrl(&mut restarted, 's');
         assert!(file(directory.path(), "review-HEAD.comments").contains("second line!\n"));
         assert!(!directory.path().join("review-HEAD-2.comments").exists());
+    }
+
+    #[test]
+    fn file_list_comment_icons_keep_statistics_and_follow_comment_state() {
+        let directory = fixture();
+        change(directory.path());
+        let state = tempfile::tempdir().unwrap();
+        let mut app = application(directory.path(), state.path());
+        comment_at(&mut app, 7, "A comment");
+
+        let opened = screen(&mut app, 100, 24);
+        assert_eq!(opened[(27, 1)].symbol(), "💬", "{}", row_text(&opened, 1));
+        assert_eq!(opened[(27, 1)].fg, app.theme.comment);
+        assert_ne!(opened[(27, 2)].symbol(), "💬");
+        app.key(KeyCode::Esc);
+        let closed = screen(&mut app, 100, 24);
+        assert_eq!(closed[(97, 1)].symbol(), "💬");
+        assert!(row_text(&closed, 1).contains("2 +-"));
+        assert!(row_text(&closed, 2).contains("2 +-"));
+        assert_ne!(closed[(97, 2)].symbol(), "💬");
+
+        let mut restarted = application(directory.path(), state.path());
+        assert_eq!(screen(&mut restarted, 100, 24)[(97, 1)].symbol(), "💬");
+        restarted.comments.comments[0].outdated = true;
+        let outdated = screen(&mut restarted, 100, 24);
+        assert_eq!(outdated[(97, 1)].fg, restarted.theme.comment_outdated);
+        assert!(outdated[(97, 1)].modifier.contains(Modifier::DIM));
+        let mut current = restarted.comments.comments[0].clone();
+        current.outdated = false;
+        restarted.comments.comments.push(current);
+        assert_eq!(
+            screen(&mut restarted, 100, 24)[(97, 1)].fg,
+            restarted.theme.comment
+        );
+        restarted.comments.comments.clear();
+        assert_ne!(screen(&mut restarted, 100, 24)[(97, 1)].symbol(), "💬");
+        for width in 0..20 {
+            screen(&mut app, width, 8);
+        }
     }
 
     #[test]
