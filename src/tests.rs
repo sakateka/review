@@ -10588,3 +10588,47 @@ fn addition_text_keeps_normal_foreground_and_marker_survives_retheme() {
                 && span.style.fg != app.theme.default_fg)
     );
 }
+
+#[test]
+fn new_file_additions_have_no_background_across_themes_and_large_patches() {
+    let directory = fixture();
+    let path = directory.path();
+    std::fs::write(path.join("empty.txt"), "").unwrap();
+    git_run(path, &["add", "empty.txt"]);
+    git_run(path, &["commit", "-qm", "empty file"]);
+    std::fs::write(path.join("empty.txt"), "existing content\n").unwrap();
+    std::fs::write(path.join("new.rs"), "fn added() {}\n").unwrap();
+    std::fs::write(path.join("large.txt"), "new content\n".repeat(24000)).unwrap();
+    git_run(path, &["add", "."]);
+    let captured = capture(path, &["HEAD"]);
+    for name in ["new.rs", "large.txt", "empty.txt"] {
+        let item = captured
+            .items
+            .iter()
+            .find(|item| item.new_path == name.as_bytes())
+            .unwrap();
+        let mut preview = preview::Preview::item(path, item, &theme::Theme::classic());
+        for theme in [theme::Theme::classic(), theme::Theme::gruvbox_baby()] {
+            preview.restyle(&theme);
+            let line = preview
+                .lines
+                .iter()
+                .find(|line| {
+                    line.to_string().starts_with(match name {
+                        "new.rs" => "+fn added",
+                        "large.txt" => "+new content",
+                        _ => "+existing content",
+                    })
+                })
+                .unwrap();
+            assert_eq!(line.spans[0].style.fg, Some(theme.added_fg));
+            for span in &line.spans {
+                if name == "empty.txt" {
+                    assert_eq!(span.style.bg, Some(theme.added_bg));
+                } else {
+                    assert_eq!(span.style.bg, None);
+                }
+            }
+        }
+    }
+}

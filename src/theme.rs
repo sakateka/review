@@ -106,6 +106,7 @@ pub enum Base {
     Plain,
     Added,
     AddedMarker,
+    NewFileMarker,
     Removed,
     Hunk,
 }
@@ -401,6 +402,7 @@ impl Theme {
                 .map_or_else(Style::default, |fg| Style::default().fg(fg))
                 .bg(self.added_bg),
             Base::AddedMarker => Style::default().fg(self.added_fg).bg(self.added_bg),
+            Base::NewFileMarker => Style::default().fg(self.added_fg),
             Base::Removed => Style::default().fg(self.removed_fg).bg(self.removed_bg),
             Base::Hunk => Style::default().fg(self.hunk),
         };

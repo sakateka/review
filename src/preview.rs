@@ -198,6 +198,9 @@ impl Preview {
             preview.add_reason(
                 "Large patch: bounded basic rendering; source navigation remains separate",
             );
+            if item.old_mode == "000000" {
+                preview.clear_new_file_background(theme);
+            }
             return preview;
         }
         let sources = source::load(cwd, item);
@@ -228,7 +231,21 @@ impl Preview {
         if text.is_err() {
             preview.locations.fill((None, None));
         }
+        if item.old_mode == "000000" {
+            preview.clear_new_file_background(theme);
+        }
         preview
+    }
+
+    fn clear_new_file_background(&mut self, theme: &Theme) {
+        for role in self.roles.iter_mut().flatten() {
+            role.base = match role.base {
+                Base::Added => Base::Plain,
+                Base::AddedMarker => Base::NewFileMarker,
+                other => other,
+            };
+        }
+        self.restyle(theme);
     }
 
     fn compose(
