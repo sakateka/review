@@ -7063,6 +7063,7 @@ fn command_line_sets_queries_and_aliases_the_colorscheme() {
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     app.key(KeyCode::Enter);
     screen(&mut app, 100, 24);
     let default = colors(app.preview.as_ref().unwrap());
@@ -7153,6 +7154,7 @@ fn command_line_tab_completion_cycles_in_place() {
     let directory = fixture();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     let text = |app: &App| app.command.as_ref().unwrap().text.clone();
     app.key(KeyCode::Char(':'));
     type_text(&mut app, "colo");
@@ -7751,7 +7753,13 @@ fn palette_entries_follow_the_registry_order() {
             .iter()
             .map(|name| format!("set appearance.colorscheme={name}")),
     );
-    expected.extend(["set wrap".into(), "set nowrap".into(), "help".into()]);
+    expected.extend([
+        "set wrap".into(),
+        "set nowrap".into(),
+        "set cursorline".into(),
+        "set nocursorline".into(),
+        "help".into(),
+    ]);
     assert_eq!(
         entries
             .iter()
@@ -7765,7 +7773,9 @@ fn palette_entries_follow_the_registry_order() {
         let summary = if entry.text == "help" {
             commands::COMMANDS[2].summary
         } else if entry.text == "set wrap" || entry.text == "set nowrap" {
-            "change line wrapping for this session"
+            "save line wrapping in configuration"
+        } else if entry.text == "set cursorline" || entry.text == "set nocursorline" {
+            "save cursor line visibility"
         } else if entry.text.starts_with("set ") {
             commands::SETTINGS[0].summary
         } else {
@@ -7777,6 +7787,7 @@ fn palette_entries_follow_the_registry_order() {
     let directory = fixture();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     for entry in &entries {
         commands::execute(&mut app, &entry.text);
         assert!(
@@ -8031,7 +8042,7 @@ fn palette_renders_a_floating_box_with_cursor_and_selection() {
         row(6)
     );
     assert!(
-        row(7).contains("│set appearance.colorscheme=review-classic  color theme"),
+        row(7).contains("│set appearance.colorscheme=review-classic  save the color theme"),
         "{}",
         row(7)
     );
@@ -11167,6 +11178,7 @@ fn line_wrap_draws_scrolls_and_mouse_targets_logical_cells() {
     .unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     app.key(KeyCode::Enter);
     let row = app
         .preview
@@ -11216,6 +11228,7 @@ fn help_and_wrap_commands_follow_session_state() {
     change(directory.path());
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     run_command(&mut app, "help");
     assert!(app.help.is_some());
     app.key(KeyCode::Esc);
@@ -11238,6 +11251,7 @@ fn wrapped_search_and_definition_keep_logical_source_positions() {
     std::fs::write(directory.path().join("one.rs"), &source).unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     app.key(KeyCode::Enter);
     screen(&mut app, 60, 14);
     run_command(&mut app, "set nowrap");
@@ -11283,6 +11297,7 @@ fn wrapped_selection_and_comments_anchor_logical_lines() {
     .unwrap();
     let state = tempfile::tempdir().unwrap();
     let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().join("config.toml"));
     app.key(KeyCode::Enter);
     screen(&mut app, 65, 15);
     run_command(&mut app, "set nowrap");
@@ -11577,4 +11592,96 @@ fn totals_show_selected_file_statistics_and_follow_selection() {
     let second = row_text(&screen(&mut app, 100, 24), 20);
     assert!(second.contains("current +1 −3"), "{second}");
     assert!(second.contains("Σ +3 −6"), "{second}");
+}
+
+#[test]
+fn cursorline_commands_persist_and_cover_file_and_diff_rows() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let path = config_dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "# keep this comment\n[appearance]\ncolorscheme = 'review-classic'\n",
+    )
+    .unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.config_path = Some(path.clone());
+    let list = screen(&mut app, 100, 24);
+    for x in [1, 40, 98] {
+        assert!(list[(x, 1)].modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(
+            list[(x, 1)].underline_color,
+            ratatui::style::Color::Rgb(50, 50, 50)
+        );
+    }
+    app.key(KeyCode::Enter);
+    let diff = screen(&mut app, 100, 24);
+    for x in [31, 60, 98] {
+        assert!(diff[(x, 1)].modifier.contains(Modifier::UNDERLINED));
+    }
+    run_command(&mut app, "set nocursorline");
+    let off = screen(&mut app, 100, 24);
+    assert!(!off[(40, 1)].modifier.contains(Modifier::UNDERLINED));
+    assert!(!off[(2, 1)].modifier.contains(Modifier::UNDERLINED));
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("# keep this comment"));
+    assert!(saved.contains("colorscheme = 'review-classic'"));
+    assert!(
+        !config::Config::load(Some(&path))
+            .unwrap()
+            .appearance
+            .cursorline
+    );
+    run_command(&mut app, "set nocursorline");
+    assert!(!app.cursorline);
+    run_command(&mut app, "set cursorline");
+    assert!(
+        config::Config::load(Some(&path))
+            .unwrap()
+            .appearance
+            .cursorline
+    );
+    assert!(
+        screen(&mut app, 100, 24)[(40, 1)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+}
+
+#[test]
+fn cursorline_save_failure_keeps_current_setting() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let mut app = application(directory.path(), state.path());
+    app.config_path = Some(state.path().to_owned());
+    run_command(&mut app, "set nocursorline");
+    assert!(app.cursorline);
+    assert!(app.status.contains("Cannot save cursorline"));
+}
+
+#[test]
+fn set_wrap_and_colorscheme_persist_and_failed_writes_do_not_change_them() {
+    let directory = fixture();
+    change(directory.path());
+    let state = tempfile::tempdir().unwrap();
+    let path = state.path().join("settings/config.toml");
+    let mut app = application(directory.path(), state.path());
+    app.config_path = Some(path.clone());
+    run_command(&mut app, "set wrap");
+    run_command(&mut app, "set appearance.colorscheme=Dracula");
+    let config = config::Config::load(Some(&path)).unwrap();
+    assert!(config.appearance.wrap);
+    assert_eq!(config.theme().unwrap().name, "Dracula");
+    run_command(&mut app, "set nowrap");
+    assert!(!config::Config::load(Some(&path)).unwrap().appearance.wrap);
+    app.config_path = Some(state.path().to_owned());
+    run_command(&mut app, "set wrap");
+    assert!(!app.wrap);
+    assert!(app.status.contains("Cannot save wrap"));
+    run_command(&mut app, "set appearance.colorscheme=Nord");
+    assert_eq!(app.theme.name, "Dracula");
+    assert!(app.status.contains("Cannot save colorscheme"));
 }

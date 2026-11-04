@@ -1,7 +1,6 @@
 //! The `:` command line and the command palette: a small registry of commands
 //! and settings, their completion, palette listing and execution. Commands
-//! only change runtime state; they never write configuration, review state,
-//! sources or Git.
+//! `set` changes are saved to configuration.
 
 use crate::{app::App, theme::Theme};
 
@@ -29,7 +28,7 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: SET,
         usage: "set <key>[=<value>]",
-        summary: "show or change a runtime setting",
+        summary: "show or save a setting",
         values: None,
     },
     Command {
@@ -50,7 +49,7 @@ pub const COLORSCHEME: &str = "appearance.colorscheme";
 
 pub const SETTINGS: &[Setting] = &[Setting {
     key: COLORSCHEME,
-    summary: "color theme (runtime only; [appearance] colorscheme sets the startup theme)",
+    summary: "save the color theme in configuration",
     values: Theme::names,
 }];
 
@@ -154,7 +153,7 @@ fn candidates(text: &str) -> (&str, &str, Vec<&'static str>) {
                 SETTINGS
                     .iter()
                     .map(|setting| setting.key)
-                    .chain(["wrap", "nowrap"])
+                    .chain(["wrap", "nowrap", "cursorline", "nocursorline"])
                     .collect(),
             ),
         },
@@ -197,7 +196,13 @@ pub fn entries() -> Vec<Entry> {
             for text in ["set wrap", "set nowrap"] {
                 entries.push(Entry {
                     text: text.into(),
-                    summary: "change line wrapping for this session",
+                    summary: "save line wrapping in configuration",
+                });
+            }
+            for text in ["set cursorline", "set nocursorline"] {
+                entries.push(Entry {
+                    text: text.into(),
+                    summary: "save cursor line visibility",
                 });
             }
             continue;
@@ -298,24 +303,52 @@ pub fn execute(app: &mut App, text: &str) {
             app.help = Some(crate::app::Help::default());
             app.bindings.clear();
         }
-        "colorscheme" => setting(app, COLORSCHEME, (!argument.is_empty()).then_some(argument)),
+        "colorscheme" => setting(
+            app,
+            COLORSCHEME,
+            (!argument.is_empty()).then_some(argument),
+            false,
+        ),
         "set" if argument.is_empty() => {
             app.status = format!("set requires a setting such as {COLORSCHEME}=<name>");
         }
+        "set" if matches!(argument, "cursorline" | "nocursorline") => {
+            let enabled = argument == "cursorline";
+            if save(app, "cursorline", toml_edit::value(enabled)) {
+                app.cursorline = enabled;
+                app.status = argument.into();
+            }
+        }
         "set" if matches!(argument, "wrap" | "nowrap") => {
             let wrap = if argument == "wrap" { true } else { !app.wrap };
-            app.set_line_wrap(wrap);
-            app.status = if app.wrap { "wrap" } else { "nowrap" }.into();
+            if save(app, "wrap", toml_edit::value(wrap)) {
+                app.set_line_wrap(wrap);
+                app.status = if app.wrap { "wrap" } else { "nowrap" }.into();
+            }
         }
         "set" => match argument.split_once('=') {
-            Some((key, value)) => setting(app, key.trim(), Some(value.trim())),
-            None => setting(app, argument, None),
+            Some((key, value)) => setting(app, key.trim(), Some(value.trim()), true),
+            None => setting(app, argument, None, true),
         },
         _ => app.status = format!("Unknown command {name:?}"),
     }
 }
 
-fn setting(app: &mut App, key: &str, value: Option<&str>) {
+fn save(app: &mut App, key: &str, value: toml_edit::Item) -> bool {
+    let result = app
+        .config_path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("configuration path unavailable"))
+        .and_then(|path| crate::config::Config::save_setting(path, key, value));
+    if let Err(error) = result {
+        app.status = format!("Cannot save {key}: {error:#}");
+        false
+    } else {
+        true
+    }
+}
+
+fn setting(app: &mut App, key: &str, value: Option<&str>, persist: bool) {
     if key != COLORSCHEME {
         app.status = format!("Unknown setting {key:?}");
         return;
@@ -324,8 +357,14 @@ fn setting(app: &mut App, key: &str, value: Option<&str>) {
         None => app.status = format!("{COLORSCHEME}={}", app.theme.name),
         Some(value) => match Theme::named(value) {
             Some(theme) => {
-                app.set_theme(theme);
-                app.status = format!("{COLORSCHEME}={} (this session only)", theme.name);
+                if !persist || save(app, "colorscheme", toml_edit::value(theme.name)) {
+                    app.set_theme(theme);
+                    app.status = if persist {
+                        format!("{COLORSCHEME}={}", theme.name)
+                    } else {
+                        format!("{COLORSCHEME}={} (this session only)", theme.name)
+                    };
+                }
             }
             None => {
                 app.status = format!("Unknown colorscheme {value:?}; press Tab to list themes");

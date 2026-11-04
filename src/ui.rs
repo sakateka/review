@@ -12,7 +12,7 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap},
 };
@@ -26,6 +26,12 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+fn cursorline_style() -> Style {
+    Style::default()
+        .underline_color(Color::Rgb(50, 50, 50))
+        .add_modifier(Modifier::UNDERLINED)
+}
 
 fn clip_name(name: &str, width: usize) -> String {
     if name.width() <= width {
@@ -348,6 +354,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         *selection.offset_mut() = app.file_offset;
         frame.render_stateful_widget(files, list_area, &mut selection);
         app.file_offset = selection.offset();
+        if app.cursorline && app.selected >= app.file_offset {
+            let offset = app.selected - app.file_offset;
+            if offset < list_area.height as usize {
+                frame.buffer_mut().set_style(
+                    Rect::new(list_area.x, list_area.y + offset as u16, list_area.width, 1),
+                    cursorline_style(),
+                );
+            }
+        }
     }
     if app.preview.is_some() {
         let area = if original { panels[0] } else { panels[1] };
@@ -409,7 +424,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             app.cursor.0
         };
         let cursor_marker = |offset: usize| {
-            app.focus == Focus::Preview
+            app.cursorline
+                && app.focus == Focus::Preview
                 && rows
                     .get(offset)
                     .is_some_and(|(row, _)| *row == app.cursor.0)
@@ -486,6 +502,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     );
                 }
             }
+        }
+        if let Some(offset) = (0..rows.len()).find(|&offset| cursor_marker(offset)) {
+            frame.buffer_mut().set_style(
+                Rect::new(content.x, content.y + offset as u16, content.width, 1),
+                cursorline_style(),
+            );
         }
         let total = preview.lines.len();
         let (row, column) = if total == 0 {

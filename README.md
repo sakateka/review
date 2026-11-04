@@ -54,7 +54,7 @@ Vim keymap (default):
 | `Tab` | Switch pane |
 | `m` | Toggle the file's reviewed mark |
 | `a` | Toggle between the diff and the new side only |
-| `:set nowrap` | Toggle soft line wrapping in previews for this session |
+| `:set nowrap` | Toggle soft line wrapping in previews (saved in configuration) |
 | `:help` | Open in-app help |
 | `c` / `dc` | Add or edit / delete a comment on the line or the `v` selection |
 | `Alt-N` | Show notes for the selected file or current diff line |
@@ -71,7 +71,9 @@ Vim keymap (default):
 | `,q` | Quit from anywhere |
 
 Usual Vim motions work in diffs: `w b e`, `0 ^ $`, `gg G`, `Ctrl-U/D/B/F`,
-counts. Use `:set wrap` to enable wrapping and `:set nowrap` to toggle it.
+counts. Use `:set cursorline` or `:set nocursorline` to show or hide a subtle
+underline on the selected file and the active diff cursor row. This setting is saved
+in the configuration file. Use `:set wrap` to enable wrapping and `:set nowrap` to toggle it; wrapping is saved too. `:set appearance.colorscheme=<name>` saves the theme.
 The Emacs keymap uses `Ctrl-N/P/B/F`, `Alt-.`, `Alt-?`, `Alt-,` and
 `Alt-X` instead. Shortcuts keep working with a Russian, Ukrainian or
 Belarusian keyboard layout active, as with Vim's `langmap`.
@@ -153,6 +155,8 @@ readline = true      # Ctrl-A/E/N/P and Alt-B/F in diffs
 
 [appearance]
 colorscheme = "gruvbox-baby"
+cursorline = true     # underline the current file and diff row
+wrap = false          # wrap preview lines
 
 [keybindings]
 toggle_mark = "m"

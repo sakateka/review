@@ -490,7 +490,7 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     ctx.git_run(&["commit", "-qm", "remove toml fixture"]);
     ctx.before = ctx.repo_snapshot();
 
-    // Installed themes and command line: gruvbox-baby without config, runtime-only
+    // Installed themes and command line: default theme, persistent set, runtime
     // switching, completion, cancel, errors, Emacs alt-x and invalid startup names.
     std::fs::remove_file(&ctx.config_file).unwrap();
     let mut session = ctx.default_session();
@@ -568,9 +568,10 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     session.send(b"\x1bx");
     assert!(status_row(&session).starts_with(':'), "{}", session.text());
     session.send(b"colorscheme\r");
-    session.wait_text("appearance.colorscheme=gruvbox-baby");
+    session.wait_text("appearance.colorscheme=gruvbox-dark");
     session.send(b",q");
     session.finish(0);
+    std::fs::remove_file(&ctx.config_file).unwrap();
     // Command palette: alt-p filters registry entries and runs them through the
     // command line's execution; cancelling leaves the view and theme untouched.
     let palette_state = ctx.state_snapshot();
@@ -658,12 +659,13 @@ fn colors_themes_and_command_line(ctx: &mut Ctx) {
     session.wait_text("set appearance.colorscheme=review-classic");
     // Ctrl-N is clamped on the single match.
     session.send(b"\x0e\r");
-    session.wait_text("appearance.colorscheme=review-classic (this session only)");
+    session.wait_text("appearance.colorscheme=review-classic");
     assert_eq!(token_color(&session, "+fn caller()", "fn"), idx(5));
     session.send(b"\x1bp");
     session.wait_text(" Command palette ");
     session.send(b"\x03");
     session.finish(0);
+    std::fs::remove_file(&ctx.config_file).unwrap();
     assert_same(
         &palette_state,
         &ctx.state_snapshot(),

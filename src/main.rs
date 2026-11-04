@@ -176,6 +176,9 @@ fn run() -> Result<i32> {
         keybindings::Keymap::Vim => "vim",
         keybindings::Keymap::Emacs => "emacs",
     };
+    app.cursorline = loaded.appearance.cursorline;
+    app.set_line_wrap(loaded.appearance.wrap);
+    app.config_path = config.or_else(config::Config::default_path);
     app.bindings = bindings;
     app.set_theme(theme);
     app.startup = Some(telemetry::Startup {

@@ -54,6 +54,8 @@ pub struct App {
     pub focus: Focus,
     pub top: usize,
     pub wrap: bool,
+    pub cursorline: bool,
+    pub config_path: Option<std::path::PathBuf>,
     pub top_segment: usize,
     pub left: usize,
     pub viewport: (usize, usize),
@@ -229,6 +231,8 @@ impl App {
             },
             top: 0,
             wrap: false,
+            cursorline: true,
+            config_path: None,
             top_segment: 0,
             left: 0,
             viewport: (0, 0),
@@ -279,10 +283,12 @@ impl App {
     }
 
     pub fn set_line_wrap(&mut self, wrap: bool) {
-        if self.preview.is_some() && self.wrap != wrap {
+        if self.wrap != wrap {
             self.wrap = wrap;
             self.top_segment = 0;
-            self.keep_cursor_visible();
+            if self.preview.is_some() {
+                self.keep_cursor_visible();
+            }
         }
     }
 
