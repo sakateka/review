@@ -16,6 +16,7 @@ riptags = { version = "=0.2.3", default-features = false, features = ["rust", "c
 tree-sitter = "=0.27.1"
 tree-sitter-json = "=0.24.8"
 arborium-meson = "=2.18.2"
+arborium-just = "=2.18.2"
 tree-sitter-yaml = "=0.7.2"
 tree-sitter-toml-ng = "=0.7.0"
 serde = { version = "=1.0.229", features = ["derive"] }

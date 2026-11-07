@@ -75,7 +75,13 @@ pub const LIMIT: usize = 128 * 1024;
 fn detect<'a>(syntaxes: &'a SyntaxSet, path: &Path, content: &str) -> Option<&'a SyntaxReference> {
     let name = path.file_name().and_then(|name| name.to_str());
     let extension = path.extension().and_then(|extension| extension.to_str());
-    name.and_then(|name| syntaxes.find_syntax_by_extension(name))
+    name.filter(|name| name.starts_with("Dockerfile."))
+        .and_then(|_| syntaxes.find_syntax_by_name("Dockerfile"))
+        .or_else(|| {
+            name.filter(|name| name.ends_with(".service") || name.ends_with(".service.j2"))
+                .and_then(|_| syntaxes.find_syntax_by_name("INI"))
+        })
+        .or_else(|| name.and_then(|name| syntaxes.find_syntax_by_extension(name)))
         .or_else(|| extension.and_then(|extension| syntaxes.find_syntax_by_extension(extension)))
         .or_else(|| {
             content
@@ -110,6 +116,27 @@ pub fn highlight(path: &Path, content: &str) -> anyhow::Result<Vec<Option<u8>>> 
         return Ok(Vec::new());
     };
     anyhow::ensure!(content.len() <= LIMIT, "source exceeds highlighting limit");
+    let mut bytes = parse(syntaxes, syntax, content)?;
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".service.j2"))
+        && let Some(jinja) = syntaxes.find_syntax_by_name("Jinja2")
+    {
+        for (base, overlay) in bytes.iter_mut().zip(parse(syntaxes, jinja, content)?) {
+            if overlay.is_some() {
+                *base = overlay;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn parse(
+    syntaxes: &SyntaxSet,
+    syntax: &SyntaxReference,
+    content: &str,
+) -> anyhow::Result<Vec<Option<u8>>> {
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
     let mut bytes = vec![None; content.len()];

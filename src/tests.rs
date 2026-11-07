@@ -9812,6 +9812,97 @@ fn meson_files_highlight_build_language() {
 }
 
 #[test]
+fn yanet_project_file_types_have_syntax_colors() {
+    let classic = theme::Theme::classic();
+    for name in ["Justfile", "justfile", ".justfile"] {
+        let view = fallback_source(
+            name,
+            "# build\nset shell := ['bash']\nbuild:\n  echo hi\n",
+            &classic,
+        );
+        assert_eq!(
+            fallback_fg(&view, "# build"),
+            Some(Color::DarkGray),
+            "{name}"
+        );
+        assert_eq!(fallback_fg(&view, "set"), Some(Color::Magenta), "{name}");
+        assert_eq!(fallback_fg(&view, "'bash'"), Some(Color::Green), "{name}");
+    }
+    let header = fallback_source("config.h.in", "#define VALUE 123\n", &classic);
+    let plain_header = fallback_source("config.h", "#define VALUE 123\n", &classic);
+    assert_eq!(
+        fallback_fg(&header, "#define"),
+        fallback_fg(&plain_header, "#define")
+    );
+    assert_ne!(fallback_fg(&header, "#define"), classic.default_fg);
+
+    let docker = fallback_source("Dockerfile.base.dev", "FROM alpine\n", &classic);
+    assert_eq!(fallback_fg(&docker, "FROM"), Some(Color::Magenta));
+
+    for name in ["daemon.service", "daemon.service.j2"] {
+        let view = fallback_source(
+            name,
+            "[Service]\n# comment\nExecStart={{ command }}\n",
+            &classic,
+        );
+        assert_eq!(
+            fallback_fg(&view, "# comment"),
+            Some(Color::DarkGray),
+            "{name}"
+        );
+        assert_ne!(
+            fallback_fg(&view, "ExecStart"),
+            classic.default_fg,
+            "{name}"
+        );
+        if name.ends_with(".j2") {
+            let jinja = fallback_source("template.j2", "ExecStart={{ command }}\n", &classic);
+            assert_eq!(
+                fallback_fg(&view, "command"),
+                fallback_fg(&jinja, "command")
+            );
+        }
+    }
+    for name in ["config.yaml.j2", "config.yml.j2"] {
+        let view = fallback_source(
+            name,
+            "logging:\n  level: debug\n  id: {{ item }}\n",
+            &classic,
+        );
+        let yaml = fallback_source("config.yaml", "logging:\n  level: debug\n", &classic);
+        assert_eq!(
+            fallback_fg(&view, "level"),
+            fallback_fg(&yaml, "level"),
+            "{name}"
+        );
+        assert_ne!(fallback_fg(&view, "level"), classic.default_fg, "{name}");
+        let jinja = fallback_source("template.j2", "id: {{ item }}\n", &classic);
+        assert_eq!(
+            fallback_fg(&view, "item"),
+            fallback_fg(&jinja, "item"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn yanet_web_and_proto_languages_are_available_through_syntect() {
+    for (name, text, token) in [
+        ("app.ts", "const value = 'text';\n", "const"),
+        ("app.tsx", "const view = <div>hello</div>;\n", "const"),
+        ("api.proto", "syntax = \"proto3\";\n", "\"proto3\""),
+        ("style.scss", "$color: #fff;\n", "$color"),
+        ("image.Dockerfile", "FROM alpine\n", "FROM"),
+    ] {
+        let captures = syntect::highlight(std::path::Path::new(name), text).unwrap();
+        assert!(
+            captures[text.find(token).unwrap()].is_some(),
+            "{name}: {token}"
+        );
+    }
+}
+
+#[test]
 fn syntect_fallback_diff_reasons_for_plain_text_and_oversized_sources() {
     let directory = fixture();
     let big = format!("// big\n{}", "let value = 1;\n".repeat(20_000));

@@ -98,6 +98,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arborium-just"
+version = "2.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9a22e90530661891ef9d7185c81c21b5f17a89629780317ced810210fe873e1"
+dependencies = [
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "arborium-meson"
 version = "2.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1577,6 +1588,7 @@ name = "review"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arborium-just",
  "arborium-meson",
  "crossterm",
  "libc",

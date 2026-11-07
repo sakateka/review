@@ -46,8 +46,17 @@ fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
 
 fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
     let path = std::path::Path::new(std::str::from_utf8(&side.path)?);
-    let extension = match path.file_name().and_then(|name| name.to_str()) {
-        Some("meson.build" | "meson.options" | "meson_options.txt") => "meson",
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let yaml_template = name.ends_with(".yaml.j2") || name.ends_with(".yml.j2");
+    let extension = match name {
+        "meson.build" | "meson.options" | "meson_options.txt" => "meson",
+        "Justfile" | "justfile" | ".justfile" => "just",
+        name if yaml_template && name.ends_with(".yaml.j2") => "yaml",
+        _ if yaml_template => "yml",
+        name if name.ends_with(".h.in") => "h",
         _ => path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
     };
     let (language, query) = match extension {
@@ -106,6 +115,10 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
                 .replace("@conditional", "@keyword")
                 .replace("@repeat", "@keyword"),
         ),
+        "just" => (
+            arborium_just::language(),
+            arborium_just::HIGHLIGHTS_QUERY.to_owned(),
+        ),
         // Tree-sitter stays authoritative; syntect covers the remaining languages.
         _ => return crate::syntect::highlight(path, &side.content),
     };
@@ -125,6 +138,9 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
     }
     if extension == "meson" {
         names.extend(["property", "boolean", "punctuation"]);
+    }
+    if extension == "just" {
+        names.extend(["attribute", "punctuation"]);
     }
     let captures: Vec<_> = names
         .iter()
@@ -160,6 +176,13 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
             }
             HighlightEvent::Source { start, end } => {
                 bytes[start..end].fill(stack.last().copied().flatten())
+            }
+        }
+    }
+    if yaml_template && let Ok(template) = crate::syntect::highlight(path, &side.content) {
+        for (base, overlay) in bytes.iter_mut().zip(template) {
+            if overlay.is_some() {
+                *base = overlay;
             }
         }
     }
