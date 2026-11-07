@@ -46,7 +46,10 @@ fn syntax(side: &source::Side) -> anyhow::Result<Captures> {
 
 fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
     let path = std::path::Path::new(std::str::from_utf8(&side.path)?);
-    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let extension = match path.file_name().and_then(|name| name.to_str()) {
+        Some("meson.build" | "meson.options" | "meson_options.txt") => "meson",
+        _ => path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
+    };
     let (language, query) = match extension {
         "rs" => (
             tree_sitter_rust::LANGUAGE,
@@ -97,6 +100,12 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
             tree_sitter_json::LANGUAGE,
             tree_sitter_json::HIGHLIGHTS_QUERY.to_owned(),
         ),
+        "meson" => (
+            arborium_meson::language(),
+            arborium_meson::HIGHLIGHTS_QUERY
+                .replace("@conditional", "@keyword")
+                .replace("@repeat", "@keyword"),
+        ),
         // Tree-sitter stays authoritative; syntect covers the remaining languages.
         _ => return crate::syntect::highlight(path, &side.content),
     };
@@ -113,6 +122,9 @@ fn highlight(side: &source::Side, embedded: bool) -> anyhow::Result<Captures> {
     }
     if extension == "toml" {
         names.extend(["property", "boolean", "string.special", "punctuation"]);
+    }
+    if extension == "meson" {
+        names.extend(["property", "boolean", "punctuation"]);
     }
     let captures: Vec<_> = names
         .iter()
@@ -459,7 +471,7 @@ fn changed_ranges(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>
     let mut new_ranges = Vec::new();
     let mut old_offset = 0;
     let mut new_offset = 0;
-    for change in TextDiff::from_chars(old, new).iter_all_changes() {
+    for change in TextDiff::from_unicode_words(old, new).iter_all_changes() {
         let length = change.value().len();
         match change.tag() {
             ChangeTag::Equal => {
@@ -1206,6 +1218,24 @@ impl Preview {
 #[cfg(test)]
 mod embedded_tests {
     use super::*;
+
+    #[test]
+    fn intraline_changes_cover_whole_unicode_words() {
+        let old = "let название = color;";
+        let new = "let название = colour;";
+        let (left, right) = changed_ranges(old, new);
+        assert_eq!(
+            left.iter().map(|r| &old[r.clone()]).collect::<String>(),
+            "color"
+        );
+        assert_eq!(
+            right.iter().map(|r| &new[r.clone()]).collect::<String>(),
+            "colour"
+        );
+        let (left, right) = changed_ranges("привет мир", "приветы мир");
+        assert_eq!(left, vec![0.."привет".len()]);
+        assert_eq!(right, vec![0.."приветы".len()]);
+    }
 
     #[test]
     fn many_doc_tests_keep_independent_highlighting() {

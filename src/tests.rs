@@ -9794,6 +9794,24 @@ fn syntect_fallback_detects_names_shebangs_and_rejects_plain_text() {
 }
 
 #[test]
+fn meson_files_highlight_build_language() {
+    let classic = theme::Theme::classic();
+    let text =
+        "# build\nproject('demo', version: '1.0')\nif true\n  executable('app', 'main.c')\nendif\n";
+    for name in ["meson.build", "meson.options", "meson_options.txt"] {
+        let view = fallback_source(name, text, &classic);
+        assert_eq!(
+            fallback_fg(&view, "# build"),
+            Some(Color::DarkGray),
+            "{name}"
+        );
+        assert_eq!(fallback_fg(&view, "'demo'"), Some(Color::Green), "{name}");
+        assert_eq!(fallback_fg(&view, "if"), Some(Color::Magenta), "{name}");
+        assert_ne!(fallback_fg(&view, "project"), classic.default_fg, "{name}");
+    }
+}
+
+#[test]
 fn syntect_fallback_diff_reasons_for_plain_text_and_oversized_sources() {
     let directory = fixture();
     let big = format!("// big\n{}", "let value = 1;\n".repeat(20_000));

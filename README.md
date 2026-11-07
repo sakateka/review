@@ -139,7 +139,7 @@ JSON. Navigation is syntax-based, so results are candidates rather than
 resolved bindings. Everything reads the compared revisions rather than your
 checkout, so the old side works too.
 
-Highlighting covers the same languages plus TOML through tree-sitter, and
+Highlighting covers the same languages plus TOML and Meson through tree-sitter, and
 everything else bat supports through syntect. Rustdoc fenced Rust examples and C
 preambles attached to Go cgo imports also receive embedded syntax highlighting.
 
